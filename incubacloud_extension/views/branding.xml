@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+    <template id="cloud_manager_index"
+              inherit_id="incubacloud.index">
+
+        <xpath expr="//head/title" position="replace">
+            <title>Cloud Manager</title>
+        </xpath>
+
+        <xpath expr="//link[@rel='icon']"
+               position="attributes">
+
+            <attribute name="href">/incubacloud_extension/static/src/logo.svg</attribute>
+
+        </xpath>
+
+    </template>
+
+    <record id="action_cloud_manager"
+            model="ir.actions.act_url">
+
+        <field name="name">Cloud Manager</field>
+        <field name="url">/cloud</field>
+        <field name="target">self</field>
+
+    </record>
+
+    <menuitem id="menu_cloud_manager"
+              name="Cloud Manager"
+              web_icon="incubacloud_extension,static/description/icon.png"
+              sequence="40"
+              action="action_cloud_manager"
+              groups="incubacloud.group_cloud_user"/>
+
+    <template id="brand_cloud_instance_logs"
+              inherit_id="incubacloud.cloud_instance_logs">
+        <xpath expr="//link[@rel='icon']"
+               position="attributes">
+            <attribute name="href">/incubacloud_extension/static/src/logo.svg</attribute>
+        </xpath>
+    </template>
+
+    <template id="brand_cloud_terminal_page"
+              inherit_id="incubacloud.cloud_terminal_page">
+        <xpath expr="//link[@rel='icon']"
+               position="attributes">
+            <attribute name="href">/incubacloud_extension/static/src/logo.svg</attribute>
+        </xpath>
+    </template>
+
+    <template id="brand_host_terminal_page"
+              inherit_id="incubacloud.host_terminal_page">
+        <xpath expr="//link[@rel='icon']"
+               position="attributes">
+            <attribute name="href">/incubacloud_extension/static/src/logo.svg</attribute>
+        </xpath>
+    </template>
+
+    <template id="brand_log_terminal"
+              inherit_id="incubacloud.log_terminal">
+        <xpath expr="//link[@rel='icon']"
+               position="attributes">
+            <attribute name="href">/incubacloud_extension/static/src/logo.svg</attribute>
+        </xpath>
+    </template>
+
+</odoo>

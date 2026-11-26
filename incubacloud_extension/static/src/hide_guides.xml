@@ -1,0 +1,7 @@
+<templates xml:space="preserve">
+    <t t-inherit="incubacloud.FirstSteps"
+       t-inherit-mode="extension">
+        <xpath expr="//a[contains(concat(' ', normalize-space(@class), ' '), ' ic-fs-guide ')]"
+               position="replace"/>
+    </t>
+</templates>
