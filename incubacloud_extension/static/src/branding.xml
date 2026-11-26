@@ -1,0 +1,10 @@
+<templates xml:space="preserve">
+<t t-inherit="incubacloud.AppHeader" t-inherit-mode="extension">
+    <xpath expr="//*[local-name()='svg' and @class='ic-header-logo-icon']" position="replace">
+        <img class="ic-header-logo-icon" src="/incubacloud_extension/static/src/logo.svg" width="26" height="26" alt="Cloud Manager"/>
+    </xpath>
+    <xpath expr="//span[@class='ic-header-logo-text']" position="replace">
+        <span class="ic-header-logo-text">Cloud Manager</span>
+    </xpath>
+</t>
+</templates>
