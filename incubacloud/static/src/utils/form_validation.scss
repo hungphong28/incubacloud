@@ -1,0 +1,31 @@
+// Shared styles for ``useFormValidation`` — red border on inputs /
+// selects / textareas inside a row marked ``.has-error`` plus the
+// subtle ``.ic-field-error`` caption rendered under the input.
+
+// ``.rl-frow`` is what the SPA templates actually mark up (they emit
+// ``'rl-frow' + (… ? ' has-error' : '')``); ``.ic-form-row`` was the
+// original row class and survives in older markup. Both must match or
+// the red border is dead styling — it was, in every validated form.
+.ic-form-row.has-error,
+.rl-frow.has-error {
+    input,
+    select,
+    textarea,
+    .ic-password-input-wrap,
+    .ic-select-wrap {
+        border-color: var(--rl-red) !important;
+        box-shadow: 0 0 0 1px rgba(var(--rl-red-rgb), 0.25) !important;
+    }
+
+    label {
+        color: var(--rl-red-text);
+    }
+}
+
+.ic-field-error {
+    display: block;
+    margin-top: 4px;
+    font-size: 12px;
+    line-height: 1.3;
+    color: var(--rl-red-text);
+}

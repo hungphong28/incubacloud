@@ -1,0 +1,176 @@
+import base64
+import os
+import tempfile
+from contextlib import suppress
+from datetime import datetime
+from pathlib import Path
+
+from odoo import fields
+
+from ._odoo_versions import script_env
+from .abstract_executor import AbstractSSHExecutor
+
+
+class BackupCreateExecutor(AbstractSSHExecutor):
+    """Create a manual backup.
+
+    Production instances: triggers the duplicity jobrunner inside the
+    backup container (full backup to S3).
+
+    Non-production instances: uses click-odoo-backupdb inside the odoo
+    container to create a ZIP (DB + filestore), then downloads it via
+    SFTP and stores it as an ir.attachment with a 2-hour TTL.
+    """
+
+    _job_type = "backup_create"
+
+    def _inst(self):
+        return self.job.instance_id
+
+    def _is_production(self):
+        return self._inst().environment == 'production'
+
+    @property
+    def _outcome_needs_room(self):
+        """Whether the closing hooks fetch the archive through the panel.
+
+        Only outside production: a production's copy goes to the backup
+        store. An attempt that ran long leaves that fetch to a fresh one
+        (``OUTCOME_ROOM_FACTOR``).
+
+        :rtype: bool
+        """
+        return not self._is_production()
+
+    def _remote_tmp(self):
+        """Return where the dump lands: the job's drop directory.
+
+        :rtype: str
+        """
+        return f"{self._drop_dir()}/backup.zip"
+
+    async def before_execute(self, transport):
+        inst = self._inst()
+        if not inst:
+            raise ValueError("backup_create job has no instance_id")
+        if not inst.deployed:
+            raise ValueError("Instance is not deployed.")
+        if not self._is_production():
+            # The dump's container writes there.
+            await self._ensure_drop_dir(transport)
+
+    def get_commands(self):
+        inst = self._inst()
+        d = self._inst_dir(inst)
+
+        # Apart on the server (12-nov-2026), in both forms: a large
+        # database, with its filestore, takes longer than a request is
+        # given. Stopped, it is the ``docker compose`` client that goes;
+        # what runs in the container goes on, as attached.
+        if self._is_production():
+            return [
+                (
+                    "Create backup",
+                    f"cd {d} && docker compose exec -T backup"
+                    f" /etc/periodic/daily/jobrunner </dev/null",
+                    {"detached": True},
+                ),
+            ]
+
+        # Non-production: the series' dump tool in a transient ``run
+        # --rm`` container with the job's drop directory bind-mounted, so
+        # the ZIP lands directly on the host at ``remote_tmp`` and a
+        # separate ``docker compose cp`` step is unnecessary. ``run --rm`` (as opposed to
+        # ``exec``) also works when the odoo service is stopped — e.g.
+        # after a failed restore left the instance in error state but the
+        # operator still wants to grab a backup of the current DB before
+        # iterating. ``with_filestore`` is forced through ``bool()``
+        # because the value picks the dump's scope — never let an
+        # arbitrary string flow into the invocation. The same script as
+        # the download's live dump, so the two cannot drift.
+        with_filestore = bool(
+            (self.job.payload or {}).get('with_filestore', True)
+        )
+        dbname = inst.postgres_dbname or 'prod'
+        return [
+            (
+                "Create backup",
+                self.run_script(
+                    "backup_download.sh",
+                    [
+                        "live-dump", d, dbname, self._remote_tmp(),
+                        "all" if with_filestore else "db",
+                    ],
+                    env=script_env(inst.odoo_version),
+                ),
+                {"stop_on_failure": True, "detached": True},
+            ),
+        ]
+
+    def parse_results(self, results):
+        return [
+            f"'{label}' exited with status {data.get('exit_status')}"
+            for label, data in results.items()
+            if data.get('exit_status', 1) != 0
+        ]
+
+    async def after_commands(self, transport, results):
+        if not self._is_production():
+            await self._download_backup(transport)
+            await transport.run(f"rm -f {self._remote_tmp()}")
+
+    async def on_success(self, results):
+        if self._is_production():
+            self._sys("✓ Backup created successfully in S3.")
+
+    async def _download_backup(self, transport):
+        """Download the non-prod backup ZIP via SFTP."""
+        inst = self._inst()
+        remote_tmp = self._remote_tmp()
+        ts = datetime.now().strftime('%Y%m%dT%H%M%S')
+        filename = f"{inst.name}-backup-{ts}.zip"
+
+        self._sys("Downloading backup to Odoo server…")
+        local_fd, local_tmp = tempfile.mkstemp(
+            prefix=".incubacloud-backup-", suffix=".zip",
+        )
+        os.close(local_fd)
+        try:
+            await self._check_regular_file(transport, remote_tmp)
+            await transport.download_file(remote_tmp, local_tmp)
+
+            self._sys("✓ Downloaded. Storing as attachment…")
+            data = Path(local_tmp).read_bytes()
+            size = len(data)
+            with_filestore = bool(
+                (self.job.payload or {}).get('with_filestore', True)
+            )
+
+            with self._durable_env() as env:
+                att = env['ir.attachment'].create({
+                    'name': filename,
+                    'type': 'binary',
+                    'datas': base64.b64encode(data).decode('ascii'),
+                    'res_model': 'cloud.job',
+                    'res_id': self.job.id,
+                })
+                env['cloud.instance.backup'].create({
+                    'instance_id': inst.id,
+                    'kind': 'archive',
+                    'backup_type': 'Full',
+                    'backup_time': fields.Datetime.now(),
+                    'attachment_id': att.id,
+                    'with_filestore': with_filestore,
+                    'size': size,
+                })
+
+            self._sys(
+                "✓ Backup ready for download (expires in 2 hours)."
+            )
+        finally:
+            with suppress(OSError):
+                Path(local_tmp).unlink()
+
+    async def on_failure(self, results, errors):
+        for err in errors:
+            self._sys(f"✗ {err}")

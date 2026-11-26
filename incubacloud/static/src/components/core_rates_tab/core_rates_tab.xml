@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+<t t-name="incubacloud.CoreRatesTab">
+    <t t-if="state.loading or state.loadError">
+        <t t-call="incubacloud.SettingsLoadState"/>
+    </t>
+    <t t-else="">
+        <t t-set="form" t-value="state.form"/>
+        <SettingsBlock title.translate="Core endpoints"
+                       how.translate="Protects the GitHub webhook, the terminal, connect as user, the logs and GitHub imports against CPU exhaustion. Past a limit the panel refuses until the window ends. A value of 0 or less falls back to the documented default.">
+            <SettingField id="'rate_limit_webhook_per_min'" form="form"/>
+            <SettingField id="'rate_limit_terminal_per_min'" form="form"/>
+            <SettingField id="'rate_limit_terminal_user_per_min'" form="form"/>
+            <SettingField id="'rate_limit_host_console_per_min'" form="form"/>
+            <SettingField id="'rate_limit_connect_per_min'" form="form"/>
+            <SettingField id="'rate_limit_connect_user_per_min'" form="form"/>
+            <SettingField id="'rate_limit_logs_per_min'" form="form"/>
+            <SettingField id="'rate_limit_mail_reads_per_min'" form="form"/>
+            <SettingField id="'rate_limit_log_search_per_min'" form="form"/>
+            <SettingAdvanced form="form" fields="['rate_limit_github_previews_per_hour', 'rate_limit_github_imports_per_hour', 'rate_limit_git_reads_per_hour']">
+                <SettingField id="'rate_limit_github_previews_per_hour'" form="form"/>
+                <SettingField id="'rate_limit_github_imports_per_hour'" form="form"/>
+                <SettingField id="'rate_limit_git_reads_per_hour'" form="form"/>
+            </SettingAdvanced>
+        </SettingsBlock>
+    </t>
+</t>
+
+</templates>

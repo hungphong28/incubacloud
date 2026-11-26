@@ -1,0 +1,34 @@
+# CN-012/021: Pinned to exact versions. Update intentionally with pip-audit review.
+# Host-state automation: Ansible-backed jobs (hardening, probe, prune,
+# observability…) run their playbooks through ansible-runner. Both packages
+# must be present in any image that executes jobs — without them every
+# Ansible-backed executor fails at start.
+ansible-core==2.21.2
+ansible-runner==2.4.3
+# CN-012: >=2.20.0 required — fixes Terrapin (CVE-2023-46445/48795) and CVE-2025-22886.
+asyncssh==2.24.0
+boto3==1.42.89
+# CN-018: >=44.0.1 required — fixes CVE-2023-49083, CVE-2024-6119, CVE-2024-12797.
+# asyncssh 2.24.0 requires >=48.0.1: anything older and pip cannot resolve
+# this file, so every instance built from it fails its image build.
+cryptography==50.0.1
+# The base image ships pyOpenSSL 24.1.0, which references ``_lib.GEN_EMAIL``
+# — removed in cryptography 49 — and crashes the ``base``/ir_mail_server
+# import. The panel image runs this same pair.
+pyOpenSSL==26.4.0
+# Odoo 19 pins urllib3 2.0.7 and requests 2.31.0 on Python 3.12, which
+# Doodba's 19.0 image runs, and pip-audit reports both. It finds nothing in
+# these, the same pair the 18.0 branch pins; requests moves with urllib3.
+urllib3==2.8.0
+requests==2.34.2
+# CN-023: Explicit bcrypt pin — >=4.0.1 required for correct >72-byte error handling.
+# Called directly (not via passlib) because passlib 1.7.4 can't talk to bcrypt >= 5.
+# passlib itself still comes in transitively through Odoo core.
+bcrypt==5.0.0
+PyYAML==6.0.3
+# The re-sync of a repository's requirements.txt compares two lines of one
+# package with it (pip_spec_relation). ansible-core needs it too.
+packaging==26.3
+# Agents' OAuth tokens (incubacloud_mcp) and layered modules' SSO: JWS and
+# JWT validation. Self-hosted installs rebuild their image to get it.
+joserfc==1.7.7

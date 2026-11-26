@@ -1,0 +1,811 @@
+"""Keep every host enrolled in observability, and its label map current.
+
+Two jobs live here, and they answer different questions.
+
+**Labels.** vmagent's scrape config carries one relabelling block per
+instance on the host — that is what turns a raw cAdvisor container sample
+into something attributable to a ``cloud.instance``, a project and an
+account. The block is rendered from the instance list at the moment the
+agents are installed, so it is a snapshot, and every instance deployed,
+moved or removed afterwards left it stale. The playbook is idempotent, so
+the fix is to re-run it whenever the set changes.
+
+**Enrolment.** There is no host to which observability does not apply, so
+it is not a decision anyone should have to make. It used to be one: the
+agents were installed once, chained to host setup, and a host could end
+up unmonitored in three ways that all failed silently — set up before
+observability was switched on, set up with no remote-write URL, or a
+single failed install that nobody retried. The reconciliation cron below
+replaces that one-shot event with a state that converges: it is the
+authority, the setup chain is only an accelerator, and turning
+observability on is itself the instruction to enrol everything pending.
+"""
+import ipaddress
+import json
+import logging
+from datetime import timedelta
+from operator import itemgetter
+
+import asyncssh
+
+from odoo import _, api, fields, models
+from odoo.exceptions import UserError
+
+from .observability_agents_executor import AGENTS_REVISION
+from .observability_central_executor import CENTRAL_REVISION
+
+_logger = logging.getLogger(__name__)
+
+#: Back-off between install attempts, in minutes, indexed by how many
+#: consecutive failures a host has had. A host nobody can reach must not
+#: be hammered every tick, but must not be abandoned either.
+_BACKOFF_MINUTES = (0, 15, 30, 60, 120)
+
+#: Consecutive failures after which we stop being quiet about it.
+_ALERT_AFTER_ATTEMPTS = 3
+
+#: Installed hosts whose agents are re-applied per pass of the cron when
+#: their last install ran an older playbook (``AGENTS_REVISION``): five
+#: every fifteen minutes, twenty an hour, so an upgrade spreads the
+#: installs over the fleet instead of queuing them all at once, each
+#: pulling images and installing a package on its host (12-nov-2026).
+_REAPPLY_PER_PASS = 5
+
+#: Job states in which an install is still to end: a host with one is
+#: left to it rather than counted against the pass.
+_UNFINISHED_JOB_STATES = ("queued", "pending", "enqueued", "wait_dependencies", "started")
+
+
+#: What the agents' install reads from a host besides its instances: the
+#: switch, and the key and user that tell the panel's own sign-ins and
+#: sudo from anyone else's. A change re-applies that host's agents.
+_AGENTS_HOST_FIELDS = ("security_logs_enabled", "key_file", "user", "login_type")
+
+#: The panel's addresses a server keeps (``security_panel_sources``): the
+#: last five seen, each forgotten 30 days after it was last seen (plan
+#: #84, A1). Odoo.sh moves a panel between machines, and a NAT may change
+#: its address: an address the panel left must not stay the panel's.
+PANEL_SOURCES_KEPT = 5
+PANEL_SOURCE_TTL = timedelta(days=30)
+
+
+def _panel_source_network(address):
+    """Return the network an address of the panel is compared by, or None.
+
+    IPv4 by the address itself, IPv6 by its /64: a host with a /64 may
+    leave by any address of it.
+
+    :param str address: an address, as text.
+    :rtype: ipaddress.IPv4Network | ipaddress.IPv6Network | None
+    """
+    try:
+        ip = ipaddress.ip_address((address or "").strip())
+    except ValueError:
+        return None
+    prefix = 64 if ip.version == 6 else 32
+    return ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
+
+
+class CloudHost(models.Model):
+    _inherit = "cloud.host"
+
+    security_logs_enabled = fields.Boolean(
+        string="Send security logs",
+        default=lambda self: self._security_logs_default(),
+        help="SSH sign-ins and failed attempts (address, user, key), sudo "
+             "commands, fail2ban's blocks, changes to passwd, shadow, "
+             "sudoers and the SSH configuration, and the failed sign-ins to "
+             "its instances (address, instance and time), sent to the "
+             "metrics central and kept there 90 days. This server can add "
+             "to them but cannot delete them. Off stops sending; what was "
+             "sent expires on its own.",
+    )
+
+    metrics_write_user = fields.Selection(
+        [("agent", "Agents' user"), ("account", "Account credential")],
+        string="Agents write with",
+        readonly=True,
+        copy=False,
+        help="The credential this server's agents were last installed with: "
+             "the agents' own user, which may only write, or the account's, "
+             "which also reads every server's logs and metrics. Empty: "
+             "installed by a version before 1.0.230. The account's read "
+             "credential is rotated once every server writes with the "
+             "agents' user.",
+    )
+    security_panel_uid = fields.Char(
+        string="Panel's uid on the server",
+        readonly=True,
+        copy=False,
+        help="The uid of the user the panel signs in as on this server, as "
+             "the agents' install read it: what tells the panel's changes "
+             "from anyone else's in auditd's records.",
+    )
+    security_panel_sources = fields.Text(
+        string="Panel's addresses seen",
+        readonly=True,
+        copy=False,
+        groups="incubacloud.group_cloud_manager",
+        help="The addresses the panel was seen connecting from by the "
+             "agents' install, with when, as JSON: the last five, each "
+             "forgotten 30 days after it was last seen. Never taken from a "
+             "notice or from a log line.",
+    )
+
+    security_last_line_at = fields.Datetime(
+        string="Last security line read",
+        readonly=True,
+        copy=False,
+        help="When the security events' cron last saw this server send "
+             "security lines. A server silent for longer than the cron's "
+             "overlap, whose lines arrive late with their own time, has "
+             "them read again from here when it speaks again.",
+    )
+    security_previous_key_fingerprint = fields.Char(
+        string="Panel's previous key",
+        readonly=True,
+        copy=False,
+        groups="incubacloud.group_cloud_manager",
+        help="The fingerprint of the key the panel signed in with before "
+             "the last change of this server's key: a sign-in with it from "
+             "before the change, read late, is still the panel's.",
+    )
+    security_key_changed_at = fields.Datetime(
+        string="Panel's key changed",
+        readonly=True,
+        copy=False,
+        groups="incubacloud.group_cloud_manager",
+        help="When this server's key or way of signing in last changed.",
+    )
+
+    @api.model
+    def _security_logs_default(self):
+        """Return the value Send security logs starts with on a new server.
+
+        On: a panel's servers are its own, and their security logs are
+        what an incident is read from (plan of 9-nov-2026). A layer whose
+        panels belong to others may start them off until it may receive
+        them.
+
+        :rtype: bool
+        """
+        return True
+
+    @api.model
+    def _security_logs_available(self):
+        """Return whether this panel's servers may send their security logs.
+
+        Always here. A layer whose panels belong to others withholds it
+        until it may receive them: the switch is then off on every server
+        and cannot be turned on, by the form, the route or an agent.
+
+        :rtype: bool
+        """
+        return True
+
+    def _check_security_logs_available(self, vals):
+        """Refuse to turn a server's security logs on where they are withheld.
+
+        Run by ``create`` and ``write``. Turning them off, or writing them
+        off, is always allowed.
+
+        :param dict vals: the values being written.
+        :raise UserError: when *vals* turn them on and this panel may not.
+        """
+        if vals.get("security_logs_enabled") and not self._security_logs_available():
+            raise UserError(_(
+                "Security logs are not available on this panel yet."
+            ))
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        """Refuse a server created sending security logs where they are withheld.
+
+        The servers created are checked, not only *vals_list*: a
+        ``default_security_logs_enabled`` in the context, or a default
+        an administrator set, turns the switch on without being sent
+        (review of 12-nov-2026).
+        """
+        for vals in vals_list:
+            self._check_security_logs_available(vals)
+        hosts = super().create(vals_list)
+        if hosts.filtered("security_logs_enabled"):
+            self._check_security_logs_available({"security_logs_enabled": True})
+        return hosts
+
+    @api.model
+    def _security_logs_after_upgrade(self, shipped_before):
+        """Return the value every server takes when the switch moves to them.
+
+        Called once, by the update that replaced the panel-wide *Send
+        hosts' security logs* with the switch of each server. On, also
+        where the panel-wide setting was off: the owner's decision of
+        10-nov-2026, said in the changelog. A layer whose panels belong
+        to others keeps what they had.
+
+        :param bool shipped_before: the panel-wide setting before the
+            update.
+        :rtype: bool
+        """
+        return True
+
+    def _panel_key_fingerprints(self):
+        """Return the SHA256 fingerprints of the panel's key for this host.
+
+        In the form ``ssh-keygen -lf`` prints and sshd logs them
+        (``SHA256:…``), so a sign-in with it counts as the panel's. Empty
+        for a host that logs in with a password, or whose key cannot be
+        read (a passphrase): every sign-in then counts as another's.
+
+        :return: zero or one fingerprint.
+        :rtype: list[str]
+        """
+        self.ensure_one()
+        if self.login_type != "ssh_key":
+            return []
+        try:
+            raw = self._get_ssh_private_key_bytes()
+            if not raw:
+                return []
+            key = asyncssh.import_private_key(raw)
+            return [key.get_fingerprint("sha256")]
+        except Exception as exc:  # noqa: BLE001 — the install goes on without it
+            _logger.warning(
+                "[metrics] cannot read the key of cloud.host(id=%s) for its "
+                "fingerprint: %s", self.id, exc,
+            )
+            return []
+
+    # ── The panel's addresses ─────────────────────────────────────────────
+
+    def _panel_sources_kept(self):
+        """Return the panel's addresses this server keeps, newest first.
+
+        Those seen within ``PANEL_SOURCE_TTL``; what cannot be read counts
+        for nothing.
+
+        :return: ``[{"address": str, "seen": datetime}]``.
+        :rtype: list[dict]
+        """
+        self.ensure_one()
+        try:
+            raw = json.loads(self.sudo().security_panel_sources or "[]")
+        except ValueError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        horizon = fields.Datetime.now() - PANEL_SOURCE_TTL
+        kept = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            address = str(item.get("address") or "")
+            try:
+                seen = fields.Datetime.to_datetime(item.get("seen"))
+            except (TypeError, ValueError):
+                continue
+            if not seen or seen < horizon or _panel_source_network(address) is None:
+                continue
+            kept.append({"address": address, "seen": seen})
+        kept.sort(key=itemgetter("seen"), reverse=True)
+        return kept
+
+    def _write_panel_sources(self, kept):
+        """Store *kept* as this server's panel addresses.
+
+        :param list kept: as :meth:`_panel_sources_kept` returns them.
+        """
+        self.ensure_one()
+        value = json.dumps([
+            {"address": item["address"],
+             "seen": fields.Datetime.to_string(item["seen"])}
+            for item in kept[:PANEL_SOURCES_KEPT]
+        ]) if kept else False
+        if (self.sudo().security_panel_sources or False) != value:
+            self.sudo().write({"security_panel_sources": value})
+
+    def _record_panel_source(self, address):
+        """Record that the panel was seen connecting from *address* now.
+
+        Only from what a job of the panel read on the server
+        (``SSH_CONNECTION``, without ``become``): never from Odoo.sh's
+        notice of a new address, which carries no credential, nor from a
+        log line. An address of the same IPv6 /64 as one kept replaces it.
+
+        :param str address: the first word of ``SSH_CONNECTION``.
+        :return: whether an address was recorded.
+        :rtype: bool
+        """
+        self.ensure_one()
+        address = str(address or "").strip().split(" ")[0]
+        network = _panel_source_network(address)
+        if network is None:
+            return False
+        address = str(ipaddress.ip_address(address))
+        kept = [
+            item for item in self._panel_sources_kept()
+            if _panel_source_network(item["address"]) != network
+        ]
+        kept.insert(0, {"address": address, "seen": fields.Datetime.now()})
+        self._write_panel_sources(kept)
+        return True
+
+    def _panel_source_known(self, address):
+        """Return whether *address* is one this server saw the panel come from.
+
+        :param str address: an address, as text.
+        :rtype: bool
+        """
+        self.ensure_one()
+        network = _panel_source_network(address)
+        if network is None:
+            return False
+        return any(
+            _panel_source_network(item["address"]) == network
+            for item in self._panel_sources_kept()
+        )
+
+    @api.model
+    def _forget_panel_source(self, address):
+        """Forget *address* as the panel's on every server.
+
+        Called when the alert of a change of the panel's address closes:
+        the address it left is no longer the panel's.
+
+        :param str address: the address the panel left.
+        :return: how many servers forgot it.
+        :rtype: int
+        """
+        network = _panel_source_network(address)
+        if network is None:
+            return 0
+        forgot = 0
+        hosts = self.sudo().with_context(active_test=False).search([
+            ("security_panel_sources", "!=", False),
+        ])
+        for host in hosts:
+            kept = host._panel_sources_kept()
+            left = [
+                item for item in kept
+                if _panel_source_network(item["address"]) != network
+            ]
+            if len(left) != len(kept):
+                host._write_panel_sources(left)
+                forgot += 1
+        return forgot
+
+    @api.model
+    def _metrics_every_host_writes_as_agent(self):
+        """Return whether no server of this panel writes with the account's credential.
+
+        Every active server whose agents were installed, or failed to be,
+        was last installed with the agents' user. One installed before
+        1.0.230 (empty) or with the account's credential holds it.
+
+        :rtype: bool
+        """
+        holding = self.sudo().search_count([
+            ("active", "=", True),
+            ("metrics_agents_state", "in", ("installed", "failed")),
+            ("metrics_write_user", "!=", "agent"),
+        ])
+        return holding == 0
+
+    def write(self, vals):
+        """Re-apply a host's agents when what they read from it changes.
+
+        Send security logs, the key and the user: the playbook renders
+        them, so a change applies now rather than at the next install. A
+        host whose last install failed is re-applied too: turning the
+        switch off is how a Fluent Bit that does not start is removed, and
+        the reconciliation would wait out its back-off (review of
+        12-nov-2026).
+        """
+        self._check_security_logs_available(vals)
+        watched = [f for f in _AGENTS_HOST_FIELDS if f in vals]
+        before = {}
+        if watched:
+            before = {
+                host.id: tuple(host.sudo()[f] for f in watched) for host in self
+            }
+        keys_before = {}
+        if "key_file" in vals or "login_type" in vals:
+            keys_before = {
+                host.id: host._panel_key_fingerprints() for host in self
+            }
+        result = super().write(vals)
+        for host in self.filtered(lambda h: h.id in keys_before):
+            host._remember_previous_key(keys_before[host.id])
+        for host in self.filtered(lambda h: h.id in before):
+            if tuple(host.sudo()[f] for f in watched) != before[host.id]:
+                host._reapply_observability_now("server settings changed")
+        return result
+
+    def _remember_previous_key(self, fingerprints_before):
+        """Keep the key the panel signed in with before a change of it.
+
+        Called by ``write`` after the key or the way of signing in
+        changed. The security events' cron reads sign-ins up to 15
+        minutes late, and a job that started before the change signs in
+        with the old key: a sign-in with it from before the change is the
+        panel's (plan #84, B1). After it, the old key is anyone's.
+
+        :param list fingerprints_before: what ``_panel_key_fingerprints``
+            gave before the change.
+        """
+        self.ensure_one()
+        if not fingerprints_before:
+            return
+        if fingerprints_before == self._panel_key_fingerprints():
+            return
+        self.sudo().write({
+            "security_previous_key_fingerprint": fingerprints_before[0],
+            "security_key_changed_at": fields.Datetime.now(),
+        })
+
+    def _reapply_observability_now(self, reason):
+        """Queue this host's agents' install now, installed or failed.
+
+        Where it cannot be queued (observability off, the host not a
+        target, the queue refusing it), an installed host's agents keep
+        running as they were installed: its revision goes to 0, so the
+        reconciliation re-applies it as soon as it can, as after an
+        upgrade, instead of never (review of 12-nov-2026). A failed host
+        is retried by the reconciliation anyway.
+
+        :param str reason: short free text for the log.
+        :return: the queued job id, or ``False`` when nothing was queued.
+        """
+        self.ensure_one()
+        job = False
+        if (
+            self._observability_target()
+            and self.metrics_agents_state in ("installed", "failed")
+        ):
+            job = self._enqueue_observability(reason)
+        if not job and self.metrics_agents_state == "installed":
+            self.sudo().write({"metrics_agents_revision": 0})
+        return job
+
+    # ── Label refresh ─────────────────────────────────────────────────────
+
+    def refresh_observability_labels(self, reason=""):
+        """Re-apply the metrics agents so the label map matches reality.
+
+        Best-effort by design: this is called from the tail of operations
+        that have already succeeded (a deploy, a move, a removal), and a
+        monitoring refresh must never turn one of those into a failure.
+
+        Only hosts whose agents are actually installed are refreshed. That
+        used to be decided by ``last_probed``, which the SSH telemetry job
+        also writes — so with the fallback alive, every host looked
+        enrolled and the guard did the opposite of what its comment
+        claimed. ``metrics_agents_state`` is maintained by the install job
+        itself and cannot be set by anything else.
+
+        :param reason: short free text for the job log, e.g. 'deploy'.
+        :return: the queued ``cloud.job`` id, or ``False`` if skipped.
+        """
+        self.ensure_one()
+        if not self._observability_target():
+            return False
+        if self.metrics_agents_state != "installed":
+            # Not enrolled yet. Enrolling here would make monitoring a
+            # surprise side effect of deploying an instance; the
+            # reconciliation cron owns that decision and will pick it up.
+            return False
+        return self._enqueue_observability(reason or "label refresh")
+
+    # ── Enrolment ─────────────────────────────────────────────────────────
+
+    def _observability_target(self):
+        """Return True when this host should be running the agents.
+
+        The genuine gate is "is there a central to push to", which is a
+        settings-level fact evaluated continuously — not "did somebody
+        press a button once".
+
+        Hosts that cannot take agents yet, or are on their way out, are
+        excluded: queuing an install against a half-built or dying machine
+        produces noise, not monitoring.
+
+        "Can take agents" is expressed as ``known_hosts_key``: the panel
+        only has one once it has actually reached the host over SSH, so a
+        record somebody typed in but never prepared is skipped without
+        needing a lifecycle field that ``cloud.host`` does not have.
+
+        And as ``traefik_deployed``, which Full Setup sets when it ends: a
+        host bought on demand has its key a minute after the purchase,
+        long before Full Setup installs Docker, and the cron queued its
+        agents then, beside the hardening, to fail on a missing ``docker``
+        (2026-10-09). Full Setup queues them itself as it finishes.
+        """
+        self.ensure_one()
+        settings = self.env["cloud.settings"].sudo()._get_system()
+        if not settings.metrics_enabled:
+            return False
+        if not (settings.metrics_remote_write_url or "").strip():
+            return False
+        if not settings.metrics_account:
+            return False
+        if not self.active:
+            return False
+        if not (self.known_hosts_key or "").strip():
+            return False
+        if not self.traefik_deployed:
+            return False
+        return True
+
+    def _observability_due(self):
+        """Return True when this host is due for an install attempt.
+
+        Never-installed hosts are due immediately. Failed ones wait out a
+        back-off that grows with the number of consecutive failures, so an
+        unreachable host is retried at a decreasing rate rather than every
+        tick.
+        """
+        self.ensure_one()
+        if self.metrics_agents_state == "installed":
+            return False
+        if self.metrics_agents_state == "never":
+            return True
+        attempts = min(self.metrics_agents_attempts, len(_BACKOFF_MINUTES) - 1)
+        wait = _BACKOFF_MINUTES[attempts]
+        if not self.metrics_agents_since:
+            return True
+        age = (
+            fields.Datetime.now() - self.metrics_agents_since
+        ).total_seconds()
+        return age >= wait * 60
+
+    def _enqueue_observability(self, reason):
+        """Queue the agent install for this host, swallowing failures.
+
+        Collapses onto a job that waits in the host's queue: the type is
+        declared ``queue_collapse`` (``data/job_type.xml``), so
+        ``enqueue`` returns the waiting one. Deleting five instances from
+        one host queued five identical installs, and that stampede is
+        what fed the serialization race of 2026-08-13: the losers were
+        rolled back, re-run by queue_job, and reported failures for
+        teardowns that had already completed.
+
+        Collapsing loses nothing because the playbook renders its label
+        map *when it runs*, not when it was queued, so a job still
+        waiting will pick up the final state of the host whether it
+        covers one removal or five. A job already dispatched is
+        deliberately not matched: it rendered, or is about to render,
+        its map on its own, so a change landing mid-flight does need its
+        own job or it would wait for the reconciliation cron to be
+        noticed.
+
+        :param reason: short free text for the log.
+        :return: the queued job id, the id of the job it collapsed onto,
+            or ``False``.
+        """
+        self.ensure_one()
+        try:
+            return self.env["cloud.job"].sudo().enqueue(
+                self.id, False, "install_observability",
+                # Often called from the on_success of a job that is still
+                # 'started' on this host: the install belongs to that
+                # job and goes before whatever else waits on the host.
+                bypass_running_check=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — never fail the caller
+            _logger.warning(
+                "[metrics] could not queue agents on host %s (%s): %s",
+                self.name, reason, exc,
+            )
+            return False
+
+    @api.model
+    def _cron_reconcile_observability(self):
+        """Enrol every host that should be reporting and is not.
+
+        This is the single mechanism that keeps observability applied.
+        Switching it on in Settings needs no companion "enrol existing
+        hosts" step: the next tick sees hosts that are targets and not
+        installed, and queues them. Switching it off stops the cron dead,
+        which is why the gate lives in ``_observability_target``.
+        """
+        settings = self.env["cloud.settings"].sudo()._get_system()
+        if not settings.metrics_enabled:
+            return
+        candidates = self.sudo().search([
+            ("metrics_agents_state", "!=", "installed"),
+            ("active", "=", True),
+        ])
+        queued = 0
+        for host in candidates:
+            if not host._observability_target():
+                continue
+            if not host._observability_due():
+                continue
+            if host._enqueue_observability("reconciliation"):
+                queued += 1
+        if queued:
+            _logger.info(
+                "[metrics] reconciliation queued agents on %s host(s)", queued,
+            )
+        # Installed hosts too: the URL the direct path offers them moves,
+        # and a change of the path asks
+        # for this cron at once (``_direct_path_changed``).
+        self._reconcile_direct_agents()
+        # And those whose last install ran an older playbook.
+        self._reconcile_agents_revision()
+        # And the central, when its last deployment ran an older one or
+        # its certificate is to be renewed.
+        self._reconcile_central_revision()
+        # The agents' write-only user, and the read credential's rotation
+        # once no server holds it (plan #84, A2).
+        self.env["cloud.settings"].sudo()._reconcile_metrics_credentials()
+        # The single name's pending check, and whether a server writes
+        # from outside the central's list.
+        self._reconcile_central_name()
+
+    @api.model
+    def _reconcile_central_revision(self):
+        """Deploy the central again while its deployment is behind this code.
+
+        The panel records the revision its central's last good deployment
+        ran (``metrics_central_revision``). Behind ``CENTRAL_REVISION``,
+        the central is deployed again: an update that changes it converges
+        even when the first deployment was run by a worker on older code,
+        failed (an unreachable host, a pull), or never ran. Not while one
+        waits or runs on the central's host, and after a failure with the
+        same growing back-off as the agents' installs. Not with
+        observability off: the deployment switches it on, so it waits for
+        the operator to switch it back on.
+
+        :return: the queued job id, or ``False``.
+        """
+        Settings = self.env["cloud.settings"].sudo()
+        settings = Settings._get_system()
+        if not settings.metrics_enabled:
+            return False
+        behind = (settings.metrics_central_revision or 0) < CENTRAL_REVISION
+        # Under its single name, also when its certificate is to be
+        # renewed (``LEAF_RENEW_BEFORE``), or was never issued.
+        renew = Settings._central_cert_due()
+        if not (behind or renew):
+            return False
+        host = settings.metrics_central_host_id.sudo()
+        if not (host and host.active):
+            return False
+        Job = self.env["cloud.job"].sudo()
+        jobs = Job.search([
+            ("host_id", "=", host.id),
+            ("job_type_id.code", "=", "deploy_metrics_central"),
+        ], order="id desc", limit=len(_BACKOFF_MINUTES))
+        if jobs.filtered(lambda j: j.state in _UNFINISHED_JOB_STATES):
+            return False
+        failures = 0
+        for job in jobs:
+            if job.state not in ("failed", "cancelled"):
+                break
+            failures += 1
+        if failures:
+            wait = _BACKOFF_MINUTES[min(failures, len(_BACKOFF_MINUTES) - 1)]
+            last = jobs[0].date_done or jobs[0].write_date
+            if last and (fields.Datetime.now() - last).total_seconds() < wait * 60:
+                return False
+        try:
+            with self.env.cr.savepoint():
+                job_id = Job.enqueue(host.id, False, "deploy_metrics_central")
+        except Exception as exc:  # noqa: BLE001 — a cron pass never fails on it
+            _logger.info(
+                "[metrics] could not queue the central's deployment on %s: %s",
+                host.name, exc,
+            )
+            return False
+        _logger.info(
+            "[metrics] the central on %s is on revision %s (code %s), its "
+            "certificate %s: deploying it again", host.name,
+            settings.metrics_central_revision or 0, CENTRAL_REVISION,
+            "to renew" if renew else "current",
+        )
+        return job_id
+
+    @api.model
+    def _reconcile_agents_revision(self):
+        """Re-apply, a few per pass, the agents installed by an older playbook.
+
+        A host records the revision its last good install ran
+        (``metrics_agents_revision``). One below ``AGENTS_REVISION`` was
+        installed before this version, or by a panel still on older code
+        (a panel rebuilt by another), and nothing else would run the
+        playbook there again until its instances change. While the agents'
+        user is in force, a host whose agents still write with the
+        account's credential is behind too, whatever its revision: the
+        moment it came into force re-applied the hosts installed then, and
+        a host is left out of that moment by an install that ran on the
+        old credential as it came, a job resumed by another worker, a
+        layer that started handing it over only after an update, or a host
+        brought back from the archive (A2, by state). Oldest first,
+        ``_REAPPLY_PER_PASS`` per pass; a host whose install is already
+        waiting or running is left to it and not counted. One that fails
+        leaves "installed" and is retried with the back-off of any other.
+
+        :return: how many installs were queued.
+        :rtype: int
+        """
+        Settings = self.env["cloud.settings"].sudo()
+        settings = Settings._get_system()
+        if not settings.metrics_enabled:
+            return 0
+        agent_in_force = Settings._metrics_agent_in_force()
+        behind = self.sudo().search([
+            ("metrics_agents_state", "=", "installed"), ("active", "=", True),
+        ]).filtered(
+            lambda h: (h.metrics_agents_revision or 0) < AGENTS_REVISION
+            or (agent_in_force and h.metrics_write_user != "agent"),
+        ).sorted(lambda h: (h.metrics_agents_revision or 0, h.id))
+        if not behind:
+            return 0
+        busy = self.env["cloud.job"].sudo().search([
+            ("host_id", "in", behind.ids),
+            ("job_type_id.code", "=", "install_observability"),
+            ("state", "in", _UNFINISHED_JOB_STATES),
+        ]).host_id
+        queued = 0
+        for host in behind - busy:
+            if queued >= _REAPPLY_PER_PASS:
+                break
+            if not host._observability_target():
+                continue
+            if host._enqueue_observability("agents revision"):
+                queued += 1
+        if queued:
+            _logger.info(
+                "[metrics] re-applied the agents of %s host(s) on an older "
+                "revision or the account's credential (%s left)",
+                queued, len(behind) - queued,
+            )
+        return queued
+
+    @api.model
+    def _reapply_observability_everywhere(self):
+        """Have the cron re-apply the agents of every installed host.
+
+        For a setting the playbook reads, such as the database collector's
+        switch: the hosts converge at the cron's pace, as after an upgrade.
+        """
+        self.sudo().search([
+            ("metrics_agents_state", "=", "installed"),
+            ("metrics_agents_revision", "!=", 0),
+        ]).write({"metrics_agents_revision": 0})
+
+    # ── State transitions, called by the install job ──────────────────────
+
+    def _mark_observability_installed(self):
+        """Record a successful agent install and clear the failure state."""
+        self.ensure_one()
+        self.sudo().write({
+            "metrics_agents_state": "installed",
+            "metrics_agents_since": fields.Datetime.now(),
+            "metrics_agents_attempts": 0,
+        })
+
+    def _mark_observability_failed(self):
+        """Record a failed install and return the attempt count so far.
+
+        The count drives both the back-off and the point at which a host
+        that keeps refusing the agents stops being a silent retry loop and
+        becomes an alert.
+        """
+        self.ensure_one()
+        attempts = (self.metrics_agents_attempts or 0) + 1
+        self.sudo().write({
+            "metrics_agents_state": "failed",
+            "metrics_agents_since": fields.Datetime.now(),
+            "metrics_agents_attempts": attempts,
+        })
+        return attempts
+
+    def _observability_alert_due(self, attempts):
+        """Return True when repeated install failures deserve an alert.
+
+        :param attempts: consecutive failures, as returned by
+            ``_mark_observability_failed``.
+        """
+        return attempts >= _ALERT_AFTER_ATTEMPTS

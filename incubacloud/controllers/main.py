@@ -1,0 +1,605 @@
+import json
+import logging
+import os
+import re
+from contextlib import suppress
+from pathlib import Path
+
+import asyncssh
+
+from odoo import http
+from odoo.http import Controller, request
+
+from odoo.addons.bus.websocket import WebsocketConnectionHandler
+
+from ..restore_staging import (
+    new_upload_path,
+    path_for_upload,
+    upload_id_of,
+)
+from ._data_load._helpers import (
+    is_safe_log_archive,
+    log_archive_download_command,
+)
+from ._client_ip import client_ip
+from ._rate_limit import Rule, first_tripped
+from .async_utils import run_async
+
+_logger = logging.getLogger(__name__)
+
+#: Largest archive a restore upload may rebuild, unless
+#: ``incubacloud.restore_upload_max_bytes`` says otherwise. The staged
+#: file sits on the panel's data volume until the executor sends it, so
+#: this is a disk budget as much as a limit.
+_RESTORE_UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+
+#: Size the browser is told to cut pieces at. Chosen well under the 100 MB
+#: a CDN typically allows per request, and small enough that re-sending
+#: one after a dropped connection is cheap.
+_RESTORE_UPLOAD_CHUNK_BYTES = 32 * 1024 * 1024  # 32 MiB
+
+#: Ceiling for a single piece, with room for the multipart envelope.
+_RESTORE_UPLOAD_PART_MAX_BYTES = 40 * 1024 * 1024  # 40 MiB
+
+#: Read granularity while appending a piece: the archive never lands in
+#: the worker's memory, same reason the one-shot route streams.
+_RESTORE_UPLOAD_BLOCK_BYTES = 64 * 1024
+
+
+def _is_cloud_user():
+    """Return whether the signed-in user may open the panel's pages.
+
+    An internal user with an IncubaCloud role: every role implies
+    Stakeholder (``group_cloud_user``). Anyone else is answered as for a
+    page that does not exist, which tells them nothing of what is there.
+
+    :rtype: bool
+    """
+    user = request.env.user
+    return user._is_internal() and user.has_group("incubacloud.group_cloud_user")
+
+
+class CloudController(Controller):
+    @http.route(
+        ["/cloud", "/cloud/<path:subpath>"], auth="user", type="http", methods=["GET"]
+    )
+    def cloud_ui(self, subpath="", **k):
+        """
+        Render the main cloud management UI
+        """
+        if not _is_cloud_user():
+            return request.not_found()
+
+        company = request.env.user.company_id
+        session_info = request.env["ir.http"].session_info()
+        session_info["user_context"]["allowed_company_ids"] = company.ids
+        session_info["user_companies"] = {
+            "current_company": company.id,
+            "allowed_companies": {
+                company.id: session_info["user_companies"]["allowed_companies"][
+                    company.id
+                ]
+            },
+        }
+        context = {
+            "from_backend": 1,
+            "session_info": session_info,
+        }
+        response = request.render("incubacloud.index", context)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @http.route(["/cloud/log/<int:job_id>"], auth="user", type="http")
+    def cloud_log(self, job_id, **k):
+        """Render the terminal log page for a job.
+
+        Any user who can see the job (via record rules) can view its logs.
+        No role check beyond Stakeholder — job visibility is the gate.
+        """
+        if not _is_cloud_user():
+            return request.not_found()
+        job = request.env["cloud.job"].browse(job_id)
+        if not job.exists():
+            return request.not_found()
+        # Odoo rejects WebSocket handshakes whose ``version`` query
+        # parameter doesn't match the server's current
+        # ``WebsocketConnectionHandler._VERSION`` — it closes with
+        # CLEAN / OUTDATED_VERSION, which our inline client reads as a
+        # successful close and retries forever. Render the server's
+        # current version into the template so the terminal page tracks
+        # Odoo upgrades without a code change.
+        payload = job.payload or {}
+        trigger = payload.get("trigger") or ""
+        context = {
+            "job_id": job_id,
+            # In the reader's language, as the job lists say it; the
+            # download's file name keeps the stored English one.
+            "job_name": job.job_type_id.name or job.name or "",
+            "job_host": job.host_id.name or "",
+            "job_instance": job.instance_id.name or "",
+            "job_project": job.instance_id.project_id.name or "",
+            "job_trigger": trigger if trigger in ("webhook", "coalesced") else "",
+            "job_push_sha": payload.get("push_sha") or "",
+            "job_push_branch": payload.get("push_branch") or "",
+            "job_push_message": payload.get("push_message") or "",
+            "job_push_by": payload.get("push_by") or "",
+            "job_coalesced_pushes": payload.get("coalesced_pushes") or [],
+            "csrf_token": request.csrf_token(None),
+            "session_info": request.env["ir.http"].session_info(),
+            "ws_version": WebsocketConnectionHandler._VERSION,
+        }
+        response = request.render("incubacloud.log_terminal", context)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @http.route(["/cloud/log/<int:job_id>/download"], auth="user", type="http")
+    def cloud_log_download(self, job_id, **k):
+        """Download job logs as a plain-text .log file.
+
+        Source-based and project-based scoping is enforced by record
+        rules on ``cloud.job.log.chunk``. Stakeholders/consultants
+        get only ``source='system'`` chunks of jobs in their projects;
+        developers+ get the full stdout/stderr where credentials may
+        appear.
+        """
+        if not _is_cloud_user():
+            return request.not_found()
+        job = request.env["cloud.job"].browse(job_id)
+        if not job.exists():
+            return request.not_found()
+        chunks = request.env["cloud.job.log.chunk"].search(
+            [
+                ("job_id", "=", job_id),
+            ],
+            order="id",
+        )
+        source_tag = {"stdout": "out", "stderr": "err", "system": "sys"}
+        lines = []
+        for c in chunks:
+            ts = c.create_date.strftime("%Y-%m-%d %H:%M:%SZ") if c.create_date else ""
+            tag = source_tag.get(c.source, c.source)
+            for line in (c.content or "").splitlines():
+                lines.append(f"{ts} [{tag}] {line}")
+        content = "\n".join(lines) + "\n"
+        slug = (job.name or "job").replace(" ", "-").lower()
+        filename = f"job-{job_id}-{slug}.log"
+        return request.make_response(
+            content,
+            headers=[
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Disposition", f'attachment; filename="{filename}"'),
+            ],
+        )
+
+    @http.route(["/cloud/instance/<int:instance_id>/logs"], auth="user", type="http")
+    def cloud_instance_logs(self, instance_id, **k):
+        """Render the standalone container log viewer for an instance."""
+        if not request.env.user._is_internal():
+            return request.not_found()
+        request.env["cloud.security.mixin"]._check_can_view_logs()
+        inst = request.env["cloud.instance"].browse(instance_id)
+        if not inst.exists():
+            return request.not_found()
+        services = [
+            s.strip()
+            for s in (inst.compose_services or "odoo,db").split(",")
+            if s.strip()
+        ]
+        context = {
+            "instance_id": instance_id,
+            "instance_name": inst.name or "",
+            "instance_host": inst.host_id.name or "",
+            "services": services,
+            "csrf_token": request.csrf_token(None),
+            "session_info": request.env["ir.http"].session_info(),
+        }
+        # One row per opened viewer — not per poll: the live tail
+        # refreshes every 4 seconds, and a row for each would bury the
+        # question this answers ("who read this instance's logs").
+        request.env["cloud.audit.log"].sudo().create({
+            "action": "Viewed instance logs",
+            "instance_id": inst.id,
+        })
+        response = request.render("incubacloud.cloud_instance_logs", context)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @http.route(
+        ["/cloud/instance/<int:instance_id>/log_archive/<string:name>"],
+        auth="user",
+        type="http",
+    )
+    def cloud_instance_log_archive_download(self, instance_id, name, **k):
+        """Download one of an instance's archived Odoo logs, gzipped.
+
+        The viewer shows a bounded tail; this is how an operator takes
+        a whole day away to grep, diff or attach to a ticket.
+        """
+        if not request.env.user._is_internal():
+            return request.not_found()
+        request.env["cloud.security.mixin"]._check_can_view_logs()
+        inst = request.env["cloud.instance"].browse(instance_id)
+        if not inst.exists() or not inst.host_id:
+            return request.not_found()
+        if not is_safe_log_archive(name):
+            return request.not_found()
+        if first_tripped(Rule(
+            f"log_download_user:{request.env.user.id}",
+            cap_key="rate_limit_log_search_per_min",
+            log_tag=f"log_download user={request.env.user.id}",
+        )):
+            return request.make_json_response(
+                {"error": "Rate limit exceeded. Wait 60s and retry."},
+                status=429,
+            )
+        settings = request.env["cloud.settings"].sudo()._get_system()
+        command = log_archive_download_command(
+            inst.get_remote_dir(), name,
+            max_bytes=settings.log_download_max_mb * 1024 * 1024,
+        )
+
+        async def _run():
+            async with asyncssh.connect(
+                **inst.host_id.ssh_connect_kwargs(),
+            ) as conn:
+                result = await conn.run(command, check=False, encoding=None)
+                return result.stdout or b""
+
+        try:
+            payload = run_async(_run())
+        except Exception:
+            _logger.exception(
+                "Error downloading log archive %s of instance %s",
+                name, instance_id,
+            )
+            return request.not_found()
+        # Audited after the fetch, not before: a download takes a
+        # customer's log out of the platform and that is the act worth
+        # accounting for, while a failed attempt ends in ``not_found``
+        # — which rolls the request back and would have taken the row
+        # with it anyway.
+        request.env["cloud.audit.log"].sudo().create({
+            "action": "Downloaded instance log",
+            "instance_id": inst.id,
+            "details": name,
+        })
+        filename = f"{inst.name}-{name}"
+        if not filename.endswith(".gz"):
+            filename += ".gz"
+        return request.make_response(
+            payload,
+            headers=[
+                ("Content-Type", "application/gzip"),
+                ("Content-Disposition", f'attachment; filename="{filename}"'),
+                ("Cache-Control", "no-store"),
+            ],
+        )
+
+    @http.route(
+        ["/cloud/instance/<int:instance_id>/restore"],
+        methods=["POST"],
+        auth="user",
+        type="http",
+        max_content_length=2 * 1024 * 1024 * 1024,  # 2 GiB
+    )
+    def restore_instance_upload(self, instance_id, **k):
+        """Receive a backup zip, save to a temp file, and enqueue the restore job."""
+        request.env["cloud.security.mixin"]._check_can_manage_backups()
+        if not request.env.user._is_internal():
+            return request.make_json_response({"error": "Forbidden"}, status=403)
+        # Per-user concurrency limit: each upload pins up to 2 GiB of
+        # /tmp on the Odoo server until the executor consumes the file.
+        # 2/min/user lets a typical operator retry a failed upload
+        # without trouble, while preventing a developer from pinning
+        # the server's tmpfs by spamming concurrent uploads.
+        if first_tripped(Rule(
+            f"restore_upload_user:{request.env.user.id}",
+            max_per_window=2,
+            log_tag=f"restore_upload user={request.env.user.id}",
+        )):
+            return request.make_json_response(
+                {"error": "Rate limit exceeded. Wait 60s and retry."},
+                status=429,
+            )
+        inst = request.env["cloud.instance"].browse(instance_id)
+        if not inst.exists() or not inst.host_id:
+            return request.make_json_response(
+                {"error": "Instance not found"}, status=404
+            )
+
+        backup_file = request.httprequest.files.get("backup_file")
+        if not backup_file:
+            return request.make_json_response({"error": "No file provided"}, status=400)
+
+        # Staged under the data dir, not /tmp: the executor that consumes
+        # this file runs in the job-runner container, which shares the
+        # data dir with this one and nothing else. See restore_staging.
+        tmp_path = str(new_upload_path(instance_id))
+        try:
+            # ``save`` streams through a 16 KiB buffer, so a 2 GiB archive
+            # never lands in the worker's memory — which matters, since
+            # limit_memory_hard is that same 2 GiB.
+            backup_file.save(tmp_path)
+            os.chmod(tmp_path, 0o600)
+            # Sanitise filename: it travels in the job payload as
+            # metadata and may surface in logs / UI / future shell
+            # interpolation. Restrict to a conservative whitelist
+            # before it leaves this controller.
+            raw_name = backup_file.filename or "restore.zip"
+            safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name)[:255]
+            payload = {
+                "mode": "browser",
+                "local_path": tmp_path,
+                "filename": safe_name or "restore.zip",
+                "backup_before_restore": (k.get("backup_before_restore") == "true"),
+            }
+            job_id = inst.restore_db(payload)
+            return request.make_json_response({"job_id": job_id})
+        except Exception:
+            with suppress(Exception):
+                Path(tmp_path).unlink()
+            _logger.exception("restore_instance_upload failed")
+            return request.make_json_response(
+                {"error": "An internal error occurred. Check server logs."}, status=500
+            )
+
+    # ── Chunked restore upload ────────────────────────────────────────────
+    # A reverse proxy or CDN in front of the panel caps how large a single
+    # request may be — Cloudflare at 100 MB, nginx at whatever
+    # ``client_max_body_size`` says — and the cap applies long before Odoo
+    # sees the request, so the one-shot route above answers 413 to any
+    # backup bigger than that no matter what ``max_content_length`` allows.
+    # Sending the archive in pieces keeps every request small; the file
+    # they rebuild is the same staged upload the executor already knows how
+    # to consume, so nothing downstream changes.
+
+    def _restore_upload_guard(self, instance_id, rate_limited=False):
+        """Authorise a restore-upload request and resolve its instance.
+
+        :param instance_id: instance being restored.
+        :param rate_limited: apply the per-user upload limit (the calls
+            that start work, not the ones that continue it — a large
+            archive is many parts and they must not trip it).
+        :return: ``(instance, None)`` when allowed, ``(None, response)``
+            when the caller must be turned away.
+        """
+        request.env["cloud.security.mixin"]._check_can_manage_backups()
+        if not request.env.user._is_internal():
+            return None, request.make_json_response(
+                {"error": "Forbidden"}, status=403,
+            )
+        if rate_limited and first_tripped(Rule(
+            f"restore_upload_user:{request.env.user.id}",
+            max_per_window=2,
+            log_tag=f"restore_upload user={request.env.user.id}",
+        )):
+            return None, request.make_json_response(
+                {"error": "Rate limit exceeded. Wait 60s and retry."},
+                status=429,
+            )
+        inst = request.env["cloud.instance"].browse(instance_id)
+        if not inst.exists() or not inst.host_id:
+            return None, request.make_json_response(
+                {"error": "Instance not found"}, status=404,
+            )
+        return inst, None
+
+    def _restore_upload_limit(self):
+        """Return the largest archive an upload may rebuild, in bytes."""
+        raw = request.env["ir.config_parameter"].sudo().get_param(
+            "incubacloud.restore_upload_max_bytes",
+        )
+        with suppress(TypeError, ValueError):
+            value = int(raw)
+            if value > 0:
+                return value
+        return _RESTORE_UPLOAD_MAX_BYTES
+
+    @http.route(
+        ["/cloud/instance/<int:instance_id>/restore/begin"],
+        methods=["POST"],
+        auth="user",
+        type="http",
+    )
+    def restore_upload_begin(self, instance_id, **k):
+        """Open a staged upload and return the token that continues it."""
+        inst, refused = self._restore_upload_guard(
+            instance_id, rate_limited=True,
+        )
+        if refused:
+            return refused
+        path = new_upload_path(instance_id)
+        try:
+            path.touch(mode=0o600)
+        except OSError:
+            _logger.exception("restore_upload_begin failed")
+            return request.make_json_response(
+                {"error": "An internal error occurred. Check server logs."},
+                status=500,
+            )
+        return request.make_json_response({
+            "upload_id": upload_id_of(path),
+            "max_bytes": self._restore_upload_limit(),
+            "chunk_bytes": _RESTORE_UPLOAD_CHUNK_BYTES,
+        })
+
+    @http.route(
+        ["/cloud/instance/<int:instance_id>/restore/part"],
+        methods=["POST"],
+        auth="user",
+        type="http",
+        max_content_length=_RESTORE_UPLOAD_PART_MAX_BYTES,
+    )
+    def restore_upload_part(self, instance_id, upload_id=None, offset=None,
+                            **k):
+        """Append one piece to a staged upload.
+
+        ``offset`` is what makes a retry safe: it must equal the size the
+        file already has. A piece that arrives twice names an offset
+        behind the end and is acknowledged without being written again; a
+        piece that arrives out of order names one past the end and is
+        refused, because appending it would leave a hole no reader could
+        detect.
+        """
+        inst, refused = self._restore_upload_guard(instance_id)
+        if refused:
+            return refused
+        path = path_for_upload(instance_id, upload_id)
+        if not path or not path.exists():
+            return request.make_json_response(
+                {"error": "Unknown upload"}, status=404,
+            )
+        chunk = request.httprequest.files.get("chunk")
+        if not chunk:
+            return request.make_json_response(
+                {"error": "No chunk provided"}, status=400,
+            )
+        try:
+            offset = int(offset)
+        except (TypeError, ValueError):
+            return request.make_json_response(
+                {"error": "Invalid offset"}, status=400,
+            )
+        size = path.stat().st_size
+        if offset < size:
+            return request.make_json_response({"size": size, "resent": True})
+        if offset > size:
+            return request.make_json_response(
+                {"error": "Out-of-order chunk", "size": size}, status=409,
+            )
+        limit = self._restore_upload_limit()
+        try:
+            with open(path, "ab") as target:
+                while True:
+                    block = chunk.stream.read(_RESTORE_UPLOAD_BLOCK_BYTES)
+                    if not block:
+                        break
+                    size += len(block)
+                    if size > limit:
+                        target.truncate(offset)
+                        return request.make_json_response(
+                            {"error": "Upload exceeds the maximum size"},
+                            status=413,
+                        )
+                    target.write(block)
+        except OSError:
+            _logger.exception("restore_upload_part failed")
+            return request.make_json_response(
+                {"error": "An internal error occurred. Check server logs."},
+                status=500,
+            )
+        return request.make_json_response({"size": size})
+
+    @http.route(
+        ["/cloud/instance/<int:instance_id>/restore/finish"],
+        methods=["POST"],
+        auth="user",
+        type="http",
+    )
+    def restore_upload_finish(self, instance_id, upload_id=None,
+                              filename=None, total_size=None, **k):
+        """Close a staged upload and enqueue the restore that consumes it."""
+        inst, refused = self._restore_upload_guard(instance_id)
+        if refused:
+            return refused
+        path = path_for_upload(instance_id, upload_id)
+        if not path or not path.exists():
+            return request.make_json_response(
+                {"error": "Unknown upload"}, status=404,
+            )
+        size = path.stat().st_size
+        if not size:
+            with suppress(OSError):
+                path.unlink()
+            return request.make_json_response(
+                {"error": "No file provided"}, status=400,
+            )
+        with suppress(TypeError, ValueError):
+            if int(total_size) != size:
+                with suppress(OSError):
+                    path.unlink()
+                return request.make_json_response(
+                    {"error": "Incomplete upload"}, status=400,
+                )
+        try:
+            os.chmod(path, 0o600)
+            safe_name = re.sub(
+                r"[^A-Za-z0-9._-]", "_", filename or "restore.zip",
+            )[:255]
+            job_id = inst.restore_db({
+                "mode": "browser",
+                "local_path": str(path),
+                "filename": safe_name or "restore.zip",
+                "backup_before_restore": (
+                    k.get("backup_before_restore") == "true"
+                ),
+            })
+            return request.make_json_response({"job_id": job_id})
+        except Exception:
+            with suppress(OSError):
+                path.unlink()
+            _logger.exception("restore_upload_finish failed")
+            return request.make_json_response(
+                {"error": "An internal error occurred. Check server logs."},
+                status=500,
+            )
+
+    @http.route(["/cloud/ping"], type="jsonrpc", auth="user")
+    def cloud_ping(self):
+        return {"response": "pong"}
+
+    @http.route(
+        "/cloud/health",
+        type="http",
+        auth="public",
+        methods=["GET"],
+        csrf=False,
+    )
+    def cloud_health(self, **kw):
+        """Public liveness probe.
+
+        Docker healthcheck, Kubernetes probes and load balancers can
+        GET this without authentication to decide whether this worker
+        is fit to serve. Returns HTTP 200 when the DB is reachable,
+        503 otherwise. Body is intentionally minimal: any extra detail
+        (module presence, version, etc.) would help an unauthenticated
+        attacker fingerprint this stack.
+        """
+        # Per-IP rate limit. 60/min comfortably covers Docker (1/30s),
+        # Kubernetes (every 10s) and Traefik (5s) healthchecks while
+        # bounding the cost of a public-endpoint flood.
+        ip = client_ip()
+        if first_tripped(Rule(
+            f"health_ip:{ip}",
+            max_per_window=60,
+            log_tag=f"health ip={ip}",
+        )):
+            return request.make_response(
+                json.dumps({"status": "rate_limited"}),
+                headers=[
+                    ("Content-Type", "application/json"),
+                    ("Cache-Control", "no-store"),
+                ],
+                status=429,
+            )
+
+        try:
+            request.env.cr.execute("SELECT 1")
+            return request.make_response(
+                json.dumps({"status": "ok"}),
+                headers=[
+                    ("Content-Type", "application/json"),
+                    ("Cache-Control", "no-store"),
+                ],
+                status=200,
+            )
+        except Exception as exc:
+            _logger.warning("health: db check failed: %s", exc)
+            return request.make_response(
+                json.dumps({"status": "down"}),
+                headers=[
+                    ("Content-Type", "application/json"),
+                    ("Cache-Control", "no-store"),
+                ],
+                status=503,
+            )

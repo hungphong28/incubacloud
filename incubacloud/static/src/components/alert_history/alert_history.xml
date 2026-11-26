@@ -1,0 +1,278 @@
+<templates>
+<t t-name="incubacloud.AlertHistory">
+<div class="ic-alert-history">
+
+    <!-- Header -->
+    <t t-if="!props.embedded">
+        <div class="rl-phead">
+            <div class="rl-htext">
+                <h1 class="rl-ptitle">Alert History</h1>
+            </div>
+            <div class="rl-pactions">
+                <button class="rl-btn rl-btn-ghost" t-on-click="loadAlerts">
+                    <t t-out="env.icon('refresh', 15)"/> Refresh
+                </button>
+            </div>
+        </div>
+    </t>
+
+    <!-- Filters -->
+    <div class="ah-filters">
+        <span class="ah-filter-label">Show</span>
+        <div class="ah-chips">
+            <button t-att-class="'ah-chip' + (state.stateFilter === 'all' ? ' active' : '')"
+                    t-on-click="() => this.setFilter('all')">All</button>
+            <button t-att-class="'ah-chip' + (state.stateFilter === 'active' ? ' active' : '')"
+                    t-on-click="() => this.setFilter('active')">Active</button>
+            <button t-att-class="'ah-chip' + (state.stateFilter === 'dismissed' ? ' active' : '')"
+                    t-on-click="() => this.setFilter('dismissed')">Dismissed</button>
+        </div>
+        <span class="ah-filter-label">Level</span>
+        <div class="ah-chips">
+            <button t-att-class="'ah-chip' + (state.levelFilter === 'all' ? ' active' : '')"
+                    t-on-click="() => this.setLevelFilter('all')">All</button>
+            <button t-att-class="'ah-chip' + (state.levelFilter === 'critical' ? ' active' : '')"
+                    t-on-click="() => this.setLevelFilter('critical')">Critical</button>
+            <button t-att-class="'ah-chip' + (state.levelFilter === 'warning' ? ' active' : '')"
+                    t-on-click="() => this.setLevelFilter('warning')">Warning</button>
+        </div>
+        <t t-if="canDismissAll">
+            <button class="rl-tl-abtn"
+                    title="Dismisses the listed non-conflict alerts for all users"
+                    t-on-click="openDismissAll">
+                <t t-out="env.icon('check', 14)"/> Dismiss all
+            </button>
+        </t>
+        <IcPager offset="state.offset" limit="pageSize"
+                 total="state.total"
+                 onPage="(o) => this.goPage(o)"/>
+    </div>
+
+    <!-- Loading -->
+    <t t-if="state.loading">
+        <div class="ic-skeleton-list" style="padding: 12px 0;">
+            <t t-foreach="[1,2,3]" t-as="i" t-key="i">
+                <div class="ic-skeleton-row" style="padding: 6px 0;">
+                    <div class="ic-skeleton-label" style="width: 120px;"/>
+                    <div class="ic-skeleton-value" style="width: 200px;"/>
+                </div>
+            </t>
+        </div>
+    </t>
+
+    <t t-else="">
+        <t t-if="!state.alerts.length">
+            <div class="rl-stub">
+                <span class="rl-si"><t t-out="env.icon('alert', 46)"/></span>
+                <h3>No alerts found</h3>
+                <p>Nothing to show for the current filter.</p>
+            </div>
+        </t>
+        <t t-else="">
+            <div class="ah-list">
+                <t t-foreach="state.alerts" t-as="alert" t-key="alert.id">
+                    <div t-att-class="'rl-sevban ah-card ' + levelClass(alert.level) + (state.focusedId === alert.id ? ' ah-card--focus' : '')"
+                         t-att-data-alert-id="alert.id">
+                        <span class="rl-si2"><t t-out="env.icon(levelIcon(alert.level), 18)"/></span>
+                        <div class="ah-card-body">
+                            <div class="ah-card-header">
+                                <div class="ah-card-left">
+                                    <t t-if="alert.instance_id and alert.project_id">
+                                        <span class="rl-at ah-card-target ah-card-link"
+                                              t-on-click.stop="() => this.goToInstance(alert)"
+                                              t-esc="alert.target or alert.host or '—'"/>
+                                    </t>
+                                    <t t-else="">
+                                        <span class="rl-at ah-card-target"
+                                              t-esc="alert.target or alert.host or '—'"/>
+                                    </t>
+                                    <span class="ah-card-code" t-esc="alert.code"/>
+                                </div>
+                                <div class="ah-card-right">
+                                    <span t-att-class="'rl-sb ah-state-badge ' + badgeState(alert)"
+                                          ><span class="rl-d"/><t t-esc="badgeState(alert)"/></span>
+                                    <span class="ah-card-date" t-esc="formatDate(alert.create_date)"/>
+                                    <t t-if="lastSeen(alert)">
+                                        <span class="ah-card-lastseen"
+                                              t-esc="'last seen ' + lastSeen(alert)"/>
+                                    </t>
+                                </div>
+                            </div>
+                            <div class="rl-ad ah-card-message" t-esc="alert.message"/>
+                            <div class="ah-card-resolved" t-if="alert.state === 'dismissed' and alert.resolution">
+                                <t t-if="alert.resolution === 'auto'">Resolved automatically</t>
+                                <t t-else="">Closed by a user</t>
+                                <t t-if="alert.resolved_at"> · <t t-esc="formatDate(alert.resolved_at)"/></t>
+                                <t t-if="alert.resolved_by_job_name"> · <t t-esc="alert.resolved_by_job_name"/> succeeded</t>
+                            </div>
+
+                            <!-- Error log groups: dedupe'd payload from instance_health -->
+                            <t t-if="alert.code === 'instance_error_logs' and alert.payload and alert.payload.length">
+                                <div class="ah-error-groups">
+                                    <button class="ah-error-toggle"
+                                            t-on-click="() => this.toggleExpanded(alert.id)">
+                                        <i t-att-class="state.expanded[alert.id] ? 'fa fa-caret-down' : 'fa fa-caret-right'"/>
+                                        <t t-if="state.expanded[alert.id]">Hide</t>
+                                        <t t-else="">Show</t>
+                                        <t t-esc="' ' + alert.payload.length + ' error group(s)'"/>
+                                    </button>
+                                    <t t-if="state.expanded[alert.id]">
+                                        <div class="ah-error-list">
+                                            <t t-foreach="alert.payload" t-as="grp" t-key="grp_index">
+                                                <div class="ah-error-group">
+                                                    <div class="ah-error-group-head">
+                                                        <span class="ah-error-count" t-esc="'×' + grp.count"/>
+                                                    </div>
+                                                    <t t-if="grp.samples and grp.samples.length">
+                                                        <pre class="ah-error-samples"><t t-foreach="grp.samples" t-as="line" t-key="line_index"><t t-esc="line"/><t t-if="!line_last">&#10;</t></t></pre>
+                                                    </t>
+                                                    <t t-if="grp.context and grp.context.length">
+                                                        <pre class="ah-error-context"><t t-foreach="grp.context" t-as="line" t-key="line_index"><t t-esc="line"/><t t-if="!line_last">&#10;</t></t></pre>
+                                                    </t>
+                                                </div>
+                                            </t>
+                                        </div>
+                                    </t>
+                                </div>
+                            </t>
+
+                            <div class="rl-tl-foot ah-card-actions" t-if="alert.state === 'active' or alert.job_id or alert.resolved_by_job_id">
+                                <div class="rl-acts">
+                                    <t t-if="alert.state === 'active' and alert.code === 'pip_conflict' and alert.conflict_data and alert.conflict_data.length">
+                                        <button class="rl-tl-abtn ah-btn-resolve" t-on-click="() => this.openResolve(alert)">
+                                            <t t-out="env.icon('settings', 14)"/> Resolve
+                                        </button>
+                                    </t>
+                                    <t t-elif="alert.state === 'active' and alert.code === 'addon_conflict'">
+                                        <button class="rl-tl-abtn ah-btn-resolve" t-on-click="() => this.openAddonConflict(alert)">
+                                            <t t-out="env.icon('settings', 14)"/> Resolve
+                                        </button>
+                                    </t>
+                                    <t t-if="alert.job_id">
+                                        <button class="rl-tl-abtn"
+                                                t-on-click="() => this.openJob(alert.job_id)">
+                                            <t t-out="env.icon('terminal', 15)"/> View job
+                                        </button>
+                                    </t>
+                                    <t t-if="alert.resolved_by_job_id">
+                                        <button class="rl-tl-abtn"
+                                                t-on-click="() => this.openJob(alert.resolved_by_job_id)">
+                                            <t t-out="env.icon('check', 15)"/> View resolving job
+                                        </button>
+                                    </t>
+                                    <t t-if="alert.state === 'active' and alert.code !== 'pip_conflict' and alert.code !== 'addon_conflict'">
+                                        <button class="rl-tl-abtn"
+                                                title="Dismisses this alert for all users"
+                                                t-on-click="() => this.dismissAlert(alert)">
+                                            <t t-out="env.icon('check', 15)"/> Dismiss
+                                        </button>
+                                    </t>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </t>
+            </div>
+        </t>
+    </t>
+
+    <!-- Addon conflict modal -->
+    <IcModal t-if="state.addonConflictModal"
+             title="'Resolve Addon Conflicts'"
+             boxClass="'ic-confirm-box ah-resolve-box'"
+             onClose="() => this.closeAddonConflictModal()">
+        <h3 class="ic-confirm-title">Resolve Addon Conflicts</h3>
+        <p class="ah-resolve-sub">
+            Choose which repo should keep each addon.
+            The other repo(s) will have it added to their <strong>Excludes</strong> automatically.
+        </p>
+        <div class="ah-conflicts-list">
+            <t t-foreach="state.addonConflictModal.alert.conflict_data" t-as="c" t-key="c.addon">
+                <div class="ah-conflict-row">
+                    <span class="ah-conflict-pkg" t-esc="c.addon"/>
+                    <div class="ah-conflict-options">
+                        <t t-foreach="c.repos || []" t-as="repo" t-key="repo">
+                            <label class="ah-conflict-opt">
+                                <input type="radio"
+                                       t-att-name="'addon_' + c.addon"
+                                       t-att-checked="state.addonConflictModal.choices[c.addon] === repo"
+                                       t-on-change="() => this.setAddonChoice(c.addon, repo)"/>
+                                <code t-esc="repo"/>
+                            </label>
+                        </t>
+                    </div>
+                </div>
+            </t>
+        </div>
+        <div class="ic-confirm-actions ah-resolve-actions">
+            <button class="ic-confirm-btn-cancel" t-on-click="closeAddonConflictModal">Cancel</button>
+            <button class="ic-confirm-btn-ok" t-on-click="confirmResolveAddon">Apply &amp; Resolve</button>
+        </div>
+    </IcModal>
+
+    <!-- Resolve pip conflict modal -->
+    <IcModal t-if="state.resolveModal"
+             title="'Resolve Pip Conflicts'"
+             boxClass="'ic-confirm-box ah-resolve-box'"
+             onClose="() => this.closeResolveModal()">
+        <h3 class="ic-confirm-title">Resolve Pip Conflicts</h3>
+        <p class="ah-resolve-sub">Choose which version spec to keep for each package:</p>
+        <div class="ah-conflicts-list">
+            <t t-foreach="state.resolveModal.alert.conflict_data" t-as="c" t-key="c.name">
+                <div class="ah-conflict-row">
+                    <span class="ah-conflict-pkg" t-esc="c.name"/>
+                    <div class="ah-conflict-options">
+                        <label class="ah-conflict-opt">
+                            <input type="radio"
+                                   t-att-name="'conflict_' + c.name"
+                                   t-att-checked="state.resolveModal.choices[c.name] === c.existing"
+                                   t-on-change="() => this.setChoice(c.name, c.existing)"/>
+                            <code t-esc="c.existing"/>
+                            <span class="ah-conflict-hint"
+                                  t-esc="'(' + (c.existing_source || 'existing') + ')'"/>
+                        </label>
+                        <label class="ah-conflict-opt">
+                            <input type="radio"
+                                   t-att-name="'conflict_' + c.name"
+                                   t-att-checked="state.resolveModal.choices[c.name] === c.incoming"
+                                   t-on-change="() => this.setChoice(c.name, c.incoming)"/>
+                            <code t-esc="c.incoming"/>
+                            <span class="ah-conflict-hint"
+                                  t-esc="'(' + (c.incoming_source || 'incoming') + ')'"/>
+                        </label>
+                    </div>
+                </div>
+            </t>
+        </div>
+        <div class="ic-confirm-actions ah-resolve-actions">
+            <button class="ic-confirm-btn-cancel" t-on-click="closeResolveModal">Cancel</button>
+            <t t-if="state.resolveModal.alert.project_id">
+                <button class="ic-confirm-btn-cancel ah-btn-edit-manually" t-on-click="resolveManually"
+                        title="Open the pip dependency list with this conflict selected, to fix it by hand">
+                    Edit Manually
+                </button>
+            </t>
+            <button class="ic-confirm-btn-ok" t-on-click="confirmResolve">Apply &amp; Resolve</button>
+        </div>
+    </IcModal>
+
+    <!-- Bulk dismiss confirmation -->
+    <IcModal t-if="state.dismissAllModal"
+             title="'Dismiss all alerts'"
+             boxClass="'ic-confirm-box'"
+             onClose="() => this.closeDismissAll()">
+        <h3 class="ic-confirm-title">Dismiss all alerts</h3>
+        <p class="ic-confirm-message">
+            This dismisses every listed non-conflict alert
+            <strong>for all users</strong>, not just for you.
+            Conflict alerts that block deploys are kept.
+        </p>
+        <div class="ic-confirm-actions">
+            <button class="ic-confirm-btn-cancel" t-on-click="closeDismissAll">Cancel</button>
+            <button class="ic-confirm-btn-ok" t-on-click="confirmDismissAll">Dismiss all</button>
+        </div>
+    </IcModal>
+
+</div>
+</t>
+</templates>

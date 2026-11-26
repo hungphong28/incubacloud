@@ -1,0 +1,1159 @@
+#!/usr/bin/env bash
+# Host-side operations of continuous recovery (point-in-time recovery).
+#
+# Usage:
+#   pitr.sh install       <dir> <version> <sha256_amd64> <sha256_aarch64>
+#   pitr.sh enable        <dir> <pg_user> <archive_timeout_s>
+#   pitr.sh base-backup   <dir> <pg_user> [full]
+#   pitr.sh housekeep     <dir> <pg_user> <cutoff_utc> <cutoff_day> [old cluster]...
+#   pitr.sh list          <dir> <pg_user>
+#   pitr.sh status        <dir> <pg_user>
+#   pitr.sh drain         <dir> <pg_user> <timeout_s>
+#   pitr.sh restore-start <dir> <pg_user> <job> <cluster> <base> <timeline> <target_utc> <since_day> [<db> <update>]
+#   pitr.sh restore-wait  <dir> <job> <max_s>   (0 also while it still runs)
+#   pitr.sh restore-cancel <dir> <job> <max_s>
+#   pitr.sh disable       <dir> <pg_user>
+#   pitr.sh settle        <dir> <pg_user> <cluster|->
+#
+# Two pieces run in the instance's stack, both from ``<dir>/.walg``:
+#
+# * ``db`` mounts it read-only at /opt/walg and archives with
+#   ``/opt/walg/archive %f`` (pitr_archive.sh), which holds no secret and
+#   only waits for the agent: Odoo connects as a superuser, whose SQL can
+#   read the database container's environment.
+# * the ``pitr`` agent (pitr_agent.sh, rclone image) has the credentials
+#   (.docker/pitr.env), uploads the log and the filestore, and runs wal-g
+#   for everything else. wal-g's builds are for glibc and the images are
+#   Alpine (musl), so ``install`` copies the host's glibc loader and the
+#   libraries wal-g needs next to it, and ``run`` starts it through them.
+#
+# A restore stops the database for as long as it takes, which can outlast
+# any one job: ``restore-start`` hands it to a process of its own on the
+# host (``restore-run``), which no lost connection or panel restart
+# interrupts, and ``restore-wait`` follows it. That process holds a lock
+# in .walg/restore/, puts the previous data back if the restored copy does
+# not come up, starts the instance again however it ends, and records how
+# it ended in .walg/restore/result.
+#
+# With ``update`` 1 the restored database <db> has its modules updated to
+# the code the instance runs, as a rebuild does (``cron_guard.sh update``,
+# copied next to this script for the process): once the files are back,
+# with Odoo still stopped, before the stack comes up, for an hour at most
+# (``UPDATE_TIMEOUT_S``). Only a database that replaced the previous one
+# (promoted) is updated; one that failed, or ran out of time, does not keep
+# the instance down (``modules=failed`` in the result). The guard is
+# needed beside this script only then.
+#
+# A database that replaced the previous one also has Odoo's default admin
+# password, if it still holds it, replaced with a random one before the
+# stack comes up (core's ``admin_password.sh``, copied next to this script
+# for the process when the caller staged it and names <db>): ``admin=`` in
+# the result says ``changed``, ``own``, ``absent``, ``failed`` or
+# ``unchecked``. Neither of the last two keeps the instance down.
+#
+# ``restore-cancel`` stops it: a TERM to that process, which puts back what
+# it changed, and a wait for the result. Up to the promotion of the
+# restored database; from there it goes on to the end, update included,
+# since a database that has replaced the previous one cannot be taken
+# back (6-nov-2026).
+#
+# IC_PITR_HOME and IC_PITR_ENV name another directory and environment
+# (default .walg and .docker/pitr.env) for a second stack in the same
+# directory: the platform's QA copy of its manager.
+#
+# Nothing secret is ever an argument here.
+set -euo pipefail
+# Uploaded next to core's scripts, whose lib/ it shares.
+# shellcheck source-path=SCRIPTDIR/../../incubacloud/scripts source=lib/common.sh
+source "$(dirname "$0")/lib/common.sh"
+
+ic_require_args 2 "$#" "pitr.sh <operation> <dir> ..."
+
+op="$1"
+dir="$(ic_expand_home "$2")"
+shift 2
+here="$(cd "$(dirname "$0")" && pwd)"
+
+[ -d "$dir" ] || ic_die "instance directory not found: $dir"
+cd "$dir"
+
+AGENT=pitr
+# Where the pieces live, relative to the directory, and the agent's
+# environment. Another stack in the same directory (the platform's QA copy
+# of its manager) keeps its own: the agent's marks are per stack.
+W="${IC_PITR_HOME:-.walg}"
+ENVF="${IC_PITR_ENV:-.docker/pitr.env}"
+[[ "$W" =~ ^\.[A-Za-z0-9_.-]+$ ]] || ic_die "bad IC_PITR_HOME: $W"
+[[ "$ENVF" =~ ^\.docker/[A-Za-z0-9_.-]+\.env$ ]] || ic_die "bad IC_PITR_ENV: $ENVF"
+RESTORE="$W/restore"
+# How long a restore's update of its database's modules may run: the hour
+# a rebuild's own update has (the panel's limit for one command,
+# DEFAULT_SSH_COMMAND_TIMEOUT). The instance is stopped while it runs and
+# a cancel does not cut it, so one that hangs would keep it down for good.
+# On that hour its one-off Odoo container is removed (``docker rm -f``: a
+# TERM to the compose client does not stop an Odoo running as PID 1, which
+# ignores it), the guard puts the crons back, and the instance starts on
+# the database partly updated (``modules=failed``). IC_PITR_UPDATE_TIMEOUT_S
+# sets another, for the tests (11-nov-2026).
+UPDATE_TIMEOUT_S="${IC_PITR_UPDATE_TIMEOUT_S:-3600}"
+[[ "$UPDATE_TIMEOUT_S" =~ ^[0-9]+$ ]] || ic_die "bad IC_PITR_UPDATE_TIMEOUT_S: $UPDATE_TIMEOUT_S"
+# Once its container is gone, how long the guard has to put the crons back
+# and end before it is killed (11-nov-2026).
+UPDATE_GRACE_S=120
+
+# ``psql`` in the db container, as the instance's database owner.
+#   $1     database user
+#   $2...  psql arguments
+db_psql() {
+    local user="$1"
+    shift
+    docker compose exec -T db psql -U "$user" -d postgres -v ON_ERROR_STOP=1 -Atq "$@"
+}
+
+# The agent, for one operation of pitr_agent.sh.
+agent() {
+    docker compose exec -T "$AGENT" sh /opt/walg/pitr_agent.sh "$@"
+}
+
+# The cluster's system identifier.
+#   $1  database user
+cluster_id() {
+    db_psql "$1" -c "SELECT system_identifier FROM pg_control_system()"
+}
+
+# Whether a service of the stack is running now, one-off containers aside.
+running() {
+    # The whole list is read: grep -q would stop at the first match and,
+    # under pipefail, a docker still writing makes it "not running".
+    ic_running_services 2>/dev/null | grep -x "$1" >/dev/null
+}
+
+# Remove the one-off containers of the stack's odoo service (``docker
+# compose run odoo``), running or not. Compose lists a one-off as its
+# service (see ic_running_services); only those whose label says they are
+# one go, the instance's own odoo stays.
+remove_odoo_oneoffs() {
+    local id
+    for id in $(docker compose ps -a -q odoo 2>/dev/null); do
+        if [ "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.oneoff"}}' "$id" 2>/dev/null)" = True ]; then
+            docker rm -f "$id" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+# Stop again a database this run started, unless Odoo runs: with Odoo
+# up, the database was not stopped but restarting (a TERM during
+# restart_db, an abort meeting a restart), and stopping it would take
+# the instance down.
+#   $1  1 when this run started the database
+stop_again() {
+    if [ "$1" -eq 1 ] && ! running odoo; then
+        docker compose stop db
+    fi
+}
+
+# Wait until the database answers.
+#   $1  database user
+wait_db() {
+    for _ in $(seq 1 60); do
+        if docker compose exec -T db pg_isready -U "$1" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    ic_die "the database did not come back within 120 s"
+}
+
+# Start Odoo again after restart_db stopped it, and say so on a line of
+# its own: its metrics series is gone for about a minute, which the
+# panel's liveness cron reads as a stop unless the job confirms the
+# instance running, as it does on that line.
+start_odoo() {
+    docker compose start odoo
+    echo "IC_PITR_ODOO_RESTARTED"
+}
+
+# Restart the database with Odoo stopped around it, so no request meets
+# a database going away. Odoo comes back however this ends (start_odoo).
+#   $1  database user
+restart_db() {
+    local was=0
+    if running odoo; then
+        was=1
+        docker compose stop odoo
+        trap start_odoo EXIT
+    fi
+    docker compose restart db
+    wait_db "$1"
+    if [ "$was" -eq 1 ]; then
+        start_odoo
+        trap - EXIT
+    fi
+}
+
+# The newest base copy's name of a cluster, or nothing.
+#   $1  cluster
+newest_base() {
+    agent walg "$1" backup-list --json 2>/dev/null | python3 -c 'import json, sys
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    rows = []
+print(rows[-1]["backup_name"] if rows else "")' || true
+}
+
+# The ``IC_PITR_BASES`` line: a cluster and its base copies.
+#   $1  cluster
+bases_line() {
+    echo "IC_PITR_BASES $1 $(agent walg "$1" backup-list --json --detail | tr -d '\n')"
+}
+
+# The last restore's result as ``restore_<key>=<value>`` pairs.
+restore_info() {
+    [ -f "$RESTORE/result" ] || return 0
+    sed 's/^/restore_/' "$RESTORE/result" | tr '\n' ' '
+}
+
+# Follow the restore of a job: print its log's new lines until its result
+# is written, for up to a number of seconds.
+#   $1  job
+#   $2  seconds to wait at most (0: look once)
+#   $3  lines of the log already shown
+# Returns 0 once a result names the job, 3 when its process still runs at
+# the end of the wait, 4 when no process of the job runs and no result
+# names it (it never started, or it is lost).
+follow_restore() {
+    local job="$1" max="$2" shown="$3" waited=0 lines pid
+    while :; do
+        if [ -f "$RESTORE/log" ]; then
+            lines="$(wc -l < "$RESTORE/log")"
+            if [ "$lines" -gt "$shown" ]; then
+                sed -n "$((shown + 1)),${lines}p" "$RESTORE/log"
+                shown="$lines"
+            fi
+        fi
+        grep -qx "job=$job" "$RESTORE/result" 2>/dev/null && return 0
+        pid="$(cat "$RESTORE/pid" 2>/dev/null || true)"
+        if [ "$(cat "$RESTORE/lock" 2>/dev/null)" != "$job" ] \
+                || ! { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }; then
+            # Read once more: it may have ended between the two checks.
+            grep -qx "job=$job" "$RESTORE/result" 2>/dev/null && return 0
+            return 4
+        fi
+        if [ "$waited" -ge "$max" ]; then
+            return 3
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+}
+
+# The ``IC_PITR_RESTORE`` line of a restore still running. ``phase=update``
+# once its log says its modules are being updated: its database is in
+# place, and a cancel no longer undoes anything.
+running_line() {
+    if grep -q "updating the restored database's modules" "$RESTORE/log" 2>/dev/null; then
+        echo "IC_PITR_RESTORE state=running phase=update"
+    else
+        echo "IC_PITR_RESTORE state=running"
+    fi
+}
+
+# The restore's result as one ``IC_PITR_RESTORE`` line.
+result_line() {
+    echo "IC_PITR_RESTORE $(tr '\n' ' ' < "$RESTORE/result")"
+}
+
+case "$op" in
+    install)
+        ic_require_args 3 "$#" "pitr.sh install <dir> <version> <sha256_amd64> <sha256_aarch64>"
+        version="$1"; sha_amd64="$2"; sha_aarch64="$3"
+        case "$(uname -m)" in
+            x86_64)
+                arch=amd64; sha="$sha_amd64"
+                loader=/lib64/ld-linux-x86-64.so.2; libdir=/lib/x86_64-linux-gnu ;;
+            aarch64)
+                arch=aarch64; sha="$sha_aarch64"
+                loader=/lib/ld-linux-aarch64.so.1; libdir=/lib/aarch64-linux-gnu ;;
+            *) ic_die "unsupported architecture: $(uname -m)" ;;
+        esac
+        [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || ic_die "bad version: $version"
+        [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || ic_die "bad checksum for $arch"
+        # One download per host and version; every instance copies it.
+        cache="$HOME/.cache/incubacloud/walg/$version"
+        bin="$cache/wal-g-pg-20.04-$arch"
+        mkdir -p "$cache"
+        if ! echo "$sha  $bin" | sha256sum -c --status 2>/dev/null; then
+            ic_log "downloading wal-g $version ($arch)"
+            # A file of its own: several instances of a host may be
+            # switched on at once.
+            part="$(mktemp "$cache/.part.XXXXXX")"
+            trap 'rm -f "$part"' EXIT
+            # A passing GitHub error (a 504, a 503 for minutes) must not
+            # fail the install. Without --retry-delay curl waits 1 s, then
+            # twice as long each time (up to 10 min); --retry-max-time
+            # stops the retries after 15 min, within the step's hour
+            # (a 503 outlasted 6 tries 10 s apart, QA 8-nov-2026).
+            # --retry-all-errors needs curl 7.71 (Debian 12 and Ubuntu
+            # 22.04 ship 7.88 and 7.81).
+            curl -fsSL --retry 10 --retry-max-time 900 --retry-all-errors \
+                --connect-timeout 20 --max-time 300 -o "$part" \
+                "https://github.com/wal-g/wal-g/releases/download/$version/wal-g-pg-20.04-$arch"
+            echo "$sha  $part" | sha256sum -c --status \
+                || ic_die "wal-g checksum mismatch: refusing it"
+            chmod 755 "$part"
+            mv -f "$part" "$bin"
+            trap - EXIT
+        fi
+        # The agent's marks start again: a new cluster in this directory
+        # may reuse a segment name it left a mark for.
+        rm -rf "${W:?}/spool/done"
+        mkdir -p "$W/lib" "$W/spool/done"
+        chmod 755 "$W" "$W/lib"
+        install -m 755 "$bin" "$W/wal-g"
+        install -m 755 "$loader" "$W/lib/$(basename "$loader")"
+        for lib in libc.so.6 libm.so.6 libpthread.so.0 libresolv.so.2; do
+            install -m 755 "$libdir/$lib" "$W/lib/$lib"
+        done
+        # wal-g starts copies of itself by its argv[0] (the restore's
+        # prefetch): --argv0 makes that this wrapper, not the binary,
+        # which the container cannot start without the loader.
+        cat > "$W/run" <<EOF
+#!/bin/sh
+# Generated by incubacloud_pitr: run the glibc wal-g build inside a musl
+# container through the loader and libc copied next to it.
+d=\$(dirname "\$0")
+exec "\$d/lib/$(basename "$loader")" --library-path "\$d/lib" --argv0 "\$0" "\$d/wal-g" "\$@"
+EOF
+        chmod 755 "$W/run"
+        install -m 755 "$here/pitr_archive.sh" "$W/archive"
+        install -m 755 "$here/pitr_agent.sh" "$W/pitr_agent.sh"
+        "$W/run" --version | head -n 1
+        ic_log "wal-g $version installed for this instance."
+        ;;
+
+    enable)
+        ic_require_args 2 "$#" "pitr.sh enable <dir> <pg_user> <archive_timeout_s>"
+        user="$1"; timeout="$2"
+        [[ "$timeout" =~ ^[0-9]+$ ]] || ic_die "bad archive timeout: $timeout"
+        [ -x "$W/archive" ] || ic_die "continuous recovery is not installed here"
+        running db || ic_die "the database is not running"
+        docker compose exec -T db test -x /opt/walg/archive \
+            || ic_die "the archive command is not mounted in the db container: rebuild the instance first"
+        # The agent first: once archiving is on, the database waits on it.
+        # Recreated, so it starts the script it idled without.
+        docker compose up -d --no-deps --force-recreate "$AGENT"
+        cluster="$(cluster_id "$user")"
+        mode="$(db_psql "$user" -c "SHOW archive_mode")"
+        # archive_mode is written down even when the stack's command line
+        # has it on: a restore's recovery starts the data directory
+        # without that line, and must archive the timeline it begins.
+        db_psql "$user" \
+            -c "ALTER SYSTEM SET archive_command = '/opt/walg/archive %f'" \
+            -c "ALTER SYSTEM SET archive_timeout = '$timeout'" \
+            -c "ALTER SYSTEM SET archive_mode = 'on'"
+        restarted=0
+        if [ "$mode" != "on" ]; then
+            # archive_mode only changes with a restart. A stack rendered
+            # with this module starts with it on: a reload is enough.
+            restart_db "$user"
+            restarted=1
+        else
+            db_psql "$user" -c "SELECT pg_reload_conf()" >/dev/null
+        fi
+        [ "$(db_psql "$user" -c "SHOW archive_mode")" = "on" ] \
+            || ic_die "archive_mode is still off"
+        echo "IC_PITR_CLUSTER $cluster restarted=$restarted"
+        # One segment end to end, so credentials that do not work fail
+        # here and not on the first night.
+        before="$(db_psql "$user" -c "SELECT archived_count FROM pg_stat_archiver")"
+        db_psql "$user" -c "SELECT txid_current()" -c "SELECT pg_switch_wal()" >/dev/null
+        for _ in $(seq 1 90); do
+            now="$(db_psql "$user" -c "SELECT archived_count FROM pg_stat_archiver")"
+            if [ "$now" -gt "$before" ]; then
+                ic_log "archiving works."
+                exit 0
+            fi
+            sleep 1
+        done
+        docker compose logs --tail 5 "$AGENT" >&2 || true
+        ic_die "archiving is on, but no segment reached the bucket within 90 s"
+        ;;
+
+    base-backup)
+        ic_require_args 1 "$#" "pitr.sh base-backup <dir> <pg_user> [full]"
+        user="$1"; kind="${2:-delta}"
+        docker compose up -d "$AGENT"
+        cluster="$(cluster_id "$user")"
+        # A delta only takes the pages changed since its base. A base of
+        # another timeline (copied before a restore to the past) holds
+        # changes the restored database never had, which a delta on top
+        # would carry back: wal-g does not check, so the chain starts
+        # again with a full copy whenever the timeline changed, and the
+        # first copy of a cluster is a full one.
+        timeline="$(db_psql "$user" -c \
+            "SELECT lpad(upper(to_hex(timeline_id)), 8, '0') FROM pg_control_checkpoint()")"
+        newest="$(newest_base "$cluster")"
+        if [ -z "$newest" ] || [ "${newest:5:8}" != "$timeline" ]; then
+            kind=full
+        fi
+        if [ "$kind" = "full" ]; then
+            agent base "$cluster" full
+        elif ! agent base "$cluster" delta; then
+            # A delta builds on the newest copy; after a restore to the
+            # past that copy is ahead of the database, and wal-g refuses
+            # it. A full copy starts the chain again.
+            ic_warn "the delta copy was refused; taking a full one"
+            agent base "$cluster" full
+        fi
+        bases_line "$cluster"
+        ;;
+
+    housekeep)
+        ic_require_args 3 "$#" "pitr.sh housekeep <dir> <pg_user> <cutoff_utc> <cutoff_day> [old cluster]..."
+        user="$1"; cutoff="$2"; cutoff_day="$3"
+        shift 3
+        [[ "$cutoff" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+            || ic_die "bad cutoff: $cutoff"
+        [[ "$cutoff_day" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || ic_die "bad day: $cutoff_day"
+        docker compose up -d "$AGENT"
+        cluster="$(cluster_id "$user")"
+        # Each part on its own: one that fails does not keep the others
+        # from running, and the step still says it failed.
+        failed=0
+        # FIND_FULL keeps the full copy a kept delta still needs.
+        agent walg "$cluster" delete before FIND_FULL "$cutoff" --confirm \
+            || { ic_warn "dropping what left the window failed"; failed=1; }
+        agent fs-purge-deleted "$cutoff_day" \
+            || { ic_warn "dropping old filestore deletions failed"; failed=1; }
+        for old in "$@"; do
+            if [ "$old" = "$cluster" ]; then
+                ic_warn "refusing to drop the archive of the current cluster $old"
+                continue
+            fi
+            if agent purge "$old"; then
+                echo "IC_PITR_PURGED $old"
+            else
+                ic_warn "dropping the archive of cluster $old failed"
+                failed=1
+            fi
+        done
+        bases_line "$cluster"
+        exit "$failed"
+        ;;
+
+    list)
+        ic_require_args 1 "$#" "pitr.sh list <dir> <pg_user>"
+        user="$1"
+        docker compose up -d "$AGENT"
+        bases_line "$(cluster_id "$user")"
+        ;;
+
+    status)
+        ic_require_args 1 "$#" "pitr.sh status <dir> <pg_user>"
+        user="$1"
+        if [ -f "$RESTORE/lock" ]; then
+            # The database may be down on purpose: nothing to read. A lock
+            # whose process is gone (the host rebooted, it was killed) is
+            # a restore that never finished, and is said so.
+            pid="$(cat "$RESTORE/pid" 2>/dev/null || true)"
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                echo "IC_PITR_STATUS restoring=1 $(restore_info)"
+            else
+                echo "IC_PITR_STATUS restoring=lost job=$(cat "$RESTORE/lock") $(restore_info)"
+            fi
+            exit 0
+        fi
+        row="$(db_psql "$user" -F ' ' -c "SELECT current_setting('archive_mode'),
+            coalesce(extract(epoch FROM last_archived_time)::bigint, 0),
+            failed_count,
+            coalesce(extract(epoch FROM last_failed_time)::bigint, 0),
+            (SELECT system_identifier FROM pg_control_system())
+            FROM pg_stat_archiver")"
+        read -r mode last failed last_failed cluster <<<"$row"
+        # Segments waiting for the archive: none means nothing is owed,
+        # however long ago the last one left (an idle database).
+        pending="$(docker compose exec -T db sh -c '
+            now=$(date +%s); n=0; oldest=0
+            for f in "$PGDATA"/pg_wal/archive_status/*.ready; do
+                [ -e "$f" ] || continue
+                n=$((n + 1)); age=$((now - $(stat -c %Y "$f")))
+                [ "$age" -gt "$oldest" ] && oldest=$age
+            done
+            echo "$n $oldest"')"
+        read -r n oldest <<<"$pending"
+        agent_up=0
+        if running "$AGENT"; then agent_up=1; fi
+        fs_ok="$(cat "$W/spool/fs-ok" 2>/dev/null || echo 0)"
+        [[ "$fs_ok" =~ ^[0-9]+$ ]] || fs_ok=0
+        echo "IC_PITR_STATUS mode=$mode last_archived=$last failed=$failed" \
+            "last_failed=$last_failed cluster=$cluster pending=$n oldest_pending=$oldest" \
+            "agent=$agent_up fs_ok=$fs_ok now=$(date +%s) $(restore_info)"
+        ;;
+
+    drain)
+        ic_require_args 2 "$#" "pitr.sh drain <dir> <pg_user> <timeout_s>"
+        user="$1"; timeout="$2"
+        db_psql "$user" -c "SELECT txid_current()" -c "SELECT pg_switch_wal()" >/dev/null
+        n=0
+        for _ in $(seq 1 "$timeout"); do
+            n="$(docker compose exec -T db sh -c \
+                'ls "$PGDATA"/pg_wal/archive_status/ | grep -c "\.ready$" || true')"
+            if [ "$n" = "0" ]; then
+                ic_log "every segment is archived."
+                exit 0
+            fi
+            sleep 1
+        done
+        ic_die "$n segment(s) still not archived after ${timeout} s"
+        ;;
+
+    restore-start)
+        ic_require_args 7 "$#" "pitr.sh restore-start <dir> <pg_user> <job> <cluster> <base> <timeline> <target_utc> <since_day> [<db> <update>]"
+        user="$1"; job="$2"; cluster="$3"; backup="$4"; timeline="$5"; target="$6"; since="$7"
+        db="${8:-}"; update="${9:-0}"
+        [[ "$job" =~ ^[0-9]+$ ]] || ic_die "bad job: $job"
+        [[ "$cluster" =~ ^[0-9]+$ ]] || ic_die "bad cluster: $cluster"
+        [[ "$backup" =~ ^base_[0-9A-F_D]+$ ]] || ic_die "bad base backup: $backup"
+        [[ "$timeline" =~ ^[0-9]+$ ]] || ic_die "bad timeline: $timeline"
+        [[ "$target" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\+00$ ]] \
+            || ic_die "bad target time: $target"
+        [[ "$since" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || ic_die "bad day: $since"
+        [[ "$update" =~ ^[01]$ ]] || ic_die "bad update flag: $update"
+        # The guard is needed, and copied, only for an update: a caller
+        # that stages pitr.sh and lib/ alone and asks for none (eight
+        # arguments) still restores.
+        if [ "$update" = 1 ]; then
+            [[ "$db" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || ic_die "bad database: $db"
+            [ -f "$here/cron_guard.sh" ] || ic_die "cron_guard.sh is missing next to pitr.sh"
+        fi
+        mkdir -p "$RESTORE"
+        # The same job again (queue_job runs a job that died once more):
+        # follow the restore it started, never start a second one.
+        if grep -qx "job=$job" "$RESTORE/result" 2>/dev/null \
+                || [ "$(cat "$RESTORE/lock" 2>/dev/null)" = "$job" ]; then
+            ic_log "this job's restore is under way or done; following it"
+            echo "IC_PITR_RESTORE_STARTED $job"
+            exit 0
+        fi
+        if [ -f "$RESTORE/lock" ]; then
+            ic_die "another restore (job $(cat "$RESTORE/lock")) holds this instance: see $dir/$RESTORE/log"
+        fi
+        [ -x "$W/run" ] || ic_die "continuous recovery is not installed here"
+        running "$AGENT" || ic_die "the pitr agent is not running"
+        echo "$job" > "$RESTORE/lock"
+        # Read after the lock is written, as restore-cancel writes its
+        # mark before it reads the lock: a cancel that comes while this
+        # starts is seen by one of the two.
+        if [ "$(cat "$RESTORE/cancel" 2>/dev/null)" = "$job" ]; then
+            rm -f "$RESTORE/lock"
+            ic_die "the restore of job $job was cancelled before it started; nothing was changed"
+        fi
+        rm -f "$RESTORE/result" "$RESTORE/armed"
+        # The process runs from copies: the job's script directory goes
+        # when the job ends.
+        rm -rf "${RESTORE:?}/bin"
+        mkdir -p "$RESTORE/bin/lib"
+        install -m 755 "$0" "$RESTORE/bin/pitr.sh"
+        if [ "$update" = 1 ]; then
+            install -m 755 "$here/cron_guard.sh" "$RESTORE/bin/cron_guard.sh"
+        fi
+        if [ -n "$db" ] && [ -f "$here/admin_password.sh" ]; then
+            [[ "$db" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || ic_die "bad database: $db"
+            install -m 755 "$here/admin_password.sh" "$RESTORE/bin/admin_password.sh"
+        fi
+        install -m 644 "$here/lib/common.sh" "$RESTORE/bin/lib/common.sh"
+        : > "$RESTORE/log"
+        setsid nohup bash "$RESTORE/bin/pitr.sh" restore-run "$dir" "$user" "$job" \
+            "$cluster" "$backup" "$timeline" "$target" "$since" "$db" "$update" \
+            >> "$RESTORE/log" 2>&1 < /dev/null &
+        echo "$!" > "$RESTORE/pid"
+        ic_log "restore started on the host (job $job); its log is $dir/$RESTORE/log"
+        echo "IC_PITR_RESTORE_STARTED $job"
+        ;;
+
+    restore-run)
+        # Started by restore-start only, detached from the job. The
+        # scripts in single quotes run in containers, with their own
+        # variables.
+        user="$1"; job="$2"; cluster="$3"; backup="$4"; timeline="$5"; target="$6"; since="$7"
+        db="${8:-}"; update="${9:-0}"
+        recovery="pitr-recovery-$job"
+        fetcher="pitr-fetch-$job"
+        stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+        state=starting; staged=0; promoted=0; new_timeline=""; promoted_at=0; fs=no
+        modules=skipped; admin=unchecked
+        # Only a change of the admin's password this restore makes counts
+        # (``admin_password.sh``'s <since>): not one the restored database
+        # carries from before.
+        admin_since="$(date +%s)"
+        # The step running in the background (``background``), if any.
+        child=""
+        say() { printf '[incubacloud] %s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+        # Run a long step in the background, in a process group of its
+        # own, and wait for it. bash runs a trap only once the command in
+        # the foreground ends: a cancel (TERM) would wait for the end of a
+        # fetch of hours, or of a drain of five minutes. A ``wait`` is cut
+        # short by it, and ``finish`` takes the step down (``stop_step``).
+        #   $@  the command
+        background() {
+            local rc=0
+            set -m
+            "$@" &
+            child=$!
+            set +m
+            wait "$child" || rc=$?
+            child=""
+            return "$rc"
+        }
+        # Take down the step running in the background and whatever it
+        # started (the drain's docker compose exec): its whole process
+        # group, gone before anything else touches the stack. Up to 10 s
+        # for them to end on the TERM, then killed.
+        stop_step() {
+            [ -n "$child" ] || return 0
+            kill -TERM -- "-$child" 2>/dev/null
+            for _ in $(seq 1 50); do
+                kill -0 -- "-$child" 2>/dev/null || break
+                sleep 0.2
+            done
+            kill -KILL -- "-$child" 2>/dev/null
+            wait "$child" 2>/dev/null
+            child=""
+        }
+        # A script on the data directory, in a container of the db
+        # service, as root, with $PGDATA set.
+        #   $1     the script
+        #   $2...  ic_compose_run options (-e, -v)
+        in_db() {
+            local script="$1"
+            shift
+            ic_compose_run --rm --no-deps -T -u root "$@" --entrypoint sh db -c "$script"
+        }
+        # Put the data from before the restore back.
+        rollback() {
+            say "putting the previous data back"
+            docker compose stop db >/dev/null 2>&1 || true
+            # shellcheck disable=SC2016  # expanded in the container
+            in_db '
+                set -eu
+                D="$PGDATA"; old="$D/.pre-pitr-$IC_STAMP"; bad="$D/.pitr-failed-$IC_STAMP"
+                # Nothing was moved yet: the data is as it was, and what
+                # was fetched beside it goes.
+                if [ ! -d "$old" ]; then
+                    rm -rf "$D/.pitr-new"
+                    exit 0
+                fi
+                mkdir "$bad"
+                for f in "$D"/* "$D"/.[!.]*; do
+                    [ -e "$f" ] || continue
+                    case "$(basename "$f")" in .pre-pitr-*|.pitr-failed-*) continue ;; esac
+                    mv "$f" "$bad/"
+                done
+                for f in "$old"/* "$old"/.[!.]*; do
+                    [ -e "$f" ] || continue
+                    mv "$f" "$D/"
+                done
+                rmdir "$old"; rm -rf "$bad"' -e "IC_STAMP=$stamp"
+        }
+        # Update the restored database's modules to the code the instance
+        # runs, as a rebuild does, with Odoo stopped: a restore to before
+        # a deployment would otherwise serve the deployment's code over
+        # the schema of the moment. A cancel does not cut it (``finish``
+        # holds the signals); its time limit does (``UPDATE_TIMEOUT_S``).
+        # A failure does not keep the instance down: the result says it
+        # (``modules=failed``) and the panel raises it.
+        update_modules() {
+            local rc=0 guard waited=0 cut=0
+            say "updating the restored database's modules to the code the instance runs (for up to $UPDATE_TIMEOUT_S s)"
+            modules=failed
+            # In a process group of its own, which the grace's end kills.
+            set -m
+            bash "$here/cron_guard.sh" update "$dir" "$db" "$user" &
+            guard=$!
+            set +m
+            while kill -0 "$guard" 2>/dev/null; do
+                if [ "$cut" -eq 0 ] && [ "$waited" -ge "$UPDATE_TIMEOUT_S" ]; then
+                    say "the update ran for $UPDATE_TIMEOUT_S s: its Odoo container is removed"
+                    remove_odoo_oneoffs
+                    cut=1; waited=0
+                elif [ "$cut" -eq 1 ] && [ "$waited" -ge "$UPDATE_GRACE_S" ]; then
+                    say "the guard had not ended ${UPDATE_GRACE_S} s later: killed"
+                    kill -KILL -- "-$guard" 2>/dev/null
+                    break
+                fi
+                sleep 1
+                waited=$((waited + 1))
+            done
+            wait "$guard" || rc=$?
+            if [ "$cut" -eq 1 ]; then
+                say "the update was cut after $UPDATE_TIMEOUT_S s: Odoo starts on the restored database, partly updated; the lines above show how far it got"
+            elif [ "$rc" -eq 0 ]; then
+                modules=updated
+                say "modules updated"
+            else
+                say "updating the modules failed (exit $rc): Odoo starts on the restored database, partly updated; the lines above name the module"
+            fi
+        }
+        # Replace Odoo's default admin password of the restored database,
+        # with Odoo stopped, and keep the answer in ``admin``. A failure
+        # does not keep the instance down: the panel checks it again once
+        # it runs.
+        replace_default_admin_password() {
+            local out
+            admin=failed
+            if out="$(bash "$here/admin_password.sh" "$dir" "$db" stopped "$admin_since")"; then
+                case "$out" in
+                    *"ADMIN_PASSWORD changed"*) admin=changed ;;
+                    *"ADMIN_PASSWORD own"*) admin=own ;;
+                    *"ADMIN_PASSWORD absent"*) admin=absent ;;
+                esac
+            fi
+            say "admin password: $admin"
+        }
+        finish() {
+            local rc=$? stopped_at="$state" cancelled=0
+            set +e
+            # Nothing cuts the clean-up short: a second cancel is noted.
+            trap 'say "a cancel came as the restore ends: it ends as it is"' TERM HUP INT
+            # The containers first (their clients then end), then the step
+            # in the background and what it started: none of it may still
+            # write to the data or call compose once the stack comes up.
+            docker rm -f "$recovery" "$fetcher" >/dev/null 2>&1
+            stop_step
+            if [ "$(cat "$RESTORE/cancel" 2>/dev/null)" = "$job" ]; then
+                cancelled=1
+            fi
+            if [ "$state" != "done" ] && [ "$state" != "db-only" ]; then
+                if [ "$cancelled" -eq 1 ]; then
+                    say "the restore was cancelled at '$state'"
+                else
+                    say "the restore stopped at '$state' (exit $rc)"
+                fi
+                if [ "$promoted" -eq 1 ]; then
+                    # The restored database is in place; what came after
+                    # it did not finish.
+                    state="db-only"
+                elif [ "$staged" -eq 1 ]; then
+                    if rollback; then state="failed"; else state="failed-unknown"; fi
+                else
+                    state=failed
+                fi
+            fi
+            # A database that replaced the previous one is updated before
+            # anything starts on it, whatever came after its promotion.
+            if [ "$promoted" -eq 1 ] && [ "$update" = 1 ]; then
+                update_modules
+            fi
+            # Then, as the last write before Odoo serves it, Odoo's
+            # default admin password, if the database still has it.
+            if [ "$promoted" -eq 1 ] && [ -f "$here/admin_password.sh" ]; then
+                replace_default_admin_password
+            fi
+            # Whatever happened, the instance runs again.
+            docker compose up -d
+            # A cancel that came during the update went unheard: said too.
+            if [ "$(cat "$RESTORE/cancel" 2>/dev/null)" = "$job" ]; then
+                cancelled=1
+            fi
+            {
+                echo "job=$job"
+                echo "state=$state"
+                echo "stopped_at=$stopped_at"
+                echo "target=${target/ /T}"
+                echo "timeline=$new_timeline"
+                echo "promoted_at=$promoted_at"
+                echo "filestore=$fs"
+                echo "modules=$modules"
+                echo "admin=$admin"
+                echo "cancelled=$cancelled"
+            } > "$RESTORE/result"
+            rm -f "$RESTORE/lock" "$RESTORE/pid" "$RESTORE/armed"
+            if [ "$cancelled" -eq 1 ]; then
+                rm -f "$RESTORE/cancel"
+            fi
+            say "restore ended: $state"
+        }
+        trap finish EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        echo "$$" > "$RESTORE/pid"
+        # restore-cancel sends its TERM once this is here: before the
+        # traps, a TERM would end the process without a word.
+        touch "$RESTORE/armed"
+
+        say "restoring to $target UTC from $backup (cluster $cluster, timeline $timeline)"
+        state=stopping-odoo
+        docker compose stop odoo
+        state=draining
+        # What the database has not handed over yet is archived too, so
+        # the present can be gone back to as well. Odoo is stopped first:
+        # nothing is written after it.
+        background bash "$0" drain "$dir" "$user" 300
+        state=fetching
+        docker compose stop db
+        # From here a failure puts back whatever was moved, however far
+        # the swap got, and drops what was fetched beside the data.
+        staged=1
+        # Fetched beside the current data, then swapped in: wal-g only
+        # fetches into an empty directory, and the current data stays
+        # whole until the restored copy has come up. Room for a second
+        # copy of the data as it is now, and a margin. In the background,
+        # in a container with a name of its own that only writes
+        # .pitr-new: a cancel stops it at once.
+        docker rm -f "$fetcher" >/dev/null 2>&1 || true
+        # shellcheck disable=SC2016  # expanded in the container
+        background in_db '
+            set -eu
+            D="$PGDATA"; new="$D/.pitr-new"
+            for f in "$D"/.pre-pitr-*; do
+                [ -e "$f" ] || continue
+                echo "[incubacloud] ERROR: $f is left from an earlier restore; check it and remove it by hand" >&2
+                exit 1
+            done
+            used=$(du -sk "$D" | cut -f1)
+            free=$(df -Pk "$D" | awk "NR==2 {print \$4}")
+            needed=$((used * 11 / 10 + 524288))
+            if [ "$free" -lt "$needed" ]; then
+                echo "[incubacloud] ERROR: ${free} KB free, ${needed} KB needed" >&2
+                exit 1
+            fi
+            while IFS="=" read -r k v; do
+                case "$k" in [A-Z]*) export "$k=$v" ;; esac
+            done < /run/pitr.env
+            export WALG_S3_PREFIX="$IC_PITR_PREFIX/$IC_CLUSTER"
+            rm -rf "$new"; mkdir "$new"; chown postgres:postgres "$new"; chmod 700 "$new"
+            if ! su postgres -s /bin/sh -c "/opt/walg/run backup-fetch $new $IC_BACKUP"; then
+                rm -rf "$new"; exit 1
+            fi' \
+            --name "$fetcher" -v "$dir/$ENVF:/run/pitr.env:ro" \
+            -e "IC_CLUSTER=$cluster" -e "IC_BACKUP=$backup"
+        # The swap only renames, in the foreground: a cancel waits for it
+        # (a moment) and never finds it half done.
+        state=swapping
+        # shellcheck disable=SC2016  # expanded in the container
+        in_db '
+            set -eu
+            D="$PGDATA"; new="$D/.pitr-new"; old="$D/.pre-pitr-$IC_STAMP"
+            mkdir "$old"
+            for f in "$D"/* "$D"/.[!.]*; do
+                [ -e "$f" ] || continue
+                case "$(basename "$f")" in .pitr-new|.pre-pitr-*) continue ;; esac
+                mv "$f" "$old/"
+            done
+            for f in "$new"/* "$new"/.[!.]*; do
+                [ -e "$f" ] || continue
+                mv "$f" "$D/"
+            done
+            rmdir "$new"' -e "IC_STAMP=$stamp"
+        say "restored copy in place; the previous data is kept until it comes up"
+        state=recovering
+        # Recovery settings for this start only; reset once promoted.
+        # shellcheck disable=SC2016  # expanded in the container
+        in_db '
+            set -eu
+            D="$PGDATA"
+            {
+                echo "restore_command = '\''/opt/walg/run wal-fetch %f %p'\''"
+                echo "recovery_target_time = '\''$IC_TARGET'\''"
+                echo "recovery_target_action = '\''promote'\''"
+                echo "recovery_target_timeline = '\''$IC_TIMELINE'\''"
+            } >> "$D/postgresql.auto.conf"
+            touch "$D/recovery.signal"
+            chown postgres:postgres "$D/postgresql.auto.conf" "$D/recovery.signal"' \
+            -e "IC_TARGET=$target" -e "IC_TIMELINE=$timeline"
+        # A database of its own for the recovery, with the credentials
+        # wal-fetch needs; the db service never holds them. Odoo is
+        # stopped, so nothing of the instance's runs SQL meanwhile.
+        #
+        # The settings that run a program or load a library are set on
+        # the server's command line, which postgresql.auto.conf does not
+        # override: the panel's own commands, and nothing else.
+        # archive_library is a setting from PostgreSQL 15 on,
+        # event_triggers from 17 on.
+        docker rm -f "$recovery" >/dev/null 2>&1 || true
+        # shellcheck disable=SC2016  # expanded in the container
+        ic_compose_run -d --no-deps --name "$recovery" \
+            -v "$dir/$ENVF:/run/pitr.env:ro" -e "IC_CLUSTER=$cluster" \
+            --entrypoint sh db -c '
+            while IFS="=" read -r k v; do
+                case "$k" in [A-Z]*) export "$k=$v" ;; esac
+            done < /run/pitr.env
+            export WALG_S3_PREFIX="$IC_PITR_PREFIX/$IC_CLUSTER"
+            set -- -c "restore_command=/opt/walg/run wal-fetch %f %p" \
+                -c "archive_command=/opt/walg/archive %f" \
+                -c "recovery_end_command=" -c "archive_cleanup_command=" \
+                -c "ssl_passphrase_command=" -c "shared_preload_libraries=" \
+                -c "session_preload_libraries=" -c "local_preload_libraries=" \
+                -c "jit=off"
+            major="$(cat "$PGDATA/PG_VERSION")"
+            if [ "$major" -ge 15 ]; then set -- "$@" -c "archive_library="; fi
+            if [ "$major" -ge 17 ]; then set -- "$@" -c "event_triggers=off"; fi
+            exec /autoconf-entrypoint postgres "$@"' >/dev/null
+        # Its connections set at login, over a role's or a database's own
+        # settings, what those could otherwise load or run then, and read
+        # the server's functions from pg_catalog alone.
+        major="$(docker exec "$recovery" sh -c 'cat "$PGDATA/PG_VERSION"' 2>/dev/null || true)"
+        [[ "$major" =~ ^[0-9]+$ ]] || { say "the restored copy's version could not be read"; exit 1; }
+        pgoptions="-c search_path=pg_catalog -c session_preload_libraries= -c local_preload_libraries= -c jit=off"
+        if [ "$major" -ge 17 ]; then pgoptions+=" -c event_triggers=off"; fi
+        recovery_failed="startup process \(PID [0-9]+\) (exited with exit code [1-9]|was terminated by signal)|terminated by signal|recovery ended before configured recovery target|PANIC:"
+        # A long replay is given up to six hours.
+        for _ in $(seq 1 10800); do
+            st="$(docker exec -e "PGOPTIONS=$pgoptions" "$recovery" psql -U "$user" -d postgres -Atqc \
+                "SELECT pg_is_in_recovery()" 2>/dev/null || true)"
+            if [ "$st" = "f" ]; then
+                # From here a cancel undoes nothing: the restore goes on to
+                # the end, filestore included, rather than leave files half
+                # restored behind a database that replaced the previous one.
+                trap 'say "a cancel came once the restored database was up: the restore goes on to the end"' TERM
+                promoted=1
+                break
+            fi
+            # A recovery that cannot go on stops the server, or says why:
+            # no point waiting. Not any FATAL: this very poll gets one
+            # while the server is still replaying. The whole log is read
+            # (grep -q would stop the pipe early under pipefail).
+            if [ "$(docker inspect -f '{{.State.Running}}' "$recovery" 2>/dev/null)" != "true" ] \
+                    || docker logs "$recovery" 2>&1 | grep -E "$recovery_failed" >/dev/null; then
+                docker logs "$recovery" 2>&1 | grep -E "FATAL|PANIC|terminated" \
+                    | grep -v "not yet accepting" | tail -n 5 || true
+                break
+            fi
+            sleep 2
+        done
+        [ "$promoted" -eq 1 ] || { say "the restored copy did not come up"; exit 1; }
+        promoted_at="$(date +%s)"
+        new_timeline="$(docker exec -e "PGOPTIONS=$pgoptions" "$recovery" psql -U "$user" -d postgres -Atqc \
+            "SELECT substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)" || true)"
+        say "promoted on timeline $new_timeline"
+        state=promoting
+        docker exec -e "PGOPTIONS=$pgoptions" "$recovery" psql -U "$user" -d postgres -v ON_ERROR_STOP=1 -Atq \
+            -c "ALTER SYSTEM RESET restore_command" \
+            -c "ALTER SYSTEM RESET recovery_target_time" \
+            -c "ALTER SYSTEM RESET recovery_target_action" \
+            -c "ALTER SYSTEM RESET recovery_target_timeline" \
+            -c "CHECKPOINT" >/dev/null
+        docker stop -t 120 "$recovery" >/dev/null
+        docker rm -f "$recovery" >/dev/null 2>&1 || true
+        docker compose up -d db
+        wait_db "$user"
+        # shellcheck disable=SC2016  # expanded in the container
+        in_db 'rm -rf "$PGDATA"/.pre-pitr-*'
+        state=filestore
+        fs=failed
+        if ic_compose_run --rm --no-deps -T --entrypoint sh "$AGENT" \
+                /opt/walg/pitr_agent.sh fs-restore "$since"; then
+            fs=restored
+            state="done"
+        else
+            say "the filestore could not be restored; the database was"
+            state="db-only"
+        fi
+        ;;
+
+    restore-wait)
+        ic_require_args 2 "$#" "pitr.sh restore-wait <dir> <job> <max_s>"
+        job="$1"; max="$2"
+        [[ "$job" =~ ^[0-9]+$ ]] || ic_die "bad job: $job"
+        [[ "$max" =~ ^[0-9]+$ ]] || ic_die "bad wait: $max"
+        rc=0
+        follow_restore "$job" "$max" 0 || rc=$?
+        case "$rc" in
+            3)
+                # Not a failure: the next job follows it.
+                running_line
+                exit 0 ;;
+            4)
+                # Whose lock is left, if any: the job's own is a restore
+                # that is lost, another's or none says nothing of it ran.
+                echo "IC_PITR_RESTORE state=lost lock=$(cat "$RESTORE/lock" 2>/dev/null || echo none)"
+                ic_die "no restore of job $job is running here, and none ended: see $dir/$RESTORE/log" ;;
+        esac
+        result_line
+        case "$(sed -n 's/^state=//p' "$RESTORE/result")" in
+            done) exit 0 ;;
+            db-only) exit 2 ;;
+            *) exit 1 ;;
+        esac
+        ;;
+
+    restore-cancel)
+        ic_require_args 2 "$#" "pitr.sh restore-cancel <dir> <job> <max_s>"
+        job="$1"; max="$2"
+        [[ "$job" =~ ^[0-9]+$ ]] || ic_die "bad job: $job"
+        [[ "$max" =~ ^[0-9]+$ ]] || ic_die "bad wait: $max"
+        mkdir -p "$RESTORE"
+        shown=0
+        if [ -f "$RESTORE/log" ]; then
+            shown="$(wc -l < "$RESTORE/log")"
+        fi
+        # The mark first, the lock read after it: restore-start does the
+        # other way round, so a restore starting now sees the mark and
+        # refuses, or this sees its lock.
+        echo "$job" > "$RESTORE/cancel"
+        printf '[incubacloud] %s cancel asked (job %s)\n' "$(date -u +%H:%M:%S)" "$job" >> "$RESTORE/log"
+        if [ "$(cat "$RESTORE/lock" 2>/dev/null)" = "$job" ]; then
+            # A restore that just started sets its traps a moment after
+            # its lock (``armed``).
+            for _ in $(seq 1 10); do
+                [ -e "$RESTORE/armed" ] && break
+                pid="$(cat "$RESTORE/pid" 2>/dev/null || true)"
+                if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+                    break
+                fi
+                sleep 1
+            done
+            # To the process alone: it stops what it runs and puts back
+            # what it changed (``finish``). Its group would take the
+            # containers' clients down before it could.
+            pid="$(cat "$RESTORE/pid" 2>/dev/null || true)"
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                # The pid may be left from a restore that died without
+                # cleaning up and reused since: only this job's
+                # restore-run (``restore-run <dir> <user> <job> ...``,
+                # arguments split by NUL) gets the signal.
+                args=()
+                mapfile -d '' -t args < "/proc/$pid/cmdline" 2>/dev/null || true
+                ours=0
+                for i in "${!args[@]}"; do
+                    if [ "${args[$i]}" = restore-run ] && [ "${args[$((i + 3))]:-}" = "$job" ]; then
+                        ours=1
+                        break
+                    fi
+                done
+                if [ "$ours" = 1 ]; then
+                    kill -TERM "$pid" 2>/dev/null || true
+                else
+                    ic_log "pid $pid is not the restore of job $job: nothing sent, the restore is taken as gone"
+                fi
+            fi
+        fi
+        rc=0
+        follow_restore "$job" "$max" "$shown" || rc=$?
+        case "$rc" in
+            0) result_line ;;
+            # Still undoing, or updating, when the wait ended: the next
+            # job follows it.
+            3) running_line ;;
+            *)
+                holder="$(cat "$RESTORE/lock" 2>/dev/null || true)"
+                if [ "$holder" = "$job" ]; then
+                    # Its process is gone and it wrote no result.
+                    echo "IC_PITR_RESTORE state=lost"
+                elif [ -n "$holder" ]; then
+                    # Another job's restore holds the instance: this one
+                    # never started, and that one goes on.
+                    echo "IC_PITR_RESTORE state=none held_by=$holder"
+                else
+                    echo "IC_PITR_RESTORE state=none"
+                fi ;;
+        esac
+        ;;
+
+    disable)
+        ic_require_args 1 "$#" "pitr.sh disable <dir> <pg_user>"
+        user="$1"
+        if [ -f "$RESTORE/lock" ]; then
+            ic_die "a restore is running: wait for it"
+        fi
+        # The settings live in the database. A stopped one is started to
+        # drop them, and stopped again unless Odoo runs (stop_again):
+        # left in place, its next start would archive to a command the
+        # rebuild removes, fail for ever and keep every segment.
+        started=0
+        if ! running db; then
+            docker compose up -d db
+            wait_db "$user"
+            started=1
+        fi
+        # The segments are let go first, with a command that needs no
+        # mount: a cut anywhere after this, or a rebuild that drops the
+        # mount before the rest is done, leaves no database keeping every
+        # segment for a command that cannot run. With archive_mode off
+        # the command is never used; switching on again overwrites it.
+        db_psql "$user" \
+            -c "ALTER SYSTEM SET archive_command = '/bin/true'" \
+            -c "SELECT pg_reload_conf()" >/dev/null
+        mode="$(db_psql "$user" -c "SHOW archive_mode")"
+        # On from the stack's command line, it stays on until the rebuild
+        # that follows drops the flag, whatever restarts it: the segments
+        # are let go until then, and nothing restarts.
+        from="$(db_psql "$user" -c \
+            "SELECT source FROM pg_settings WHERE name = 'archive_mode'")"
+        db_psql "$user" \
+            -c "ALTER SYSTEM RESET archive_timeout" \
+            -c "ALTER SYSTEM RESET archive_mode"
+        if [ "$from" = "command line" ]; then
+            db_psql "$user" -c "SELECT pg_reload_conf()" >/dev/null
+        elif [ "$mode" = "on" ]; then
+            # Odoo stopped around it when it runs, as for any instance.
+            restart_db "$user"
+        else
+            db_psql "$user" -c "SELECT pg_reload_conf()" >/dev/null
+        fi
+        stop_again "$started"
+        docker compose rm -sf "$AGENT" >/dev/null 2>&1 || true
+        # The agent's environment stays (0600, like backup.env): deleting
+        # the instance purges the archive with it.
+        rm -rf "${W:?}/wal-g" "${W:?}/lib" "${W:?}/run" "${W:?}/archive" \
+            "$W/pitr_agent.sh" "$W/spool/done" "$RESTORE"
+        echo "IC_PITR_DISABLED"
+        ;;
+
+    settle)
+        # What a switch on that failed or was stopped leaves: never a
+        # database keeping its segments for a command that does not work.
+        # Only the archive of the cluster the panel has base copies of
+        # (the argument, - for none), archiving with its own command, is
+        # kept as it is: it was there before the job, and the watch reads
+        # it. Anything else is parked: /bin/true lets the segments go,
+        # which, without a base copy before them, restore nothing. No
+        # network, no restart, and the agent is left as it is: a switch
+        # on still running somewhere may be about to write the real
+        # command, which an idle agent would leave failing for ever.
+        ic_require_args 2 "$#" "pitr.sh settle <dir> <pg_user> <cluster|->"
+        user="$1"; known="$2"
+        [[ "$known" =~ ^([0-9]+|-)$ ]] || ic_die "bad cluster: $known"
+        if [ -f "$RESTORE/lock" ]; then
+            # The database may be down on purpose, or replaced.
+            echo "IC_PITR_SETTLED restoring"
+            exit 0
+        fi
+        # The settings live in the database: a stopped one is started to
+        # read and write them, and stopped again unless Odoo runs
+        # (stop_again). Left as it is, its next start would keep every
+        # segment.
+        started=0
+        if ! running db; then
+            docker compose up -d db
+            wait_db "$user"
+            started=1
+        fi
+        cluster="$(cluster_id "$user")"
+        command="$(db_psql "$user" -c "SELECT current_setting('archive_command')")"
+        if [ "$command" = "/opt/walg/archive %f" ] && [ "$cluster" = "$known" ]; then
+            answer=kept
+        elif [ "$command" = "/bin/true" ]; then
+            answer=parked
+        else
+            ic_log "parking archiving (command: '${command:-none}', cluster $cluster)"
+            # archive_mode on from the stack's command line stays on and
+            # discards; from postgresql.auto.conf it goes off at the next
+            # start, and discards until then.
+            db_psql "$user" \
+                -c "ALTER SYSTEM SET archive_command = '/bin/true'" \
+                -c "ALTER SYSTEM RESET archive_timeout" \
+                -c "ALTER SYSTEM RESET archive_mode" \
+                -c "SELECT pg_reload_conf()" >/dev/null
+            answer=parked
+        fi
+        stop_again "$started"
+        echo "IC_PITR_SETTLED $answer"
+        ;;
+
+    *)
+        ic_die "unknown operation: $op"
+        ;;
+esac

@@ -1,0 +1,676 @@
+// ============================================================================
+//  IncubaCloud — Relay design-system primitives  ("rl-*")
+//  Faithful port of the approved console prototype (prototipo-consola.html).
+//  Scoped under .ic-app and prefixed `rl-` so it never collides with Bootstrap
+//  (bundled via web._assets_bootstrap_backend) nor with the legacy `ic-*`
+//  layer. Screens are rebuilt onto these primitives; un-migrated screens keep
+//  working on `ic-*` until they are migrated.
+//
+//  This file is the single source of visual truth for the redesign. It mirrors
+//  the prototype's tokens, spacing and component anatomy 1:1. Do not "improve"
+//  the numbers — they ARE the design.
+// ============================================================================
+
+// ── Tokens (CSS custom properties, exposed on the SPA root) ─────────────────
+// Same hex values as the prototype :root. Defined on :root (the cloud bundle is
+// only served on /cloud, never the Odoo backend) so the vars — and the rl-*
+// classes below — also resolve in the slide-over / modals / toasts that OWL
+// renders as siblings OUTSIDE .ic-app.
+:root {
+  // Neutral carbon (no green cast) so the green ACCENT reads as the only green.
+  --rl-bg:#0a0c0d; --rl-surf:#101315; --rl-surf2:#181c1f; --rl-surf3:#20262a;
+  --rl-line:#262b2f; --rl-line2:#333a3f;
+  --rl-fg:#eef1f3; --rl-fg2:#c3cad0; --rl-muted:#8a949c; --rl-faint:#737d85;
+  --rl-green:#2fc78c; --rl-green-soft:rgba(47,199,140,.15); --rl-green-fg:#06140d; --rl-green-dim:#1e9e70;
+  // Fill of the primary button and its hover, under --rl-green-fg text. Dark theme: the
+  // accent itself (8.7:1) and its dim (5.6:1).
+  --rl-green-btn:var(--rl-green); --rl-green-btn-hover:var(--rl-green-dim);
+  --rl-amber:#efa53e; --rl-amber-soft:rgba(239,165,62,.14); --rl-amber-fg:#1c1408;
+  --rl-red:#ff6063; --rl-red-soft:rgba(255,96,99,.15); --rl-red-fg:#2a0808;
+  // Info accent (cyan, NOT a generic web-app blue — and dusty enough to never read as the
+  // brand green): toasts, announcement severity "info", password level "good".
+  --rl-cyan:#4fb6c6; --rl-cyan-dim:#43a3b2; --rl-cyan-soft:rgba(79,182,198,.14);
+  --rl-cyan-fg:#06222a; --rl-cyan-text:#9fd6e2;
+  // RGB triplets so rgba(var(--x-rgb), a) translucent overlays follow the active theme.
+  --rl-bg-rgb:10,12,13; --rl-surf-rgb:16,19,21; --rl-surf2-rgb:24,28,31; --rl-line-rgb:38,43,47;
+  --rl-fg-rgb:238,241,243; --rl-muted-rgb:138,148,156; --rl-faint-rgb:115,125,133;
+  --rl-green-rgb:47,199,140; --rl-amber-rgb:239,165,62; --rl-red-rgb:255,96,99; --rl-cyan-rgb:79,182,198;
+  // Log/terminal surface. A token pair (not a literal) so the light
+  // theme can invert it: the hardcoded #080b09 kept a near-black panel
+  // under light-theme ink and measured 1.82:1 — WCAG AA needs 4.5:1.
+  --rl-logs-bg:#080b09; --rl-logs-fg:#c3cad0;
+  // The canvas a captured email renders on. White in BOTH themes on
+  // purpose: the body is HTML somebody else wrote for a mail client,
+  // and it assumes white — a dark canvas turns their black text
+  // invisible. It is not the panel's surface and must not follow it.
+  --rl-mail-canvas:#ffffff;
+  // Settings' bar of unsaved changes: dark in both themes, so it reads as
+  // a bar over the page whatever the page's theme.
+  --rl-savebar-bg:#121815; --rl-savebar-fg:#eef4f0; --rl-savebar-muted:#b7c3bc;
+  --rl-savebar-line:rgba(255,255,255,.28); --rl-savebar-hover:rgba(255,255,255,.08);
+  --rl-savebar-dirty:#efa53e; --rl-savebar-err:#ff8a8c;
+  // Lifted state-text colours (used on pills/timeline/badges); were hardcoded literals.
+  --rl-green-text:#9fe7c4; --rl-amber-text:#f0c987; --rl-red-text:#ff9b9d;
+  // Amber as text (labels, badges, warnings): here the accent itself, as
+  // it always was; the light theme points it at its --rl-amber-text.
+  --rl-amber-ink:var(--rl-amber);
+  // Card elevation: surface is now lighter than bg + a hairline top highlight.
+  --rl-card-shadow:0 1px 2px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.025);
+  --rl-r:10px; --rl-rsm:7px;
+  --rl-fd:'Space Grotesk',system-ui,-apple-system,'Segoe UI',sans-serif;
+  --rl-fb:'Hanken Grotesk',system-ui,-apple-system,'Segoe UI',sans-serif;
+  --rl-fm:'JetBrains Mono','Fira Code',monospace;
+}
+
+// ── Light theme (paper / ink + green) — toggled by [data-ic-theme="light"] on <html> ──
+:root[data-ic-theme="light"] {
+  --rl-bg:#f3f7f4; --rl-surf:#f3f7f4; --rl-surf2:#eaf1ec; --rl-surf3:#e2ebe5;
+  --rl-line:#dde6df; --rl-line2:#cdd8d0;
+  --rl-fg:#0e1512; --rl-fg2:#33403a; --rl-muted:#5d6b63; --rl-faint:#7d8a82;
+  --rl-green:#14a06e; --rl-green-soft:rgba(20,160,110,.12); --rl-green-fg:#ffffff; --rl-green-dim:#0c7a55;
+  // Primary button fill: white text on --rl-green (#14a06e) is 3.3:1, under AA 4.5:1.
+  // The dim green gives 5.3:1 and the darker hover 7.7:1 (9-nov-2026).
+  --rl-green-btn:var(--rl-green-dim); --rl-green-btn-hover:#095f42;
+  // Amber is a mark here — dots, bars, borders, icons — which needs 3:1
+  // (WCAG non-text contrast); #b7791f measured 2.9–3.0:1 on the gauge
+  // track and on its own soft tint. Same hue, darkened just enough.
+  // Text in amber uses --rl-amber-ink, and text on amber is dark: white
+  // reaches 3.9:1 on it, 4.5:1 is needed.
+  --rl-amber:#b27418; --rl-amber-soft:rgba(178,116,24,.13); --rl-amber-fg:#1c1408;
+  --rl-red:#dc4c4f; --rl-red-soft:rgba(220,76,79,.12); --rl-red-fg:#ffffff;
+  --rl-cyan:#0e7c8c; --rl-cyan-dim:#0a6270; --rl-cyan-soft:rgba(14,124,140,.12);
+  --rl-cyan-fg:#ffffff; --rl-cyan-text:#0a6270;
+  // Amber text — pills, badges, warnings, the staging label, chips, the
+  // warning toast — measured 2.8–4.0:1, drawn in #b7791f or #9a6614.
+  // Same hue, darkened just enough for its worst case, its 20% tint
+  // (4.6:1). --rl-amber-ink, the amber of every amber text, is this one.
+  --rl-green-text:#0c7a55; --rl-amber-text:#865602; --rl-red-text:#c0393c;
+  --rl-amber-ink:var(--rl-amber-text);
+  --rl-card-shadow:0 2px 6px rgba(16,24,20,.10), 0 1px 2px rgba(16,24,20,.06);
+  --rl-bg-rgb:243,247,244; --rl-surf-rgb:243,247,244; --rl-surf2-rgb:234,241,236; --rl-line-rgb:221,230,223;
+  --rl-fg-rgb:14,21,18; --rl-muted-rgb:93,107,99; --rl-faint-rgb:125,138,130;
+  --rl-green-rgb:20,160,110; --rl-amber-rgb:178,116,24; --rl-red-rgb:220,76,79; --rl-cyan-rgb:14,124,140;
+  // Light theme: ink on paper, like the rest of the theme (~16:1).
+  // Flagged for the visual-review session — it is item 1 of the human
+  // judgement list in AUDIT_UI.md ("is a light log panel right, or
+  // should the terminal stay dark on purpose?").
+  --rl-logs-bg:#eaf1ec; --rl-logs-fg:#0e1512;
+  color-scheme: light;
+}
+[data-ic-theme="light"] body, [data-ic-theme="light"] .ic-app { color-scheme: light; }
+
+// ── Tag colours ────────────────────────────────────────────────────────────────
+// The ten colours a tag can hold (cloud.tag.color), by index. Green, amber, red
+// and cyan are Relay's own state text colours; Relay has no indigo, violet,
+// pink, blue or orange, so those are set at the same lightness to sit beside
+// them. Light text on the dark theme, dark text on the light one: one set for
+// both drew pale yellow and green on the light theme's paper (30-oct-2026).
+:root {
+    --rl-tag-0:#b0b0f0; --rl-tag-0-bg:rgba(176,176,240,.15);  // indigo
+    --rl-tag-1:#c9a8ee; --rl-tag-1-bg:rgba(201,168,238,.15);  // violet
+    --rl-tag-2:#f0a3c8; --rl-tag-2-bg:rgba(240,163,200,.15);  // pink
+    --rl-tag-3:#ff9b9d; --rl-tag-3-bg:rgba(255,155,157,.15);  // red
+    --rl-tag-4:#f0c987; --rl-tag-4-bg:rgba(240,201,135,.15);  // amber
+    --rl-tag-5:#6fd9b0; --rl-tag-5-bg:rgba(111,217,176,.15);  // green
+    --rl-tag-6:#9ab8ec; --rl-tag-6-bg:rgba(154,184,236,.15);  // blue
+    --rl-tag-7:#9fd6e2; --rl-tag-7-bg:rgba(159,214,226,.15);  // teal
+    --rl-tag-8:#f5b07a; --rl-tag-8-bg:rgba(245,176,122,.15);  // orange
+    --rl-tag-9:#a5aeb5; --rl-tag-9-bg:rgba(165,174,181,.15);  // gray
+}
+
+:root[data-ic-theme="light"] {
+    --rl-tag-0:#4a4fb0; --rl-tag-0-bg:rgba(74,79,176,.11);  // indigo
+    --rl-tag-1:#6b45a8; --rl-tag-1-bg:rgba(107,69,168,.11);  // violet
+    --rl-tag-2:#a8366e; --rl-tag-2-bg:rgba(168,54,110,.11);  // pink
+    --rl-tag-3:#c0393c; --rl-tag-3-bg:rgba(192,57,60,.11);  // red
+    --rl-tag-4:#865602; --rl-tag-4-bg:rgba(134,86,2,.11);  // amber
+    --rl-tag-5:#0c7a55; --rl-tag-5-bg:rgba(12,122,85,.11);  // green
+    --rl-tag-6:#2d5fa8; --rl-tag-6-bg:rgba(45,95,168,.11);  // blue
+    --rl-tag-7:#0a6270; --rl-tag-7-bg:rgba(10,98,112,.11);  // teal
+    --rl-tag-8:#a4531a; --rl-tag-8-bg:rgba(164,83,26,.11);  // orange
+    --rl-tag-9:#5d6b63; --rl-tag-9-bg:rgba(93,107,99,.11);  // gray
+}
+
+// ── Keyframes (global names, rl- prefixed to avoid collisions) ──────────────
+@keyframes rl-pulse { 50% { opacity:.4; } }
+@keyframes rl-sp { to { transform:rotate(360deg); } }
+@keyframes rl-tin { from { opacity:0; transform:translateY(8px); } }
+// A tab bar that scrolls fades out on the side with more tabs (see .rl-tabs).
+// Mask images do not interpolate, so each stretch holds its own: the end fades
+// at the start of the scroll, both sides in between, the start at its end.
+@keyframes rl-tabs-edge {
+  0%, 1% { mask-image:linear-gradient(to right, #000 calc(100% - 28px), transparent), linear-gradient(#000, #000); }
+  2%, 98% { mask-image:linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent), linear-gradient(#000, #000); }
+  99%, 100% { mask-image:linear-gradient(to right, transparent, #000 28px), linear-gradient(#000, #000); } }
+
+// Everything below is scoped under :root (i.e. the whole cloud page) rather than
+// .ic-app, so rl-* primitives also style the slide-over / dialogs / toasts that
+// render as siblings outside .ic-app. The rl- prefix keeps it collision-free and
+// the bundle is cloud-only, so :root never reaches the Odoo backend.
+:root {
+
+  // Content links never inherit the browser's purple "visited" colour.
+  a { color: inherit; }
+  .rl-link, .rl-psub a, .rl-v.link { color: var(--rl-green); text-decoration: none;
+    &:hover { text-decoration: underline; } }
+  // Native form controls tinted to the brand green (option highlight, checkbox, radio).
+  input, select, textarea { accent-color: var(--rl-green); }
+  // Dropdown option list: carbon surface instead of the OS blue highlight.
+  select option { background-color: var(--rl-surf2); color: var(--rl-fg); }
+  select option:checked { background-color: var(--rl-green-soft); color: var(--rl-fg); }
+
+  // ── Page scaffold ────────────────────────────────────────────────────────
+  // Full-bleed by default (lists + forms use all available width). The --narrow
+  // variant is kept for create/onboarding flows that read better when contained.
+  .rl-page { padding-block-start:24px; padding-inline:30px; padding-block-end:64px; max-inline-size:none; }
+  .rl-page--wide { max-inline-size:none; }
+  .rl-page--narrow { max-inline-size:980px; }  // deprecated — all views now full-width
+
+  .rl-crumb {
+    display:flex; align-items:center; gap:7px; font-family:var(--rl-fm);
+    font-size:11.5px; color:var(--rl-muted); margin-block-end:14px; flex-wrap:wrap;
+    a { color:var(--rl-muted); text-decoration:none; cursor:pointer;
+        &:hover { color:var(--rl-green); } }
+    .rl-sep { color:var(--rl-faint); }
+    .rl-cur { color:var(--rl-fg2); }
+  }
+
+  .rl-phead { display:flex; align-items:flex-start; gap:14px; margin-block-end:20px; }
+  .rl-phead .rl-htext { flex:1; min-inline-size:0; }
+  .rl-ptitle {
+    font-family:var(--rl-fd); font-size:25px; font-weight:600; letter-spacing:-0.02em;
+    margin:0; display:flex; align-items:center; gap:11px; flex-wrap:wrap; color:var(--rl-fg);
+  }
+  .rl-psub { color:var(--rl-muted); font-size:13px; margin-block-start:5px; margin-inline:0; margin-block-end:0; font-family:var(--rl-fm); }
+  .rl-pactions { display:flex; gap:8px; align-items:center; flex:none; }
+
+  // ── Buttons ──────────────────────────────────────────────────────────────
+  .rl-btn {
+    display:inline-flex; align-items:center; gap:7px; font-size:13px; font-weight:600;
+    font-family:var(--rl-fb); border-radius:var(--rl-rsm); padding-block:8px; padding-inline:14px;
+    border:1px solid transparent; white-space:nowrap; cursor:pointer; color:var(--rl-fg);
+    background:transparent; text-decoration:none;
+    .rl-svg, svg { width:15px; height:15px; }
+    &:disabled { opacity:.5; cursor:not-allowed; }
+  }
+  .rl-btn-primary { background:var(--rl-green-btn); color:var(--rl-green-fg); border-color:transparent;
+    &:hover:not(:disabled), &:active:not(:disabled) { background:var(--rl-green-btn-hover); } }
+  .rl-btn-ghost { background:transparent; color:var(--rl-fg); border-color:var(--rl-line2);
+    &:hover:not(:disabled) { background:var(--rl-surf2); } }
+  .rl-btn-icon { background:transparent; color:var(--rl-muted); border-color:var(--rl-line2); padding-block:8px; padding-inline:10px;
+    &:hover:not(:disabled) { background:var(--rl-surf2); color:var(--rl-fg); } }
+  .rl-btn-danger { background:transparent; color:var(--rl-red); border-color:transparent; padding-block:8px; padding-inline:10px;
+    &:hover:not(:disabled) { background:var(--rl-red-soft); } }
+  .rl-btn-sm { padding-block:5px; padding-inline:11px; font-size:12.5px; }
+
+  // ── Env badge ────────────────────────────────────────────────────────────
+  .rl-env {
+    font-family:var(--rl-fm); font-size:10px; letter-spacing:.04em; padding-block:3px; padding-inline:8px;
+    border-radius:5px; border:1px solid var(--rl-line2); color:var(--rl-muted); text-transform:lowercase;
+  }
+  .rl-env.production { color:var(--rl-green); border-color:rgba(47,199,140,.4); background:var(--rl-green-soft); }
+  .rl-env.staging { color:var(--rl-amber-ink); border-color:rgba(239,165,62,.35); background:var(--rl-amber-soft); }
+  .rl-env.development { color:var(--rl-muted); }
+
+  // ── Status pill (instance lifecycle) ─────────────────────────────────────
+  .rl-pill {
+    display:inline-flex; align-items:center; gap:7px; font-family:var(--rl-fm); font-size:11px;
+    padding:3px 10px 3px 8px; border-radius:999px; border:1px solid var(--rl-line2);
+    color:var(--rl-muted); background:transparent;
+    .rl-d { width:6px; height:6px; border-radius:50%; background:var(--rl-faint); flex:none; }
+  }
+  .rl-pill.running, .rl-pill.active, .rl-pill.done { color:var(--rl-fg2); }
+  .rl-pill.running .rl-d, .rl-pill.active .rl-d, .rl-pill.done .rl-d { background:var(--rl-green); box-shadow:0 0 0 3px var(--rl-green-soft); }
+  .rl-pill.building, .rl-pill.provisioning, .rl-pill.pending, .rl-pill.queued, .rl-pill.starting { color:var(--rl-amber-text); }
+  .rl-pill.building .rl-d, .rl-pill.provisioning .rl-d, .rl-pill.pending .rl-d, .rl-pill.queued .rl-d, .rl-pill.starting .rl-d {
+    background:var(--rl-amber); box-shadow:0 0 0 3px var(--rl-amber-soft); animation:rl-pulse 1s infinite; }
+  .rl-pill.stopped, .rl-pill.draft, .rl-pill.unknown { color:var(--rl-muted); }
+  .rl-pill.stopped .rl-d, .rl-pill.draft .rl-d, .rl-pill.unknown .rl-d { background:var(--rl-faint); }
+  // Down on purpose (a layer that sleeps an idle instance). Amber, so it
+  // reads apart from both "up" and "stopped" at a glance in the sidebar
+  // where there is no label — but still, unlike the amber above, so no
+  // pulse: nothing is in progress, it is resting.
+  .rl-pill.asleep { color:var(--rl-muted); }
+  .rl-pill.asleep .rl-d { background:var(--rl-amber); box-shadow:0 0 0 3px var(--rl-amber-soft); }
+  // A job waiting in its instance's queue: the same still amber, since
+  // nothing runs yet, with the text of the states in progress.
+  .rl-pill.waiting { color:var(--rl-amber-text); }
+  .rl-pill.waiting .rl-d { background:var(--rl-amber); box-shadow:0 0 0 3px var(--rl-amber-soft); }
+  .rl-pill.crashed, .rl-pill.failed, .rl-pill.error, .rl-pill.deleted { color:var(--rl-red-text); }
+  .rl-pill.crashed .rl-d, .rl-pill.failed .rl-d, .rl-pill.error .rl-d, .rl-pill.deleted .rl-d {
+    background:var(--rl-red); box-shadow:0 0 0 3px var(--rl-red-soft); }
+  .rl-pill--bare { padding-block:2px; padding-inline:5px; border:none; }
+  // A job's state (Job History), not an instance's: amber and still while
+  // it waits, cyan and pulsing while it runs. ``running`` above stays the
+  // green of an instance that is up.
+  .rl-pill--job.queued .rl-d { animation:none; }
+  .rl-pill--job.running { color:var(--rl-cyan-text); }
+  .rl-pill--job.running .rl-d { background:var(--rl-cyan); box-shadow:0 0 0 3px var(--rl-cyan-soft); animation:rl-pulse 1.2s infinite; }
+
+  // ── State badge (accounts / users / generic) ─────────────────────────────
+  .rl-sb {
+    display:inline-flex; align-items:center; gap:6px; font-family:var(--rl-fm); font-size:10.5px;
+    padding:3px 9px 3px 7px; border-radius:999px; border:1px solid var(--rl-line2); color:var(--rl-muted);
+    .rl-d { width:6px; height:6px; border-radius:50%; background:var(--rl-faint); flex:none; }
+  }
+  .rl-sb.active, .rl-sb.running, .rl-sb.compatible, .rl-sb.ok, .rl-sb.done { color:var(--rl-green-text); }
+  .rl-sb.active .rl-d, .rl-sb.running .rl-d, .rl-sb.compatible .rl-d, .rl-sb.ok .rl-d, .rl-sb.done .rl-d {
+    background:var(--rl-green); box-shadow:0 0 0 3px var(--rl-green-soft); }
+  .rl-sb.provisioning, .rl-sb.deploying, .rl-sb.pending, .rl-sb.starting { color:var(--rl-amber-text); }
+  .rl-sb.provisioning .rl-d, .rl-sb.deploying .rl-d, .rl-sb.pending .rl-d, .rl-sb.starting .rl-d {
+    background:var(--rl-amber); box-shadow:0 0 0 3px var(--rl-amber-soft); animation:rl-pulse 1s infinite; }
+  .rl-sb.suspended, .rl-sb.degraded, .rl-sb.warning, .rl-sb.warn { color:var(--rl-amber-text); }
+  .rl-sb.suspended .rl-d, .rl-sb.degraded .rl-d, .rl-sb.warning .rl-d, .rl-sb.warn .rl-d { background:var(--rl-amber); }
+  .rl-sb.draft, .rl-sb.inactive { color:var(--rl-muted); }
+  .rl-sb.deleted, .rl-sb.failed, .rl-sb.error, .rl-sb.crashed { color:var(--rl-red-text); }
+  .rl-sb.deleted .rl-d, .rl-sb.failed .rl-d, .rl-sb.error .rl-d, .rl-sb.crashed .rl-d { background:var(--rl-red); }
+
+  // ── Cards / rows ─────────────────────────────────────────────────────────
+  .rl-grid { display:grid; gap:14px; }
+  .rl-grid-2 { grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); }
+  .rl-grid-3 { grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); }
+  .rl-card { background:var(--rl-surf); border:1px solid var(--rl-line); border-radius:var(--rl-r); box-shadow:var(--rl-card-shadow); }
+  .rl-card-pad { padding-block:16px; padding-inline:18px; }
+  .rl-card-h { padding-block:13px; padding-inline:16px; border-block-end:1px solid var(--rl-line); display:flex; align-items:center; gap:10px;
+    h3 { font-family:var(--rl-fd); font-size:14px; font-weight:600; margin:0; }
+    .rl-more { margin-inline-start:auto; font-family:var(--rl-fm); font-size:11px; color:var(--rl-muted); cursor:pointer; } }
+
+  .rl-row { display:flex; align-items:center; gap:13px; padding-block:13px; padding-inline:16px; border-block-end:1px solid var(--rl-line);
+    &:last-child { border-block-end:none; } }
+  .rl-row.click { cursor:pointer; &:hover { background:var(--rl-surf2); } }
+  .rl-rico { width:34px; height:34px; border-radius:8px; background:var(--rl-surf3); display:flex;
+    align-items:center; justify-content:center; color:var(--rl-muted); flex:none;
+    .rl-svg, svg { width:17px; height:17px; } }
+  .rl-rname { font-family:var(--rl-fd); font-weight:600; font-size:14px; color:var(--rl-fg); }
+  .rl-rmeta { font-family:var(--rl-fm); font-size:11px; color:var(--rl-muted); margin-block-start:2px; }
+  .rl-rspacer { flex:1; }
+  .rl-row-chevron { color:var(--rl-faint); display:flex; flex:none; }
+  .rl-proj-envs { display:flex; gap:6px; flex-wrap:wrap; }
+  .rl-tag-list { display:flex; gap:5px; flex-wrap:wrap; margin-block-start:6px; }
+  .rl-tag-badge { display:inline-flex; align-items:center; gap:5px; font-family:var(--rl-fm); font-size:10px; padding-block:2px; padding-inline:8px; border-radius:5px; }
+  .rl-kv { display:flex; flex-direction:column; align-items:flex-end; gap:2px;
+    .rl-k { font-family:var(--rl-fm); font-size:10px; color:var(--rl-faint); }
+    .rl-v { font-family:var(--rl-fm); font-size:12px; color:var(--rl-fg2); } }
+
+  // ── Action bar (instance / host) ─────────────────────────────────────────
+  .rl-abar { display:flex; align-items:center; gap:7px; flex-wrap:wrap; margin-block-end:4px; }
+  .rl-asep { width:1px; height:22px; background:var(--rl-line2); margin-block:0; margin-inline:3px; }
+  .rl-iconbtn {
+    width:34px; height:34px; border-radius:var(--rl-rsm); background:transparent;
+    border:1px solid var(--rl-line2); color:var(--rl-muted); display:inline-flex;
+    align-items:center; justify-content:center; cursor:pointer;
+    &:hover:not(:disabled) { background:var(--rl-surf2); color:var(--rl-fg); }
+    &.danger:hover { color:var(--rl-red); border-color:rgba(255,96,99,.4); background:var(--rl-red-soft); }
+    &:disabled { opacity:.45; cursor:not-allowed; }
+    .rl-svg, svg { width:15px; height:15px; }
+  }
+
+  // ── Tabs ─────────────────────────────────────────────────────────────────
+  // overflow-y:clip is REQUIRED: with only overflow-x:auto the spec coerces
+  // overflow-y to `auto`, and the active tab's 2px border + (-1px) margin
+  // overflow then triggers a phantom vertical scrollbar on the tab bar.
+  .rl-tabs { display:flex; gap:2px; border-block-end:1px solid var(--rl-line); margin-block-start:18px; margin-inline:0; margin-block-end:22px; overflow-x:auto; overflow-y:clip; }
+  // The fade follows the bar's own scroll. A bar that fits has no scroll, so
+  // its timeline is inactive and nothing fades; a browser without scroll
+  // timelines shows no fade either. The second mask layer keeps the bottom
+  // pixel, the bar's rule, whole. The bar's own mask-image, two opaque
+  // layers, is what gives mask-size and mask-position their two values: on
+  // a bar with none, Chrome keeps only the first and the rule is lost.
+  @supports (animation-timeline: scroll()) {
+    .rl-tabs { mask-image:linear-gradient(#000, #000), linear-gradient(#000, #000);
+      mask-size:100% calc(100% - 1px), 100% 1px; mask-position:top, bottom; mask-repeat:no-repeat;
+      animation-name:rl-tabs-edge; animation-timing-function:linear; animation-fill-mode:both;
+      animation-timeline:scroll(self inline); } }
+  .rl-tab { padding-block:9px; padding-inline:13px; background:none; border:none; border-block-end:2px solid transparent;
+    color:var(--rl-muted); font-size:13px; font-weight:500; margin-block-end:-1px; white-space:nowrap;
+    cursor:pointer; font-family:var(--rl-fb);
+    &:hover { color:var(--rl-fg); }
+    &.active { color:var(--rl-fg); border-block-end-color:var(--rl-fg2); font-weight:600; } }
+  // On a phone a tab is 6 px narrower: a short bar (a backup destination's
+  // three tabs in Spanish at 390 px) then fits whole, instead of scrolling
+  // 3 px under the fade that cut its last tab; a longer one still scrolls.
+  @media (max-width: 480px) { .rl-tab { padding-inline:10px; } }
+
+  // ── Overview cards + services ────────────────────────────────────────────
+  .rl-ovcards { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-block-end:18px; }
+  .rl-ovcard { background:var(--rl-surf); border:1px solid var(--rl-line); border-radius:var(--rl-r); padding-block:4px; padding-inline:0; box-shadow:var(--rl-card-shadow); }
+  .rl-ovtitle { font-family:var(--rl-fm); font-size:10px; letter-spacing:.1em; text-transform:uppercase;
+    color:var(--rl-muted); padding-block-start:14px; padding-inline:16px; padding-block-end:8px; }
+  .rl-ovrow { display:flex; align-items:center; justify-content:space-between; gap:12px; padding-block:7px; padding-inline:16px; font-size:13px;
+    .rl-l { color:var(--rl-muted); font-family:var(--rl-fm); font-size:11.5px; }
+    .rl-v { color:var(--rl-fg); font-family:var(--rl-fm); font-size:12.5px; text-align:right; }
+    .rl-v.link { color:var(--rl-green); }
+    .rl-v.ok { color:var(--rl-green-text); }
+    .rl-v.muted { color:var(--rl-faint); }
+    .rl-v.warn { color:var(--rl-amber-ink); }
+    .rl-v.crit { color:var(--rl-red); } }
+  .rl-svc-row { display:flex; gap:16px; padding-block-start:12px; padding-inline:16px; padding-block-end:14px; margin-block-start:4px; border-block-start:1px solid var(--rl-line); flex-wrap:wrap; }
+  .rl-svc { display:flex; align-items:center; gap:7px; font-family:var(--rl-fm); font-size:11.5px; color:var(--rl-fg2);
+    .rl-sd { width:7px; height:7px; border-radius:50%; }
+    .rl-sd.up { background:var(--rl-green); box-shadow:0 0 0 3px var(--rl-green-soft); }
+    .rl-sd.down { background:var(--rl-faint); }
+    .rl-sd.asleep { background:var(--rl-amber); box-shadow:0 0 0 3px var(--rl-amber-soft); } }
+
+  // ── Timeline (recent activity) ───────────────────────────────────────────
+  .rl-tlh { font-family:var(--rl-fm); font-size:10px; letter-spacing:.1em; text-transform:uppercase; color:var(--rl-muted); margin-block-start:0; margin-inline:0; margin-block-end:12px; }
+  .rl-tl { position:relative; }
+  .rl-tl-item { display:flex; gap:14px; cursor:pointer; }
+  .rl-tl-item--static { cursor:default; }
+  .rl-tl-overflow { font-family:var(--rl-fm); font-size:11px; color:var(--rl-muted); }
+  .rl-tl-rail { display:flex; flex-direction:column; align-items:center; flex:none; width:16px; }
+  .rl-tl-dot { width:11px; height:11px; border-radius:50%; margin-block-start:3px; flex:none; border:2px solid var(--rl-bg); background:var(--rl-faint); }
+  .rl-tl-dot.done { background:var(--rl-green); }
+  .rl-tl-dot.failed { background:var(--rl-red); }
+  // Amber and still while a job waits (on a runner, or in its target's
+  // queue); cyan and pulsing while it runs.
+  .rl-tl-dot.queued, .rl-tl-dot.waiting { background:var(--rl-amber); }
+  .rl-tl-dot.running { background:var(--rl-cyan); animation:rl-pulse 1.2s infinite; }
+  .rl-tl-line { flex:1; width:2px; background:var(--rl-line); margin-block:4px; margin-inline:0; }
+  .rl-tl-item:last-child .rl-tl-line { display:none; }
+  .rl-tl-content { flex:1; padding-block-end:18px; min-inline-size:0; }
+  .rl-tl-head { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+  .rl-tl-icon { color:var(--rl-muted); display:flex; .rl-svg, svg { width:14px; height:14px; } }
+  .rl-tl-name { font-family:var(--rl-fd); font-weight:600; font-size:13.5px; color:var(--rl-fg); }
+  .rl-tl-state { font-family:var(--rl-fm); font-size:10px; padding-block:2px; padding-inline:7px; border-radius:5px; text-transform:lowercase; }
+  .rl-tl-state.done { color:var(--rl-green); background:var(--rl-green-soft); }
+  .rl-tl-state.failed { color:var(--rl-red-text); background:var(--rl-red-soft); }
+  .rl-tl-state.queued { color:var(--rl-amber-text); background:var(--rl-amber-soft); }
+  .rl-tl-state.running, .rl-tl-state.started { color:var(--rl-cyan-text); background:var(--rl-cyan-soft); }
+  .rl-tl-state.waiting { color:var(--rl-amber-text); background:transparent; box-shadow:inset 0 0 0 1px var(--rl-amber-soft); }
+  .rl-tl-loghint { margin-inline-start:auto; font-family:var(--rl-fm); font-size:10.5px; color:var(--rl-faint); display:flex; align-items:center; gap:5px; cursor:pointer;
+    &:hover { color:var(--rl-fg2); } }
+  .rl-tl-trigger { font-family:var(--rl-fm); font-size:11px; color:var(--rl-muted); margin-block-start:5px; display:flex; align-items:center; gap:6px;
+    .rl-sha { color:var(--rl-fg2); } }
+  .rl-tl-msg { font-family:var(--rl-fm); font-size:11px; color:var(--rl-muted); margin-block-start:5px; }
+  .rl-tl-foot { display:flex; align-items:center; gap:8px; margin-block-start:7px;
+    .rl-who { display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--rl-fg2); }
+    .rl-ava-s { width:18px; height:18px; border-radius:50%; background:var(--rl-surf3); color:var(--rl-muted);
+      font-family:var(--rl-fd); font-size:9px; display:flex; align-items:center; justify-content:center; }
+    .rl-when { font-family:var(--rl-fm); font-size:10.5px; color:var(--rl-faint); }
+    .rl-acts { margin-inline-start:auto; display:flex; gap:6px; } }
+  .rl-tl-abtn { font-family:var(--rl-fb); font-size:11px; font-weight:600; padding-block:4px; padding-inline:9px; border-radius:6px;
+    border:1px solid var(--rl-line2); background:transparent; color:var(--rl-fg2); display:inline-flex; align-items:center; gap:5px; cursor:pointer;
+    &:hover { background:var(--rl-surf2); } .rl-svg, svg { width:11px; height:11px; } }
+
+  // ── Tables / mono / logs ─────────────────────────────────────────────────
+  .rl-table { width:100%; border-collapse:collapse; font-size:13px;
+    th { text-align:left; padding-block:9px; padding-inline:16px; font-family:var(--rl-fm); font-size:10px; letter-spacing:.06em;
+      text-transform:uppercase; color:var(--rl-muted); border-block-end:1px solid var(--rl-line); font-weight:500; }
+    td { padding-block:10px; padding-inline:16px; border-block-end:1px solid var(--rl-line); }
+    tr:last-child td { border-block-end:none; }
+    tbody tr.click { cursor:pointer; &:hover { background:var(--rl-surf2); } } }
+  .rl-mono { font-family:var(--rl-fm); }
+  // ── Pager (server-side pagination controls; reusable via IcPager) ─────────
+  .rl-pager { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin-block-start:12px; }
+  .rl-pager-info { font-family:var(--rl-fm); font-size:11.5px; color:var(--rl-muted); }
+  .rl-pager-btn { width:28px; height:28px; border-radius:var(--rl-rsm); border:1px solid var(--rl-line2);
+    background:transparent; color:var(--rl-muted); display:inline-flex; align-items:center; justify-content:center; cursor:pointer;
+    &:hover:not(:disabled) { background:var(--rl-surf2); color:var(--rl-fg); }
+    &:disabled { opacity:.4; cursor:not-allowed; } }
+  .rl-logs { background:var(--rl-logs-bg); border:1px solid var(--rl-line); border-radius:var(--rl-r); padding-block:14px; padding-inline:16px;
+    font-family:var(--rl-fm); font-size:12px; line-height:1.75; max-block-size:340px; overflow-y:auto; color:var(--rl-logs-fg);
+    .rl-ts { color:var(--rl-faint); } .rl-ok { color:var(--rl-green); } .rl-dim { color:var(--rl-muted); } }
+
+  // ── Forms ────────────────────────────────────────────────────────────────
+  // One rule, said once: a field fills its column, and the column is the
+  // form unless an ``.rl-fgrid`` deliberately pairs two fields. The old
+  // ``max-inline-size:460px`` here was the opposite — every field stopped
+  // at 460px inside a 1170px form, so the same screen showed a select at
+  // 575px, a number at 120px and a textarea at 100%, none of them the
+  // width of the form.
+  //
+  // The row styles its OWN caption and field: a direct child, or a
+  // class-less control in a plain wrapper (language picker, rl-frow-inline).
+  // A control that carries a class inside a wrapper belongs to a component
+  // (domain row, TagSelector, PasswordInput, SearchSelect, a
+  // stepper, checkbox labels) and keeps that component's CSS. Reaching them
+  // too painted every one over — the input selector outweighs any
+  // single-class rule — and broke the domain row outright: its certificate
+  // select went 100% wide and squeezed both text fields to nothing.
+  .rl-frow { margin-block-end:16px;
+    > label { display:block; @include rl-field-label; margin-block-end:6px; }
+    // Checkboxes and radios are excluded: they have an intrinsic size,
+    // and stretching one to 100% painted it as an empty text box with
+    // its label off to the right (visible on New Host).
+    // Kept as separate selectors (no ``:is()``): ``:is`` takes its heaviest
+    // argument, which would lift the select/textarea weight to the input's
+    // and beat rules such as ``.ic-app select.ic-ann-multi`` that win today.
+    > input:not([type=checkbox]):not([type=radio]), > select, > textarea,
+    input:not([type=checkbox]):not([type=radio]):not([class]), select:not([class]), textarea:not([class]) {
+      width:100%; background:var(--rl-bg); border:1px solid var(--rl-line2);
+      border-radius:var(--rl-rsm); padding-block:9px; padding-inline:12px; color:var(--rl-fg); font-family:var(--rl-fb); font-size:13.5px; outline:none;
+      &:focus { border-color:var(--rl-green); box-shadow:0 0 0 3px var(--rl-green-soft); } }
+    // Listed with the ``:not([class])`` form too: that branch of the field
+    // rule above outweighs a bare ``textarea``, and would set the body font.
+    textarea, textarea:not([class]) { font-family:var(--rl-fm); resize:vertical; min-block-size:90px; }
+    // With its space inside (``Odoo version<span class="rl-req"> *</span>``)
+    // the asterisk never opens a line of its own on a phone.
+    .rl-req { color:var(--rl-green); white-space:nowrap; }
+    // The note a label carries (« · optional», «— production only») reads as help.
+    .rl-opt { font-size:12.5px; font-weight:400; color:var(--rl-muted); } }
+  // A field with a button beside it: the field takes what is left.
+  .rl-frow-inline { display:flex; align-items:flex-end; gap:10px;
+    > :first-child { flex:1 1 auto; min-inline-size:0; }
+    > button { flex:none; } }
+  // A column never grows past its share: a long unbroken value (a URL, a
+  // select's option) wraps or shrinks inside it instead of widening the form.
+  .rl-fgrid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px 18px;
+    > * { min-inline-size:0; }
+    code { overflow-wrap:anywhere; }
+    .rl-full { grid-column:1/-1; }
+    .rl-frow { margin:0; } }
+  .rl-tabnote { font-family:var(--rl-fb); font-size:12.5px; color:var(--rl-muted); margin-block-start:0; margin-inline:0; margin-block-end:16px; }
+
+  .rl-ftoggle { display:flex; align-items:center; justify-content:space-between; gap:12px; padding-block:10px; padding-inline:0; border-block-start:1px solid var(--rl-line);
+    .rl-tl-label { font-size:13px; color:var(--rl-fg); }
+    .rl-th { font-family:var(--rl-fb); font-size:12.5px; color:var(--rl-muted); margin-block-start:2px; } }
+  // Switch
+  .rl-sw { width:36px; height:20px; border-radius:999px; background:var(--rl-surf3); border:1px solid var(--rl-line2);
+    position:relative; flex:none; cursor:pointer; padding:0; transition:background .15s;
+    &::after { content:''; position:absolute; width:14px; height:14px; border-radius:50%; background:var(--rl-fg); top:2px; left:2px; transition:left .15s; }
+    &.on { background:var(--rl-green); border-color:transparent; &::after { left:18px; background:var(--rl-green-fg); } }
+    &:disabled { opacity:.5; cursor:not-allowed; } }
+
+  // A footer that does not fit wraps onto more lines rather than running
+  // off the page's start edge.
+  .rl-formfoot { display:flex; flex-wrap:wrap; align-items:center; gap:10px; justify-content:flex-end; margin-block-start:16px; padding-block-start:14px; border-block-start:1px solid var(--rl-line);
+    .rl-ff-hint { margin-inline-end:auto; font-family:var(--rl-fb); font-size:12.5px; color:var(--rl-muted); } }
+
+  // ── Custom select (RlSelect) ─────────────────────────────────────────────
+  // Drop-in replacement for native <select>: the trigger mimics an rl input and
+  // the option list is our own markup (carbon surface, green selection) so it is
+  // immune to the OS-drawn popup that ignores CSS on Linux/GTK Chromium.
+  .rl-sel { position:relative; width:100%; font-family:var(--rl-fb); }
+  .rl-sel__trigger {
+    width:100%; display:flex; align-items:center; gap:10px; text-align:left;
+    background:var(--rl-bg); border:1px solid var(--rl-line2); border-radius:var(--rl-rsm);
+    padding-block:9px; padding-inline:12px; color:var(--rl-fg); font-family:var(--rl-fb); font-size:13.5px;
+    cursor:pointer; outline:none;
+    &:disabled { opacity:.55; cursor:not-allowed; }
+  }
+  .rl-sel--open .rl-sel__trigger,
+  .rl-sel__trigger:focus-visible {
+    border-color:var(--rl-green); box-shadow:0 0 0 3px var(--rl-green-soft);
+  }
+  .rl-sel__value { flex:1; min-inline-size:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rl-sel__value--placeholder { color:var(--rl-faint); }
+  .rl-sel__chevron { color:var(--rl-muted); font-size:11px; flex:none; transition:transform .15s,color .15s; }
+  .rl-sel--open .rl-sel__chevron { transform:rotate(180deg); color:var(--rl-green); }
+
+  .rl-sel__menu {
+    z-index:100050; background:var(--rl-surf2); border:1px solid var(--rl-line2);
+    border-radius:var(--rl-rsm); padding:5px; max-block-size:280px; overflow-y:auto;
+    box-shadow:0 16px 40px rgba(0,0,0,.7); animation:rl-tin .12s ease;
+  }
+  .rl-sel__opt {
+    padding-block:8px; padding-inline:11px; border-radius:var(--rl-rsm); font-size:13px; color:var(--rl-fg2);
+    cursor:pointer; display:flex; align-items:center; gap:8px; white-space:nowrap;
+    &:hover { background:var(--rl-surf3); color:var(--rl-fg); }
+  }
+  .rl-sel__opt--selected, .rl-sel__opt--selected:hover {
+    background:var(--rl-green-soft); color:var(--rl-green); font-weight:600;
+  }
+  .rl-sel__opt--disabled, .rl-sel__opt--disabled:hover {
+    opacity:.4; cursor:not-allowed; background:transparent; color:var(--rl-fg2);
+  }
+
+  // ── Repo editor rows ─────────────────────────────────────────────────────
+  .rl-repolist { display:flex; flex-direction:column; gap:10px; margin-block-end:12px; }
+  .rl-repo { border:1px solid var(--rl-line); border-radius:8px; padding-block:11px; padding-inline:12px; background:var(--rl-bg); }
+  .rl-repo-main { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .rl-repo-url { flex:1; min-inline-size:180px; background:var(--rl-surf); border:1px solid var(--rl-line2); border-radius:6px;
+    padding-block:7px; padding-inline:10px; color:var(--rl-fg); font-family:var(--rl-fm); font-size:12px; outline:none;
+    &:focus { border-color:var(--rl-green); box-shadow:0 0 0 3px var(--rl-green-soft); }
+    &[readonly] { color:var(--rl-muted); cursor:default; } }
+  .rl-repo-branch { display:flex; align-items:center; gap:7px; }
+  .rl-repo-lbl { @include rl-field-label; }
+  .rl-repo-bval { font-family:var(--rl-fm); font-size:11.5px; color:var(--rl-fg2); background:var(--rl-surf); border:1px solid var(--rl-line2); border-radius:6px; padding-block:6px; padding-inline:9px; }
+  .rl-repo-freeze { display:inline-flex; align-items:center; gap:5px; font-family:var(--rl-fm); font-size:11px; color:var(--rl-muted);
+    background:var(--rl-surf); border:1px solid var(--rl-line2); border-radius:6px; padding-block:6px; padding-inline:9px; cursor:pointer;
+    &.on { color:var(--rl-amber-text); border-color:rgba(239,165,62,.4); background:var(--rl-amber-soft); } }
+  .rl-repo-rm { width:30px; height:30px; border-radius:6px; border:1px solid var(--rl-line2); background:transparent; color:var(--rl-muted);
+    display:flex; align-items:center; justify-content:center; cursor:pointer;
+    &:hover { color:var(--rl-red); border-color:rgba(255,96,99,.4); background:var(--rl-red-soft); } }
+  .rl-repo-mods { display:flex; align-items:center; gap:8px; margin-block-start:9px; flex-wrap:wrap; }
+  .rl-repo-chip { display:flex; gap:5px; flex-wrap:wrap; }
+  .rl-rchip { font-family:var(--rl-fm); font-size:10.5px; color:var(--rl-fg2); background:var(--rl-surf3); border-radius:5px; padding-block:2px; padding-inline:8px; }
+
+  // ── Metric bars / gauge ──────────────────────────────────────────────────
+  .rl-mbar { margin-block:9px; margin-inline:0;
+    .rl-mbar-top { display:flex; justify-content:space-between; font-family:var(--rl-fm); font-size:10.5px; color:var(--rl-muted); margin-block-end:4px; }
+    .rl-mbar-track { height:6px; border-radius:3px; background:var(--rl-surf3); overflow:hidden; }
+    .rl-mbar-fill { height:100%; border-radius:3px; background:var(--rl-green);
+      &.warn { background:var(--rl-amber); } &.crit { background:var(--rl-red); } } }
+  .rl-gauge { height:8px; border-radius:4px; background:var(--rl-surf3); overflow:hidden; margin-block:6px; margin-inline:0;
+    .rl-gauge-fill { height:100%; background:var(--rl-green); &.warn { background:var(--rl-amber); } &.crit { background:var(--rl-red); } } }
+  // Password strength
+  .rl-pwbar { height:5px; border-radius:3px; background:var(--rl-surf3); overflow:hidden; margin-block-start:8px; margin-inline:0; margin-block-end:4px;
+    .rl-pwbar-fill { height:100%; border-radius:3px; transition:width .2s; background:var(--rl-green); } }
+
+  // ── Plan / pricing card ──────────────────────────────────────────────────
+  .rl-pcard { background:var(--rl-surf); border:1px solid var(--rl-line); border-radius:var(--rl-r); padding:16px; cursor:pointer; box-shadow:var(--rl-card-shadow);
+    &:hover { border-color:var(--rl-line2); background:var(--rl-surf2); }
+    &.selected { border-color:var(--rl-green); box-shadow:0 0 0 1px var(--rl-green); } }
+  .rl-pcard-h { display:flex; align-items:baseline; justify-content:space-between; margin-block-end:12px; gap:10px; }
+  .rl-pcard-name { font-family:var(--rl-fd); font-weight:600; font-size:16px; color:var(--rl-fg); }
+  .rl-pcard-code { font-family:var(--rl-fm); font-size:10px; color:var(--rl-faint); }
+  .rl-pcard-row { display:flex; justify-content:space-between; gap:10px; font-family:var(--rl-fm); font-size:11px; color:var(--rl-muted); margin-block:5px; margin-inline:0;
+    .rl-v { color:var(--rl-fg2); white-space:nowrap; flex:none; }
+    .rl-v.green { color:var(--rl-green); } }
+  .rl-pcard-price { margin-block-start:13px; padding-block-start:12px; border-block-start:1px solid var(--rl-line); font-family:var(--rl-fd); font-weight:600; font-size:24px; letter-spacing:-0.02em; color:var(--rl-fg);
+    .rl-per { font-size:12px; color:var(--rl-faint); font-weight:400; } }
+
+  // ── Stepper ──────────────────────────────────────────────────────────────
+  .rl-stepper { display:inline-flex; align-items:center; gap:0; border:1px solid var(--rl-line2); border-radius:7px; overflow:hidden;
+    button { width:28px; height:26px; background:transparent; border:none; color:var(--rl-fg2); font-size:15px; cursor:pointer;
+      &:hover:not(:disabled) { background:var(--rl-surf3); color:var(--rl-fg); } &:disabled { opacity:.4; cursor:not-allowed; } }
+    .rl-n { min-inline-size:30px; text-align:center; font-family:var(--rl-fm); font-size:12px; } }
+
+  // ── Wizard steps ─────────────────────────────────────────────────────────
+  .rl-wiz { display:flex; align-items:center; gap:0; margin-block-start:6px; margin-inline:0; margin-block-end:20px; flex-wrap:wrap; }
+  .rl-wstep { display:flex; align-items:center; gap:8px;
+    .rl-wnum { width:26px; height:26px; border-radius:50%; border:1px solid var(--rl-line2); display:flex; align-items:center; justify-content:center;
+      font-family:var(--rl-fm); font-size:12px; color:var(--rl-muted); flex:none; }
+    .rl-wlabel { font-size:12.5px; color:var(--rl-muted); }
+    &.active .rl-wnum { background:var(--rl-green); color:var(--rl-green-fg); border-color:transparent; }
+    &.done .rl-wnum { background:var(--rl-green-soft); color:var(--rl-green); border-color:transparent; }
+    &.active .rl-wlabel, &.done .rl-wlabel { color:var(--rl-fg); } }
+  .rl-wconn { width:46px; height:1px; background:var(--rl-line2); margin-block:0; margin-inline:10px; }
+
+  // ── GitHub / generic feature card ────────────────────────────────────────
+  .rl-ghcard { display:flex; gap:14px; background:var(--rl-surf); border:1px solid var(--rl-line); border-radius:var(--rl-r); padding:18px; align-items:flex-start; box-shadow:var(--rl-card-shadow);
+    .rl-ghi { width:40px; height:40px; border-radius:9px; background:var(--rl-surf3); display:flex; align-items:center; justify-content:center; color:var(--rl-green); flex:none; }
+    h3 { font-family:var(--rl-fd); font-size:15px; font-weight:600; margin-block-start:0; margin-inline:0; margin-block-end:6px; color:var(--rl-fg); }
+    p { font-size:13px; color:var(--rl-muted); margin-block-start:0; margin-inline:0; margin-block-end:12px; line-height:1.5; } }
+
+  // ── Severity banner ──────────────────────────────────────────────────────
+  .rl-sevban { display:flex; gap:11px; padding-block:13px; padding-inline:15px; border-radius:9px; border:1px solid var(--rl-line2); border-inline-start-width:3px; margin-block-end:10px; background:var(--rl-surf);
+    .rl-si2 { flex:none; } }
+  .rl-sevban.info { border-inline-start-color:#4fb6c6; .rl-si2 { color:#4fb6c6; } }
+  .rl-sevban.warning { border-inline-start-color:var(--rl-amber); .rl-si2 { color:var(--rl-amber); } }
+  .rl-sevban.critical { border-inline-start-color:var(--rl-red); .rl-si2 { color:var(--rl-red); } }
+
+  // ── Alert (drawer/list) ──────────────────────────────────────────────────
+  .rl-alert { display:flex; gap:11px; padding-block:13px; padding-inline:16px; border-block-end:1px solid var(--rl-line); align-items:flex-start;
+    &:last-child { border-block-end:none; }
+    .rl-ai { color:var(--rl-amber); flex:none; margin-block-start:1px; }
+    .rl-at { font-weight:600; font-size:13px; color:var(--rl-fg); }
+    .rl-ad { color:var(--rl-muted); font-size:12px; margin-block-start:2px; } }
+
+  // ── Empty state / tag ────────────────────────────────────────────────────
+  .rl-stub { display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding-block:70px; padding-inline:20px; color:var(--rl-muted);
+    .rl-si { width:46px; height:46px; color:var(--rl-faint); margin-block-end:14px; }
+    h3 { font-family:var(--rl-fd); font-size:18px; color:var(--rl-fg); margin-block-start:0; margin-inline:0; margin-block-end:6px; }
+    p { max-inline-size:360px; font-size:13.5px; } }
+  .rl-tag { font-family:var(--rl-fm); font-size:10px; padding-block:2px; padding-inline:8px; border-radius:5px; background:var(--rl-green-soft); color:var(--rl-green); }
+
+  // ── Loading skeletons ────────────────────────────────────────────────────
+  // Shown while a dashboard fetch is in flight so a slow request never
+  // renders as the empty state. Decorative (aria-hidden in the markup);
+  // the announcement rides on a .ic-visually-hidden role="status".
+  .ic-skeleton-card { pointer-events:none; }
+  .ic-skeleton-line { block-size:11px; border-radius:6px; margin-block-end:10px;
+    background:linear-gradient(90deg, rgba(var(--rl-muted-rgb),.13) 25%, rgba(var(--rl-muted-rgb),.22) 37%, rgba(var(--rl-muted-rgb),.13) 63%);
+    background-size:400% 100%; animation:ic-skeleton-shimmer 1.4s ease infinite;
+    &:last-child { margin-block-end:0; } }
+  .ic-skeleton-title { block-size:15px; inline-size:55%; }
+  .ic-skeleton-short { inline-size:35%; }
+  @keyframes ic-skeleton-shimmer { 0% { background-position:100% 50%; } 100% { background-position:0 50%; } }
+  // Respect users who ask the OS for less motion.
+  @media (prefers-reduced-motion: reduce) {
+    .ic-skeleton-line, .rl-tl-dot.running, .rl-pill--job.running .rl-d { animation:none; } }
+
+  // Available to assistive tech, invisible on screen.
+  .ic-visually-hidden { position:absolute; inline-size:1px; block-size:1px; padding:0; margin:-1px;
+    overflow:hidden; clip-path:inset(50%); white-space:nowrap; border:0; }
+
+  // ── Env bar (project dashboard) ──────────────────────────────────────────
+  .rl-envbar { display:flex; align-items:center; gap:10px; padding-block:8px; padding-inline:13px; border-radius:var(--rl-rsm); margin-block-end:16px; border:1px solid var(--rl-line2);
+    .rl-eb-dot { width:8px; height:8px; border-radius:50%; flex:none; background:var(--rl-faint); }
+    .rl-eb-label { font-family:var(--rl-fd); font-weight:600; font-size:12.5px; letter-spacing:.06em; text-transform:uppercase; }
+    .rl-eb-warn { font-family:var(--rl-fm); font-size:10.5px; color:var(--rl-muted); } }
+  .rl-envbar.env-production { background:var(--rl-green-soft); border-color:rgba(47,199,140,.4);
+    .rl-eb-dot { background:var(--rl-green); box-shadow:0 0 0 3px var(--rl-green-soft); } .rl-eb-label { color:var(--rl-green); } }
+  .rl-envbar.env-staging { background:var(--rl-amber-soft); border-color:rgba(239,165,62,.35);
+    .rl-eb-dot { background:var(--rl-amber); } .rl-eb-label { color:var(--rl-amber-ink); } }
+  .rl-envbar.env-development { background:var(--rl-surf2); .rl-eb-dot { background:var(--rl-faint); } .rl-eb-label { color:var(--rl-fg2); } }
+
+  // ── Project context sidebar (the .ctx rail inside a project) ─────────────
+  .rl-ctx-back { display:flex; align-items:center; gap:6px; background:none; border:none; color:var(--rl-muted);
+    font-family:var(--rl-fm); font-size:11px; padding-block:4px; padding-inline:8px; border-radius:6px; margin-block-end:6px; cursor:pointer;
+    &:hover { color:var(--rl-green); } }
+  .rl-ctx-proj { font-family:var(--rl-fd); font-weight:600; font-size:15px; padding-block-start:4px; padding-inline:9px; padding-block-end:12px; display:flex; flex-direction:column; gap:2px; color:var(--rl-fg);
+    .rl-ctx-projver { font-family:var(--rl-fm); font-size:10px; color:var(--rl-faint); font-weight:400; } }
+  .rl-ctx-sec { margin-block-end:8px; }
+  .rl-ctx-sech { display:flex; align-items:center; justify-content:space-between; padding-block-start:8px; padding-inline:9px; padding-block-end:5px; font-family:var(--rl-fm);
+    font-size:9.5px; letter-spacing:.12em; text-transform:uppercase; color:var(--rl-faint); }
+  .rl-ctx-add { width:20px; height:20px; border-radius:5px; border:1px solid var(--rl-line2); background:none; color:var(--rl-muted);
+    display:flex; align-items:center; justify-content:center; cursor:pointer; &:hover { background:var(--rl-surf2); color:var(--rl-fg); } }
+  .rl-ctx-item { display:flex; align-items:center; gap:8px; width:100%; text-align:left; background:none; border:none; color:var(--rl-fg2);
+    font-size:12.5px; padding-block:7px; padding-inline:9px; border-radius:6px; cursor:pointer;
+    &:hover { background:var(--rl-surf2); color:var(--rl-fg); }
+    &.active { background:var(--rl-surf2); color:var(--rl-fg); box-shadow:inset 2px 0 0 var(--rl-green); }
+    .rl-ctx-name { flex:1; font-family:var(--rl-fb); font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .rl-ctx-ver { font-family:var(--rl-fm); font-size:9.5px; color:var(--rl-faint); }
+    .rl-ctx-clone { color:var(--rl-muted); display:flex; &:hover { color:var(--rl-green); } } }
+  .rl-ctx-empty { padding-block:4px; padding-inline:9px; color:var(--rl-faint); font-family:var(--rl-fm); font-size:11px; }
+
+  // ── Drawer (jobs / alerts slide-over) ────────────────────────────────────
+  .rl-jstep { display:flex; align-items:center; gap:11px; padding-block:9px; padding-inline:0; border-block-end:1px solid var(--rl-line); font-size:13px;
+    &:last-child { border-block-end:none; }
+    .rl-si2 { width:18px; height:18px; flex:none; display:flex; align-items:center; justify-content:center; }
+    &.pending { color:var(--rl-faint); } &.run { color:var(--rl-amber-ink); } &.done { color:var(--rl-fg2); } }
+  .rl-spin { width:13px; height:13px; border:2px solid var(--rl-line2); border-block-start-color:var(--rl-amber); border-radius:50%; animation:rl-sp .7s linear infinite; }
+
+  // ── Modal explain block ──────────────────────────────────────────────────
+  .rl-steps-explain { background:var(--rl-bg); border:1px solid var(--rl-line); border-radius:var(--rl-rsm); padding-block:12px; padding-inline:14px; margin-block-end:18px;
+    li { font-family:var(--rl-fm); font-size:11.5px; color:var(--rl-muted); margin-block:5px; margin-inline:0; list-style:none; display:flex; gap:8px;
+      b { color:var(--rl-green); } } }
+
+  // ── Avatar chip ──────────────────────────────────────────────────────────
+  .rl-ava { border-radius:50%; background:var(--rl-green-dim); color:var(--rl-green-fg); font-family:var(--rl-fd);
+    font-weight:600; display:flex; align-items:center; justify-content:center; width:28px; height:28px; font-size:12px; }
+
+  // SVG helper sizing default (icons emitted by env.icon get class ic-svg/rl-svg)
+  .rl-svg { flex:none; }
+}

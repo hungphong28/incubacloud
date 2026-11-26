@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <t t-name="incubacloud.Monitoring">
+        <div class="rl-page">
+            <div class="rl-phead">
+                <div>
+                    <h1 class="rl-ptitle">Monitoring</h1>
+                    <p class="rl-psub">The fleet's metrics and each server's, drawn from the metrics central.</p>
+                </div>
+            </div>
+
+            <!-- Loading -->
+            <t t-if="state.loading">
+                <div class="rl-card rl-card-pad ic-skeleton-card" aria-hidden="true">
+                    <div class="ic-skeleton-line ic-skeleton-title"/>
+                    <div class="ic-skeleton-line"/>
+                </div>
+                <span class="ic-visually-hidden" role="status">Loading monitoring…</span>
+            </t>
+
+            <!-- Could not read the configuration -->
+            <t t-elif="state.error">
+                <div class="rl-stub" role="alert">
+                    <span class="rl-si"><t t-out="env.icon('alert', 46)"/></span>
+                    <h3>Could not load monitoring</h3>
+                    <p t-esc="state.error"/>
+                    <button class="rl-btn rl-btn-primary" style="margin-top:14px;"
+                            t-on-click="() => this.loadConfig()">Retry</button>
+                </div>
+            </t>
+
+            <!-- No server in the fleet: nothing can report metrics yet.
+                 A managed panel itself runs on servers it does not
+                 manage, and those are not part of its fleet. -->
+            <t t-elif="!hasHosts">
+                <div class="rl-stub">
+                    <span class="rl-si"><t t-out="env.icon('heartbeat', 46)"/></span>
+                    <h3>No servers yet</h3>
+                    <p>Here you will see your fleet's metrics: the servers you add and the instances you deploy on them. You have no server yet, so there is nothing to show. Add a VPS or connect a server of your own to start.</p>
+                </div>
+            </t>
+
+            <t t-else="">
+                <div class="rl-tabs" role="tablist" aria-label="Monitoring views">
+                    <t t-foreach="views" t-as="v" t-key="v.key">
+                        <button class="rl-tab" role="tab" t-att-data-view="v.key"
+                                t-att-class="{ active: state.view === v.key }"
+                                t-att-aria-selected="state.view === v.key ? 'true' : 'false'"
+                                t-on-click="() => this.select(v.key)">
+                            <t t-esc="v.label"/>
+                        </button>
+                    </t>
+                </div>
+                <div class="ic-monitoring-view">
+                    <t t-if="state.view === 'fleet'">
+                        <FleetBoard canConfigure="canConfigure" onOpenHost.bind="openHost"/>
+                    </t>
+                    <t t-else="">
+                        <div class="ic-monitoring-subject">
+                            <span class="ic-monitoring-subject-label">Host</span>
+                            <SearchSelect options="hostOptions"
+                                          value="state.host"
+                                          onChange.bind="setHost"
+                                          placeholder.translate="Select a host"
+                                          emptyLabel.translate="Select a host"/>
+                        </div>
+                        <t t-if="hostId">
+                            <HostBoard t-key="hostId" hostId="hostId" canConfigure="canConfigure"/>
+                        </t>
+                    </t>
+                </div>
+            </t>
+        </div>
+    </t>
+
+</templates>

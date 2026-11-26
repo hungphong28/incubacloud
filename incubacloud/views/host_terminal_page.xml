@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+<template id="host_terminal_page" name="Cloud Host Console">&lt;!DOCTYPE html&gt;
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>Host Shell — <t t-esc="host_label"/></title>
+    <link rel="icon" type="image/svg+xml" href="/incubacloud/static/src/img/icon-solid.svg"/>
+
+    <!-- xterm.js 5.3.0 vendored locally (offline-safe, no CDN);
+         the same copy the instance terminal page loads -->
+    <link rel="stylesheet" href="/incubacloud/static/lib/xterm/xterm.min.css"/>
+    <script src="/incubacloud/static/lib/xterm/xterm.min.js"></script>
+    <script src="/incubacloud/static/lib/xterm/xterm-addon-fit.min.js"></script>
+
+    <link rel="stylesheet" href="/incubacloud/static/fonts/fonts.css"/>
+    <link rel="preload" href="/incubacloud/static/fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin=""/>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            background: #0a0c0d;
+            color: #c3cad0;
+            font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, Consolas, monospace;
+            font-size: 13px;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* ── Header — danger styling ── */
+        .terminal-header {
+            background: #1d1213;
+            border-bottom: 2px solid #ff6063;
+            padding: 8px 16px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+
+        .terminal-title {
+            flex: 1;
+            font-family: 'Space Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif;
+            font-size: 14px;
+            color: #c3cad0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .terminal-title strong { color: #eef1f3; }
+
+        .terminal-host-meta {
+            color: #ff9b9d;
+            font-size: 12px;
+        }
+
+        .terminal-badge {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            background: #ff6063;
+            color: #2a0808;
+        }
+
+        .terminal-badge.connected { background: #ff6063; color: #2a0808; }
+        .terminal-badge.error     { background: rgba(255,96,99,.15); color: #ff9b9d; }
+        .terminal-badge.closed    { background: #181c1f; color: #8a949c; }
+        .terminal-badge.idle      { background: rgba(239,165,62,.14); color: #f0c987; }
+        .terminal-badge.paused    { background: #181c1f; color: #8a949c; }
+
+        .terminal-badge-host {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: 700;
+            background: #ff6063;
+            color: #2a0808;
+            letter-spacing: 0.1em;
+        }
+
+        /* ── Body ── */
+        #terminal-container {
+            flex: 1;
+            padding: 4px;
+            overflow: hidden;
+        }
+
+        .xterm { height: 100%; }
+        .xterm-viewport { overflow-y: hidden !important; }
+
+        /* ── Footer ── */
+        .terminal-footer {
+            background: #101315;
+            border-top: 1px solid #262b2f;
+            padding: 5px 16px;
+            font-size: 11px;
+            color: #737d85;
+            display: flex;
+            justify-content: space-between;
+            flex-shrink: 0;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="terminal-header">
+        <span class="terminal-badge-host">HOST</span>
+        <div class="terminal-title">
+            <strong><t t-esc="host_label"/></strong>
+            <span class="terminal-host-meta">
+                — <t t-esc="host_user"/>@<t t-esc="host_ip"/>:<t t-esc="host_port"/>
+            </span>
+        </div>
+        <span id="conn-badge" class="terminal-badge">Connecting…</span>
+    </div>
+
+    <div id="terminal-container"></div>
+
+    <div class="terminal-footer">
+        <span id="status-text">Establishing SSH connection…</span>
+        <span id="size-text">—</span>
+    </div>
+
+    <t t-call="incubacloud.terminal_client_script">
+        <t t-set="base_path" t-value="'/cloud/host_terminal/'"/>
+        <t t-set="cursor_color" t-value="'#ff6063'"/>
+    </t>
+
+</body>
+</html>
+</template>
+</odoo>

@@ -1,0 +1,584 @@
+#!/usr/bin/env bats
+# Tests for scripts/lib/common.sh.
+#
+# Run locally with:  bats incubacloud/tests/shell
+# CI runs the same command in the "Shell tests (bats)" job.
+
+setup() {
+    # shellcheck source=../../scripts/lib/common.sh
+    source "${BATS_TEST_DIRNAME}/../../scripts/lib/common.sh"
+    TMP="$(mktemp -d)"
+}
+
+teardown() {
+    rm -rf "$TMP"
+}
+
+# Build a copier-shaped instance repo with the live log tracked, which
+# is the state every instance deployed before this fix is already in.
+_repo_with_tracked_log() {
+    local dir="$TMP/inst"
+    mkdir -p "$dir/logs"
+    git -C "$dir" init -q
+    git -C "$dir" config user.email t@example.com
+    git -C "$dir" config user.name Test
+    printf 'template\n' > "$dir/prod.yaml"
+    printf 'boot line\n' > "$dir/logs/odoo.log"
+    git -C "$dir" add -A
+    git -C "$dir" commit -qm initial
+    printf '%s\n' "$dir"
+}
+
+# The same repo with continuous recovery's directory tracked: wal-g, and
+# the spool the pitr agent writes. Every instance a rebuild committed
+# after continuous recovery was switched on is in this state.
+_repo_with_tracked_walg() {
+    local dir="$TMP/inst"
+    mkdir -p "$dir/.walg/spool/done"
+    git -C "$dir" init -q
+    git -C "$dir" config user.email t@example.com
+    git -C "$dir" config user.name Test
+    printf 'template\n' > "$dir/prod.yaml"
+    printf 'wal-g\n' > "$dir/.walg/wal-g"
+    : > "$dir/.walg/spool/done/00000001000000000000000B"
+    printf '1761566560\n' > "$dir/.walg/spool/fs-ok"
+    git -C "$dir" add -A
+    git -C "$dir" commit -qm initial
+    printf '%s\n' "$dir"
+}
+
+@test "ic_log prefixes the message" {
+    run ic_log "deploying instance"
+    [ "$status" -eq 0 ]
+    [ "$output" = "[incubacloud] deploying instance" ]
+}
+
+@test "ic_log joins its arguments" {
+    run ic_log one two three
+    [ "$output" = "[incubacloud] one two three" ]
+}
+
+@test "ic_warn marks the line as a warning and keeps going" {
+    run ic_warn "image is stale"
+    [ "$status" -eq 0 ]
+    [ "$output" = "[incubacloud] WARNING: image is stale" ]
+}
+
+@test "ic_die exits non-zero with an ERROR line" {
+    run ic_die "compose file missing"
+    [ "$status" -eq 1 ]
+    [ "$output" = "[incubacloud] ERROR: compose file missing" ]
+}
+
+@test "ic_expand_home expands a leading tilde against \$HOME" {
+    HOME=/home/cloud run ic_expand_home "~/project/inst"
+    [ "$output" = "/home/cloud/project/inst" ]
+}
+
+@test "ic_expand_home expands a bare tilde" {
+    HOME=/home/cloud run ic_expand_home "~"
+    [ "$output" = "/home/cloud" ]
+}
+
+@test "ic_expand_home leaves an absolute path alone" {
+    HOME=/home/cloud run ic_expand_home "/srv/odoo/inst"
+    [ "$output" = "/srv/odoo/inst" ]
+}
+
+@test "ic_expand_home only expands a tilde at the start" {
+    HOME=/home/cloud run ic_expand_home "/srv/~/inst"
+    [ "$output" = "/srv/~/inst" ]
+}
+
+@test "ic_require_args passes when enough arguments were given" {
+    run ic_require_args 2 3 "script.sh <dir> <name>"
+    [ "$status" -eq 0 ]
+    [ "$output" = "" ]
+}
+
+@test "ic_require_args passes on the exact count" {
+    run ic_require_args 2 2 "script.sh <dir> <name>"
+    [ "$status" -eq 0 ]
+}
+
+@test "ic_require_args aborts and shows the usage line" {
+    run ic_require_args 2 1 "script.sh <dir> <name>"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"expected at least 2 argument(s), got 1."* ]]
+    [[ "$output" == *"Usage: script.sh <dir> <name>"* ]]
+}
+
+@test "ic_require_args aborts without a usage line when none is given" {
+    run ic_require_args 1 0
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"expected at least 1 argument(s), got 0."* ]]
+    [[ "$output" != *"Usage:"* ]]
+}
+
+@test "ic_git_exclude_logs excludes the log directory" {
+    dir="$(_repo_with_tracked_log)"
+    run ic_git_exclude_logs "$dir"
+    [ "$status" -eq 0 ]
+    grep -qxF '/logs/' "$dir/.git/info/exclude"
+}
+
+@test "ic_git_exclude_logs untracks the log but leaves it on disk" {
+    dir="$(_repo_with_tracked_log)"
+    ic_git_exclude_logs "$dir"
+    [ -z "$(git -C "$dir" ls-files logs)" ]
+    [ -f "$dir/logs/odoo.log" ]
+}
+
+@test "ic_git_exclude_logs leaves the tree clean while Odoo keeps writing" {
+    # The whole point. Before this, a write landing between the commit
+    # and copier's cleanliness check aborted the rebuild with
+    # "Destination repository is dirty" after 26 other steps had passed.
+    dir="$(_repo_with_tracked_log)"
+    ic_git_exclude_logs "$dir"
+    git -C "$dir" commit -qm untrack
+    printf 'odoo writes again\n' >> "$dir/logs/odoo.log"
+    printf 'and rotates\n' > "$dir/logs/odoo.log.2026-08-23"
+    [ -z "$(git -C "$dir" status --porcelain)" ]
+}
+
+@test "ic_git_exclude_logs is idempotent" {
+    dir="$(_repo_with_tracked_log)"
+    ic_git_exclude_logs "$dir"
+    ic_git_exclude_logs "$dir"
+    ic_git_exclude_logs "$dir"
+    [ "$(grep -cxF '/logs/' "$dir/.git/info/exclude")" -eq 1 ]
+}
+
+@test "ic_git_exclude_logs appends after an exclude file with no final newline" {
+    dir="$(_repo_with_tracked_log)"
+    printf '# no trailing newline' > "$dir/.git/info/exclude"
+    ic_git_exclude_logs "$dir"
+    grep -qxF '/logs/' "$dir/.git/info/exclude"
+}
+
+@test "ic_git_exclude_logs does nothing outside a git repository" {
+    mkdir -p "$TMP/plain"
+    run ic_git_exclude_logs "$TMP/plain"
+    [ "$status" -eq 0 ]
+    [ ! -e "$TMP/plain/.git" ]
+}
+
+@test "ic_git_exclude untracks continuous recovery's directory but leaves it on disk" {
+    dir="$(_repo_with_tracked_walg)"
+    run ic_git_exclude "$dir" .walg/
+    [ "$status" -eq 0 ]
+    grep -qxF '/.walg/' "$dir/.git/info/exclude"
+    [ -z "$(git -C "$dir" ls-files .walg)" ]
+    [ -f "$dir/.walg/wal-g" ]
+    [ -f "$dir/.walg/spool/fs-ok" ]
+}
+
+@test "ic_git_exclude leaves the tree clean while the pitr agent keeps writing" {
+    # QA 7016, 2026-10-27: the agent marked a segment, dropped an old
+    # mark or recorded a filestore copy between the commit and copier's
+    # check, and a plan change died on "Destination repository is
+    # dirty", holding the instance's queue.
+    dir="$(_repo_with_tracked_walg)"
+    ic_git_exclude "$dir" .walg/
+    git -C "$dir" commit -qm untrack
+    : > "$dir/.walg/spool/done/000000010000000000000018"
+    rm "$dir/.walg/spool/done/00000001000000000000000B"
+    printf '1761566860\n' > "$dir/.walg/spool/fs-ok"
+    mkdir -p "$dir/.walg/restore"
+    printf 'job=7\n' > "$dir/.walg/restore/result"
+    [ -z "$(git -C "$dir" status --porcelain)" ]
+}
+
+@test "ic_git_exclude is idempotent and keeps the log's line" {
+    dir="$(_repo_with_tracked_walg)"
+    ic_git_exclude_logs "$dir"
+    ic_git_exclude "$dir" .walg/
+    ic_git_exclude "$dir" .walg/
+    [ "$(grep -cxF '/.walg/' "$dir/.git/info/exclude")" -eq 1 ]
+    [ "$(grep -cxF '/logs/' "$dir/.git/info/exclude")" -eq 1 ]
+}
+
+@test "ic_git_exclude keeps out a single file and a pattern, not their neighbours" {
+    dir="$TMP/inst"
+    mkdir -p "$dir/odoo/custom/src" "$dir/odoo/custom/conf.d"
+    git -C "$dir" init -q
+    git -C "$dir" config user.email t@example.com
+    git -C "$dir" config user.name Test
+    printf 'odoo: {}\n' > "$dir/odoo/custom/src/repos.yaml"
+    printf 'odoo: {}\n' > "$dir/odoo/custom/src/addons.yaml"
+    printf '[options]\n' > "$dir/odoo/custom/conf.d/inst.conf"
+    : > "$dir/odoo/custom/conf.d/.empty"
+    git -C "$dir" add -A
+    git -C "$dir" commit -qm initial
+    ic_git_exclude "$dir" odoo/custom/src/repos.yaml
+    ic_git_exclude "$dir" 'odoo/custom/conf.d/*.conf'
+    grep -qxF '/odoo/custom/src/repos.yaml' "$dir/.git/info/exclude"
+    grep -qxF '/odoo/custom/conf.d/*.conf' "$dir/.git/info/exclude"
+    [ "$(git -C "$dir" ls-files odoo)" = "$(printf 'odoo/custom/conf.d/.empty\nodoo/custom/src/addons.yaml')" ]
+    [ -f "$dir/odoo/custom/src/repos.yaml" ]
+    [ -f "$dir/odoo/custom/conf.d/inst.conf" ]
+}
+
+@test "ic_git_exclude untracks a path staged with content neither HEAD nor the disk has" {
+    # A commit that failed (commit-dirty swallows it) leaves the file
+    # staged, and the next deploy rewrites it on disk: plain
+    # ``git rm --cached`` refuses that path, and ``git add -A`` would
+    # then commit it. ``-f`` is safe: ``--cached`` never touches the disk.
+    dir="$TMP/inst"
+    mkdir -p "$dir/odoo/custom/src"
+    git -C "$dir" init -q
+    git -C "$dir" config user.email t@example.com
+    git -C "$dir" config user.name Test
+    printf 'token: one\n' > "$dir/odoo/custom/src/repos.yaml"
+    git -C "$dir" add -A
+    git -C "$dir" commit -qm initial
+    printf 'token: two\n' > "$dir/odoo/custom/src/repos.yaml"
+    git -C "$dir" add -A
+    printf 'token: three\n' > "$dir/odoo/custom/src/repos.yaml"
+    run ic_git_exclude "$dir" odoo/custom/src/repos.yaml
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"WARNING"* ]]
+    [ -z "$(git -C "$dir" ls-files odoo)" ]
+    [ "$(cat "$dir/odoo/custom/src/repos.yaml")" = "token: three" ]
+}
+
+# ── The instance's database tool ─────────────────────────────────────────
+
+@test "the database tool is click-odoo unless the panel says otherwise" {
+    unset IC_DB_TOOL
+    run ic_db_tool
+    [ "$output" = "click-odoo" ]
+    IC_DB_TOOL=odoo-db run ic_db_tool
+    [ "$output" = "odoo-db" ]
+}
+
+@test "a tool the library does not implement stops the script" {
+    IC_DB_TOOL=pg_dump run ic_db_tool
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unknown database tool: pg_dump"* ]]
+}
+
+@test "click-odoo dumps with and without the filestore" {
+    unset IC_DB_TOOL
+    ic_db_dump_args prod /host-tmp/out.zip all
+    [ "${IC_DB_ARGS[*]}" = "click-odoo-backupdb --filestore prod /host-tmp/out.zip" ]
+    ic_db_dump_args prod /host-tmp/out.zip db
+    [ "${IC_DB_ARGS[*]}" = "click-odoo-backupdb --no-filestore prod /host-tmp/out.zip" ]
+}
+
+@test "odoo-db dumps the zip, with or without the filestore" {
+    export IC_DB_TOOL=odoo-db
+    ic_db_dump_args prod /host-tmp/out.zip all
+    [ "${IC_DB_ARGS[*]}" = "odoo db dump prod /host-tmp/out.zip" ]
+    ic_db_dump_args prod /host-tmp/out.zip db
+    [ "${IC_DB_ARGS[*]}" = "odoo db dump --no-filestore prod /host-tmp/out.zip" ]
+}
+
+@test "a dump scope the library does not know stops the script" {
+    run ic_db_dump_args prod /host-tmp/out.zip filestore
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unknown scope: filestore"* ]]
+}
+
+@test "click-odoo loads as a copy, forced, neutralized on request" {
+    unset IC_DB_TOOL
+    ic_db_load_args prod /mnt/restore.zip 0
+    [ "${IC_DB_ARGS[*]}" = "click-odoo-restoredb --copy --force prod /mnt/restore.zip" ]
+    ic_db_load_args prod /mnt/restore.zip 1
+    [ "${IC_DB_ARGS[*]}" = "click-odoo-restoredb --neutralize --copy --force prod /mnt/restore.zip" ]
+}
+
+@test "odoo-db loads forced, as a copy by default, neutralized on request" {
+    export IC_DB_TOOL=odoo-db
+    ic_db_load_args prod /mnt/restore.zip
+    [ "${IC_DB_ARGS[*]}" = "odoo db load --force prod /mnt/restore.zip" ]
+    ic_db_load_args prod /mnt/restore.zip 1
+    [ "${IC_DB_ARGS[*]}" = "odoo db load --neutralize --force prod /mnt/restore.zip" ]
+}
+
+@test "a move loads the database as moved with either tool" {
+    unset IC_DB_TOOL
+    ic_db_load_args prod /mnt/restore.zip 0 move
+    [ "${IC_DB_ARGS[*]}" = "click-odoo-restoredb --move --force prod /mnt/restore.zip" ]
+    ic_db_load_args prod /mnt/restore.zip 0 copy
+    [ "${IC_DB_ARGS[*]}" = "click-odoo-restoredb --copy --force prod /mnt/restore.zip" ]
+    export IC_DB_TOOL=odoo-db
+    ic_db_load_args prod /mnt/restore.zip 0 move
+    [ "${IC_DB_ARGS[*]}" = "odoo db load --move --force prod /mnt/restore.zip" ]
+}
+
+@test "a load the library does not know stops the script" {
+    run ic_db_load_args prod /mnt/restore.zip 0 clone
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unknown load: clone"* ]]
+}
+
+@test "a series without Odoo's neutralization loads plainly, then runs the SQL" {
+    export IC_NEUTRALIZE=sql
+    ic_db_load_args prod /mnt/restore.zip 1
+    [ "${IC_DB_ARGS[*]}" = "click-odoo-restoredb --copy --force prod /mnt/restore.zip" ]
+    ic_db_neutralize_args prod
+    [ "${IC_DB_ARGS[0]}" = "psql" ]
+    [[ "${IC_DB_ARGS[*]}" == *"database.is_neutralized"* ]]
+}
+
+@test "with Odoo's own neutralization there is nothing to run after the load" {
+    unset IC_NEUTRALIZE
+    ic_db_neutralize_args prod
+    [ "${#IC_DB_ARGS[@]}" -eq 0 ]
+}
+
+@test "an unknown neutralizer is refused" {
+    export IC_NEUTRALIZE=other
+    run ic_neutralizer
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unknown neutralizer: other"* ]]
+}
+
+@test "the argv keeps a path with spaces as one word" {
+    unset IC_DB_TOOL
+    ic_db_dump_args prod "/host tmp/out.zip" all
+    [ "${#IC_DB_ARGS[@]}" -eq 4 ]
+    [ "${IC_DB_ARGS[3]}" = "/host tmp/out.zip" ]
+}
+
+# ── One-off containers ───────────────────────────────────────────────────
+
+# A docker for the one-off helpers. ``compose ps -q --status running``
+# answers the ids in $STUB_IDS, or fails when STUB_PS_FAILS=1; ``inspect``
+# reads "<id> <service> <oneoff>" lines from $STUB_CONTAINERS and prints,
+# like the real format, the service of a container that is not a one-off
+# and an empty line for one that is; an id it does not know fails the
+# command after the others are printed, as docker does. ``compose run``
+# is recorded in $TMP/calls.
+_oneoff_docker() {
+    docker() {
+        case "$*" in
+            "compose ps -q --status running")
+                [ "${STUB_PS_FAILS:-0}" = 1 ] && return 1
+                printf '%s' "${STUB_IDS:-}"
+                return 0
+                ;;
+            "compose run "*)
+                printf '%s\n' "$*" >> "$TMP/calls"
+                return 0
+                ;;
+            "inspect "*)
+                local id line rc=0
+                shift 3
+                for id in "$@"; do
+                    line="$(grep "^$id " <<<"${STUB_CONTAINERS:-}")" || { rc=1; continue; }
+                    set -- $line
+                    [ "$3" = True ] && echo || echo "$2"
+                done
+                return "$rc"
+                ;;
+        esac
+        return 99
+    }
+}
+
+@test "ic_compose_run keeps the one-off out of Traefik and Sablier" {
+    _oneoff_docker
+    run ic_compose_run --rm -T odoo odoo shell
+    [ "$status" -eq 0 ]
+    [ "$(cat "$TMP/calls")" = "compose run --label traefik.enable=false --label sablier.enable=false --rm -T odoo odoo shell" ]
+}
+
+@test "ic_compose_run passes an argument with spaces as one word" {
+    _oneoff_docker
+    docker() { printf '%s\n' "$@" > "$TMP/argv"; }
+    ic_compose_run --rm odoo sh -c "echo two words"
+    [ "$(tail -n 1 "$TMP/argv")" = "echo two words" ]
+}
+
+@test "ic_running_services leaves one-off containers out" {
+    _oneoff_docker
+    STUB_IDS=$'a1\nb2\nc3\n'
+    STUB_CONTAINERS=$'a1 db False\nb2 odoo True\nc3 smtp False'
+    run ic_running_services
+    [ "$status" -eq 0 ]
+    [ "$output" = $'db\nsmtp' ]
+}
+
+@test "ic_running_services names a service once, however many containers run it" {
+    _oneoff_docker
+    STUB_IDS=$'a1\nb2\n'
+    STUB_CONTAINERS=$'a1 odoo False\nb2 odoo False'
+    run ic_running_services
+    [ "$output" = "odoo" ]
+}
+
+@test "ic_running_services prints nothing when nothing runs" {
+    _oneoff_docker
+    STUB_IDS=""
+    run ic_running_services
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "ic_running_services fails when docker cannot list the stack" {
+    _oneoff_docker
+    STUB_PS_FAILS=1
+    run ic_running_services
+    [ "$status" -eq 1 ]
+}
+
+@test "a one-off that ends before the inspect is not a failed read" {
+    _oneoff_docker
+    STUB_IDS=$'a1\ngone\n'
+    STUB_CONTAINERS='a1 db False'
+    set -o pipefail
+    run ic_running_services
+    [ "$status" -eq 0 ]
+    [ "$output" = "db" ]
+}
+
+@test "ic_copier: each run has a cache of its own, gone when it ends" {
+    export HOME="$TMP/home"
+    mkdir -p "$HOME/.local/bin"
+    cat > "$HOME/.local/bin/copier" <<STUB
+#!/bin/bash
+[ -d "\$COPIER_CACHE_DIR" ] || exit 7
+echo "\$COPIER_CACHE_DIR" >> "$TMP/caches"
+STUB
+    chmod +x "$HOME/.local/bin/copier"
+    ic_copier update first
+    ic_copier update second
+    [ "$(sort -u "$TMP/caches" | wc -l)" -eq 2 ]
+    while read -r cache; do
+        [ ! -e "$cache" ]
+    done < "$TMP/caches"
+}
+
+@test "ic_copier: copier's own failure comes back, and the cache still goes" {
+    export HOME="$TMP/home"
+    mkdir -p "$HOME/.local/bin"
+    cat > "$HOME/.local/bin/copier" <<STUB
+#!/bin/bash
+echo "\$COPIER_CACHE_DIR" > "$TMP/cache"
+exit 3
+STUB
+    chmod +x "$HOME/.local/bin/copier"
+    run ic_copier update
+    [ "$status" -eq 3 ]
+    [ ! -e "$(cat "$TMP/cache")" ]
+}
+
+@test "ic_copier: the settings file the panel names reaches copier" {
+    export HOME="$TMP/home"
+    mkdir -p "$HOME/.local/bin"
+    cat > "$HOME/.local/bin/copier" <<STUB
+#!/bin/bash
+echo "\${COPIER_SETTINGS_PATH:-none} \$*" > "$TMP/seen"
+STUB
+    chmod +x "$HOME/.local/bin/copier"
+    IC_COPIER_SETTINGS="$TMP/copier-settings.yml" ic_copier update --defaults
+    [ "$(cat "$TMP/seen")" = "$TMP/copier-settings.yml update --defaults" ]
+    unset COPIER_SETTINGS_PATH
+    ic_copier update --defaults
+    [ "$(cat "$TMP/seen")" = "none update --defaults" ]
+}
+
+@test "ic_compose_older_than names only a Compose under the version asked" {
+    docker() {
+        [ "$*" = "compose version --short" ] || return 2
+        [ -n "${STUB_VERSION:-}" ] || return 1
+        printf '%s\n' "$STUB_VERSION"
+    }
+    for old in 2.23.3 v2.23.0 1.29.2; do
+        STUB_VERSION="$old" run ic_compose_older_than 2 24
+        [ "$status" -eq 0 ]
+        [ "$output" = "${old#v}" ]
+    done
+    for recent in 2.24.0 v2.24.6 2.40.3 5.7.0 "" garbage; do
+        STUB_VERSION="$recent" run ic_compose_older_than 2 24
+        [ "$status" -eq 0 ]
+        [ -z "$output" ]
+    done
+}
+
+# needrestart's drop-ins, read the way needrestart.conf reads them: the
+# unit's restart is turned off by a key that matches it.
+_needrestart_reads() {
+    # shellcheck disable=SC2016
+    command perl -e '
+        our %nrconf;
+        my $fn = shift;
+        eval do { local (@ARGV, $/) = $fn; <> };
+        die "Error parsing $fn: $@" if $@;
+        my ($re) = grep { "cloud-init-hotplugd.service" =~ $_ }
+            keys %{ $nrconf{override_rc} || {} };
+        exit(defined $re && !$nrconf{override_rc}{$re} ? 0 : 1);
+    ' "$1"
+}
+
+# Restarted by hand, cloud-init's hotplug hook (a oneshot unit fed by a
+# FIFO) waits on the FIFO for good, and the apt run with it (QA,
+# 15-nov-2026).
+@test "ic_needrestart_keep_hotplug writes a drop-in needrestart reads, and nothing on stdout" {
+    export IC_NEEDRESTART_CONF_DIR="$TMP/needrestart"
+    mkdir -p "$IC_NEEDRESTART_CONF_DIR"
+    sudo() { [ "$1" = -n ] && shift; "$@"; }
+    run ic_needrestart_keep_hotplug
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    conf="$IC_NEEDRESTART_CONF_DIR/50-incubacloud-hotplug.conf"
+    grep -qxF '$nrconf{override_rc}{qr(^cloud-init-hotplugd)} = 0;' "$conf"
+    [ "$(stat -c %a "$conf")" = 644 ]
+    _needrestart_reads "$conf"
+    [ "$(ls -A "$IC_NEEDRESTART_CONF_DIR")" = 50-incubacloud-hotplug.conf ]
+}
+
+@test "ic_needrestart_keep_hotplug leaves a drop-in saying the same as it is, and replaces another" {
+    export IC_NEEDRESTART_CONF_DIR="$TMP/needrestart"
+    mkdir -p "$IC_NEEDRESTART_CONF_DIR"
+    sudo() { [ "$1" = -n ] && shift; "$@"; }
+    conf="$IC_NEEDRESTART_CONF_DIR/50-incubacloud-hotplug.conf"
+    ic_needrestart_keep_hotplug
+    first="$(stat -c %i "$conf")"
+    ic_needrestart_keep_hotplug
+    [ "$(stat -c %i "$conf")" = "$first" ]
+    printf '%s\n' '$nrconf{override_rc}{qr(^cloud-init-hotplugd)} = 1;' > "$conf"
+    ic_needrestart_keep_hotplug
+    _needrestart_reads "$conf"
+}
+
+@test "ic_needrestart_keep_hotplug never leaves a drop-in needrestart would not read" {
+    export IC_NEEDRESTART_CONF_DIR="$TMP/needrestart"
+    mkdir -p "$IC_NEEDRESTART_CONF_DIR"
+    sudo() { [ "$1" = -n ] && shift; "$@"; }
+    # The check refuses the text, as it would a drop-in with a syntax error.
+    perl() { return 1; }
+    run ic_needrestart_keep_hotplug
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"WARNING: needrestart: the hotplug drop-in did not read"* ]]
+    [ -z "$(ls -A "$IC_NEEDRESTART_CONF_DIR")" ]
+    # One already there is left as it was.
+    printf 'kept\n' > "$IC_NEEDRESTART_CONF_DIR/50-incubacloud-hotplug.conf"
+    run ic_needrestart_keep_hotplug
+    [ "$status" -eq 1 ]
+    [ "$(cat "$IC_NEEDRESTART_CONF_DIR/50-incubacloud-hotplug.conf")" = kept ]
+    [ "$(ls -A "$IC_NEEDRESTART_CONF_DIR")" = 50-incubacloud-hotplug.conf ]
+}
+
+@test "ic_needrestart_keep_hotplug leaves a host without needrestart alone" {
+    export IC_NEEDRESTART_CONF_DIR="$TMP/needrestart"
+    sudo() { [ "$1" = -n ] && shift; "$@"; }
+    run ic_needrestart_keep_hotplug
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ ! -e "$IC_NEEDRESTART_CONF_DIR" ]
+}
+
+@test "ic_needrestart_keep_hotplug: a drop-in it cannot write is warned of and left out" {
+    export IC_NEEDRESTART_CONF_DIR="$TMP/needrestart"
+    [ "$(id -u)" -ne 0 ] || skip "root writes without sudo"
+    mkdir -p "$IC_NEEDRESTART_CONF_DIR"
+    # sudo -n with no rule: everything but the directory's test fails.
+    sudo() { [ "$2" = test ] && { shift; "$@"; return; }; return 1; }
+    run ic_needrestart_keep_hotplug
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"WARNING: needrestart: could not write"* ]]
+    [ -z "$(ls -A "$IC_NEEDRESTART_CONF_DIR")" ]
+}

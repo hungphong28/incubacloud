@@ -1,0 +1,1926 @@
+// instance_detail reuses styles from host_detail.scss
+// (.ic-host-detail, .ic-code-editor-wrap, etc.) and is rebuilt on the Relay
+// `rl-*` primitives (relay.scss). The `ic-*` rules kept below are either
+// screen-specific (modals, audit filters, backups, sync, domains) or shared
+// with still-un-migrated screens (host_detail's `ic-action-*`/`ic-ov-*`/
+// `ic-tl-*` layers, and the `dot-running-pulse` keyframe used by
+// hosts_dashboard / project_sidebar). Do not drop those.
+
+// ── Relay screen scaffold (instance_detail-specific) ─────────────────────────
+
+// Natural page flow (see host_detail.scss): the whole detail scrolls as one
+// page inside .ic-main. Plain block — no nested scroll box.
+.ic-rl-detail-scroll {
+    display: block;
+}
+
+// Tighten the gap under the hero so the action bar sits close beneath it.
+.ic-rl-hero {
+    margin-bottom: 10px;
+}
+
+@keyframes dot-running-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.6; transform: scale(1.3); }
+}
+
+// ── Action bar ───────────────────────────────────────────────────────────────
+
+.ic-action-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 0;
+    margin-bottom: 4px;
+    flex-wrap: wrap;
+
+    &.ic-action-loading {
+        opacity: 0.6;
+        pointer-events: none;
+    }
+}
+
+.ic-action-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    padding: 5px 12px;
+    min-height: 36px;
+    border: 1px solid $border;
+    border-radius: 6px;
+    background: $surface-light;
+    color: $text-primary;
+    font-size: 0.8125rem;
+    cursor: pointer;
+    transition: background $duration-fast, border-color $duration-fast;
+
+    &:hover {
+        background: rgba(var(--rl-green-rgb), 0.1);
+        border-color: $primary-blue;
+    }
+
+    i { font-size: 0.75rem; }
+}
+
+.ic-ab-deploy {
+    background: rgba(var(--rl-green-rgb), 0.12);
+    border-color: rgba(var(--rl-green-rgb), 0.4);
+    color: $accent;
+
+    &:hover { background: rgba(var(--rl-green-rgb), 0.22); }
+}
+
+.ic-ab-rebuild {
+    border-color: rgba(var(--rl-amber-rgb), 0.4);
+    color: $state-warning-text;
+
+    &:hover { background: rgba(var(--rl-amber-rgb), 0.1); }
+}
+
+.ic-ab-secondary {
+    padding: 5px 8px;
+    color: $text-secondary;
+
+    &:hover { color: $text-primary; }
+}
+
+.ic-ab-warn {
+    border-color: rgba(var(--rl-amber-rgb), 0.5);
+    color: $state-warning-text;
+
+    &:hover { background: rgba(var(--rl-amber-rgb), 0.12); }
+}
+
+// ── Move to host (inline picker) ─────────────────────────────────────────────
+
+.ic-move-picker {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+    padding: 10px 12px;
+    border: 1px solid $border;
+    border-radius: 8px;
+    background: $surface-light;
+
+    .ic-move-picker-label {
+        font-size: 0.8125rem;
+        color: $text-secondary;
+    }
+
+    // SearchSelect grows to fill the row; buttons keep their size.
+    > :nth-child(2) {
+        flex: 1 1 220px;
+        min-width: 180px;
+    }
+}
+
+// ── Locked fields ──────────────────────────────────────────────────────────────
+
+.ic-locked-notice {
+    font-size: 0.75rem;
+    color: rgba(var(--rl-muted-rgb), 0.8);
+    background: rgba(var(--rl-line-rgb), 0.25);
+    border: 1px solid rgba(var(--rl-line-rgb), 0.5);
+    border-radius: 5px;
+    padding: 7px 12px;
+    width: 100%;
+}
+
+.ic-form-grid {
+    input:disabled,
+    select:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+        pointer-events: none;
+    }
+}
+
+// Disabled-field styling for the Relay form grid (locked-after-deploy fields).
+// relay.scss styles rl-frow inputs but not their disabled state.
+.rl-fgrid {
+    input:disabled,
+    select:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+        pointer-events: none;
+    }
+
+    // Section headers (Resources tab) span the full grid width.
+    .ic-form-section-header { margin-top: 6px; }
+}
+
+// ── Groups and the record grid (form standard §2, §3) ───────────────────────
+// A tab's fields sit in group cards (settings_form's `.ic-set-block`) no
+// wider than 920 px, on a 12-column grid with the label above the field:
+// S takes 3 columns, M 6 and L the whole row.
+
+.ic-inst-col {
+    max-inline-size: 920px;
+
+    // A group without a title opens with its fields.
+    .ic-set-block__body:first-child { padding-block-start: 16px; }
+
+    // A switch heading its group has no rule above it.
+    .ic-set-block__body > .rl-ftoggle:first-child {
+        border-block-start: 0;
+        padding-block-start: 4px;
+    }
+
+    .ic-set-block__title .rl-opt {
+        font-family: var(--rl-fb);
+        font-size: 12.5px;
+        font-weight: 400;
+        color: var(--rl-muted);
+    }
+}
+
+// ── New instance: one page (form standard §1, §3, §4) ──────────────────────
+// A section per tab of the instance's page, its title above its groups, no
+// wider than the groups. A folded one is a single bar until opened. The
+// footer with Create stays at the bottom of the window.
+
+.ic-new-sec {
+    max-inline-size: 920px;
+    margin-block-end: 26px;
+
+    &--fold { margin-block-end: 12px; }
+    &--fold .ic-new-sec__body { padding-block-start: 12px; }
+}
+
+// A section with its title after a folded one keeps the usual gap.
+.ic-new-sec--fold + .ic-new-sec:not(.ic-new-sec--fold) { margin-block-start: 26px; }
+
+.ic-new-sec__title {
+    font-family: var(--rl-fd);
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0 0 12px;
+    color: var(--rl-fg);
+
+    .ic-new-sec--fold & { margin: 0; }
+}
+
+.ic-new-sec__toggle {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    inline-size: 100%;
+    min-block-size: 44px;
+    padding: 10px 16px;
+    border: 1px solid var(--rl-line);
+    border-radius: var(--rl-r);
+    background: var(--rl-surf);
+    color: var(--rl-fg);
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+
+    .fa { inline-size: 12px; font-size: 12px; color: var(--rl-muted); }
+    &:hover { border-color: var(--rl-line2); }
+    &:focus-visible { outline: 2px solid var(--rl-green-text); outline-offset: 2px; }
+}
+
+.ic-new-sec__adv {
+    font-family: var(--rl-fb);
+    font-size: 12.5px;
+    font-weight: 400;
+    color: var(--rl-muted);
+}
+
+.ic-new-sec__changed {
+    font-family: var(--rl-fm);
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--rl-amber-ink);
+    background: var(--rl-amber-soft);
+    border-radius: 4px;
+    padding: 1px 6px;
+}
+
+.rl-formfoot.ic-new-foot {
+    position: sticky;
+    inset-block-end: 0;
+    z-index: 5;
+    max-inline-size: 920px;
+    margin-block-start: 6px;
+    padding-block: 12px;
+    background: var(--rl-bg);
+}
+
+// As specific as the footer's own hint, which sets it grey.
+.rl-formfoot.ic-new-foot .rl-ff-hint.ic-new-foot__err {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--rl-red-text);
+    font-weight: 600;
+}
+
+// The sentence above a tab's groups.
+.ic-inst-lead { margin-block: 0 14px; }
+
+// A switch that only applies while the one above it is on.
+.rl-ftoggle.ic-ftoggle--nested { padding-inline-start: 22px; }
+
+// Resources: one half-width card per service, its two S fields side by side.
+.ic-res-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: 18px;
+
+    .ic-rgrid > .ic-w-s { grid-column: span 6; }
+}
+
+// Phones and narrow windows (§9): one service card a row. The record grid
+// itself (`.ic-rgrid`) is in settings_form.scss.
+@media (max-width: 900px) {
+    .ic-res-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+// ── Language picker ─────────────────────────────────────────────────────────────
+
+.ic-lang-picker {
+    position: relative;
+    width: 100%;
+
+    input {
+        width: 100%;
+        box-sizing: border-box;
+    }
+
+    .ic-lang-dropdown {
+        position: absolute;
+        top: calc(100% + 3px);
+        left: 0;
+        right: 0;
+        background: $surface;
+        border: 1px solid $border;
+        border-radius: 6px;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+        z-index: 100;
+        overflow: hidden;
+        max-height: 220px;
+        overflow-y: auto;
+    }
+
+    .ic-lang-option {
+        padding: 7px 12px;
+        font-size: 0.8125rem;
+        cursor: pointer;
+        color: $text-primary;
+
+        &:hover { background: rgba(var(--rl-green-rgb), 0.1); }
+        &.selected { background: rgba(var(--rl-green-rgb), 0.15); color: $primary-blue; }
+        &.ic-lang-option-default { color: $text-secondary; font-style: italic; }
+    }
+}
+
+// ── Dependencies tab ──────────────────────────────────────────────────────────
+
+.ic-deps-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    height: 100%;
+}
+
+// What "Edit Manually" opened the tab for; the project page uses it too.
+.ic-deps-focus-hint {
+    margin: 0;
+    padding: 8px 12px;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    color: $state-warning-text;
+    background: rgba(var(--rl-amber-rgb), 0.12);
+    border: 1px solid rgba(var(--rl-amber-rgb), 0.5);
+    border-radius: $radius-md;
+}
+
+// ── Misc overview helpers ────────────────────────────────────────────────────
+
+.ic-ov-ok {
+    color: $state-ok;
+    font-size: 0.75rem;
+    .fa { margin-right: 4px; font-size: 0.625rem; }
+}
+
+.ic-ov-warn {
+    color: $state-warning-text;
+    font-size: 0.75rem;
+    .fa { margin-right: 4px; font-size: 0.625rem; }
+}
+
+
+.ic-ov-card {
+    background: $surface-light;
+    border: 1px solid $border;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.ic-ov-card-title {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: $text-secondary;
+    padding: 10px 14px 6px;
+}
+
+.ic-ov-card-body {
+    padding: 4px 14px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.ic-ov-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.8125rem;
+    min-height: 24px;
+}
+
+.ic-ov-label {
+    color: $text-secondary;
+    font-size: 0.75rem;
+    flex-shrink: 0;
+    margin-right: 12px;
+}
+
+.ic-ov-sub {
+    margin-left: 6px;
+    color: $text-secondary;
+    font-size: 0.72rem;
+}
+
+.ic-ov-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 500;
+}
+
+.ic-ov-deploy-state {
+    font-size: 0.6875rem;
+    text-transform: lowercase;
+    margin-left: 6px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 500;
+}
+
+
+// ── Activity feed ────────────────────────────────────────────────────────────
+
+.ic-ov-activity {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+
+    &::-webkit-scrollbar { width: 4px; }
+    &::-webkit-scrollbar-thumb { background: $border; border-radius: 2px; }
+    scrollbar-width: thin;
+    scrollbar-color: $border transparent;
+}
+
+.ic-ov-activity-title {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: $text-secondary;
+    margin-bottom: 8px;
+}
+
+.ic-ov-activity-loading,
+.ic-ov-activity-empty {
+    font-size: 0.8125rem;
+    color: $text-secondary;
+    padding: 12px 0;
+}
+
+// ── Timeline ─────────────────────────────────────────────────────────────────
+
+.ic-tl {
+    display: flex;
+    flex-direction: column;
+}
+
+.ic-tl-item {
+    display: flex;
+    cursor: pointer;
+    transition: background 0.1s;
+    padding: 2px 0;
+
+    &:hover .ic-tl-content { background: rgba(var(--rl-green-rgb), 0.04); }
+}
+
+.ic-tl-rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 24px;
+    flex-shrink: 0;
+    padding-top: 6px;
+}
+
+.ic-tl-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: $border;
+    z-index: 1;
+
+    &.jst-done      { background: $state-ok; }
+    &.jst-failed    { background: $state-error; }
+    &.jst-cancelled { background: $text-secondary; }
+    &.jst-running   { background: var(--rl-cyan); }
+    &.jst-pending   { background: $text-secondary; }
+    &.jst-queued    { background: $state-warning; opacity: 0.6; }
+    &.jst-blocked   { background: $state-warning; }
+}
+
+.ic-tl-pulse {
+    animation: ic-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes ic-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(var(--rl-green-rgb), 0.5); }
+    50%      { box-shadow: 0 0 0 5px rgba(var(--rl-green-rgb), 0); }
+}
+
+.ic-tl-line {
+    flex: 1;
+    width: 2px;
+    background: rgba(var(--rl-line-rgb), 0.6);
+    min-height: 12px;
+}
+
+.ic-tl-item:last-child .ic-tl-line {
+    background: transparent;
+}
+
+.ic-tl-content {
+    flex: 1;
+    min-width: 0;
+    padding: 4px 10px 12px;
+    border-radius: 6px;
+    transition: background 0.1s;
+}
+
+.ic-tl-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.ic-tl-icon {
+    font-size: 0.75rem;
+    color: $text-secondary;
+    width: 14px;
+    text-align: center;
+}
+
+.ic-tl-name {
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: $text-primary;
+}
+
+// "by <user>" suffix on a webhook/coalesced trigger line (rendered inside the
+// Relay rl-tl-trigger row in the new markup).
+.ic-tl-trigger-by { opacity: 0.7; }
+
+.ic-tl-msg {
+    font-size: 0.75rem;
+    color: $text-secondary;
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.ic-tl-time {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.6875rem;
+    color: rgba(var(--rl-muted-rgb), 0.7);
+    margin-top: 3px;
+}
+
+.ic-tl-user-avatar {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    object-fit: cover;
+    flex-shrink: 0;
+}
+
+.ic-tl-ago {
+    margin-left: 6px;
+    opacity: 0.7;
+}
+
+.ic-tl-log-hint {
+    font-size: 0.6875rem;
+    color: rgba(var(--rl-muted-rgb), 0.5);
+    margin-left: auto;
+    opacity: 0;
+    transition: opacity 0.15s;
+
+    i { margin-right: 3px; }
+}
+
+.ic-tl-item:hover .ic-tl-log-hint {
+    opacity: 1;
+}
+
+.ic-tl-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 3px;
+    gap: 8px;
+}
+
+.ic-tl-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.ic-tl-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border: 1px solid $border;
+    border-radius: 4px;
+    background: none;
+    color: $text-secondary;
+    font-size: 0.6875rem;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background 0.1s, color 0.1s, border-color 0.1s;
+
+    &:hover {
+        background: rgba(var(--rl-green-rgb), 0.08);
+        border-color: $primary-blue;
+        color: $primary-blue;
+    }
+}
+
+.ic-tl-cancel:hover {
+    background: rgba(var(--rl-red-rgb), 0.08);
+    border-color: rgba(var(--rl-red-rgb), 0.5);
+    color: $state-error;
+}
+
+.ic-tl-alert-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font: inherit;
+    line-height: 1.5;
+    font-size: 0.625rem;
+    font-weight: 600;
+    color: $state-warning-text;
+    background: rgba(var(--rl-amber-rgb), 0.1);
+    border: 1px solid rgba(var(--rl-amber-rgb), 0.3);
+    border-radius: 4px;
+    padding: 1px 7px;
+    cursor: pointer;
+    transition: all 0.15s;
+    animation: alert-badge-pulse 2s ease-in-out infinite;
+
+    .fa { font-size: 0.625rem; }
+
+    &:hover {
+        background: rgba(var(--rl-amber-rgb), 0.2);
+        border-color: rgba(var(--rl-amber-rgb), 0.6);
+    }
+}
+
+// Why a job reads "Action required": shown while the chip is hovered or
+// has the focus, and kept open by a click (``toggleHold``), with a link
+// to the alert that keeps the job.
+.ic-hold {
+    position: relative;
+    display: inline-flex;
+
+    .ic-tl-alert-badge:focus-visible {
+        outline: 2px solid var(--rl-amber);
+        outline-offset: 2px;
+    }
+}
+
+.ic-hold-pop {
+    display: none;
+    position: absolute;
+    inset-block-start: calc(100% + 6px);
+    inset-inline-start: 0;
+    z-index: 20;
+    inline-size: max-content;
+    // Interpolated: libsass would evaluate a bare min() as its own.
+    max-inline-size: #{"min(300px, calc(100vw - 48px))"};
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--rl-line2);
+    background: var(--rl-surf2);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+    color: var(--rl-fg);
+    font-size: 0.75rem;
+    font-weight: 400;
+    line-height: 1.45;
+    text-transform: none;
+    white-space: normal;
+    cursor: default;
+
+    // Bridges the gap to the chip, so the pointer reaches the link.
+    &::before {
+        content: "";
+        position: absolute;
+        inset-inline: 0;
+        inset-block-start: -8px;
+        block-size: 8px;
+    }
+}
+
+.ic-hold:hover .ic-hold-pop,
+.ic-hold:focus-within .ic-hold-pop,
+.ic-hold-pop.open {
+    display: flex;
+}
+
+.ic-hold-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0;
+    border: none;
+    background: none;
+    font: inherit;
+    font-weight: 600;
+    color: var(--rl-amber-text);
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+
+    &:focus-visible {
+        outline: 2px solid var(--rl-amber);
+        outline-offset: 2px;
+        border-radius: 3px;
+    }
+}
+
+@keyframes alert-badge-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+
+.ic-ov-job-state {
+    font-size: 0.6875rem;
+    font-weight: 500;
+    padding: 1px 7px;
+    border-radius: 3px;
+    flex-shrink: 0;
+    text-transform: capitalize;
+}
+
+.jst-done      { color: $state-ok;      background: rgba(var(--rl-green-rgb), 0.12); }
+.jst-failed    { color: $state-error;   background: rgba(var(--rl-red-rgb), 0.12); }
+.jst-cancelled { color: $text-secondary; background: rgba(var(--rl-line-rgb), 0.4); }
+.jst-running   { color: var(--rl-cyan-text); background: var(--rl-cyan-soft); }
+.jst-pending   { color: $text-secondary; background: rgba(var(--rl-line-rgb), 0.3); }
+.jst-queued    { color: $state-warning-text; background: rgba(var(--rl-line-rgb), 0.3); }
+.jst-blocked   { color: $state-warning-text; background: rgba(var(--rl-amber-rgb), 0.12); }
+
+.ic-ov-load-more {
+    align-self: center;
+    margin-top: 10px;
+    background: none;
+    border: 1px solid $border;
+    border-radius: 5px;
+    color: $text-secondary;
+    font-size: 0.75rem;
+    padding: 5px 16px;
+    cursor: pointer;
+    transition: border-color 0.12s, color 0.12s;
+
+    &:hover {
+        border-color: $primary-blue;
+        color: $primary-blue;
+    }
+
+    &:disabled {
+        opacity: 0.5;
+        cursor: default;
+    }
+}
+
+// ── Sync with project ────────────────────────────────────────────────────
+
+.ic-btn-sync {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border: 1px solid $border;
+    border-radius: 6px;
+    background: transparent;
+    color: $text-secondary;
+    font-size: 0.75rem;
+    cursor: pointer;
+    margin-bottom: 12px;
+
+    &:hover { color: $text-primary; border-color: $text-secondary; }
+}
+
+.ic-sync-box {
+    max-width: 640px;
+    width: 100%;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    background: $surface;
+    border-radius: 12px;
+    padding: 24px;
+}
+
+.ic-sync-sub {
+    font-size: 0.8125rem;
+    color: $text-secondary;
+    margin: 0 0 16px;
+}
+
+.ic-sync-loading, .ic-sync-empty {
+    text-align: center;
+    padding: 24px;
+    color: $text-secondary;
+    font-size: 0.8125rem;
+}
+
+.ic-sync-empty {
+    color: $state-ok;
+    i { margin-right: 6px; }
+}
+
+.ic-sync-sections {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    overflow-y: auto;
+    max-height: 50vh;
+    padding-right: 4px;
+    margin-bottom: 16px;
+}
+
+.ic-sync-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+// Section head: the title on the left, its "Select all" box on the right.
+.ic-sync-section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid $border;
+    margin-bottom: 2px;
+}
+
+.ic-sync-section-title {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: $text-secondary;
+    letter-spacing: 0.5px;
+}
+
+// "Select all" box of a section or of the whole modal. The label is the
+// click target; the secondary text colour is 5.2:1 (light) / 6.0:1 (dark)
+// on the modal surface.
+.ic-sync-selectall {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    font-size: 0.75rem;
+    color: $text-secondary;
+    cursor: pointer;
+
+    &:hover { color: $text-primary; }
+    input[type="checkbox"] { margin: 0; }
+}
+
+.ic-sync-all {
+    padding: 6px 8px;
+    margin-bottom: 8px;
+    border-radius: 6px;
+    background: $surface-light;
+
+    .ic-sync-selectall {
+        font-size: 0.8125rem;
+        font-weight: 600;
+        color: $text-primary;
+    }
+}
+
+// Package names, URLs and versions. A bare <code> takes the colour of the
+// Bootstrap theme underneath (pink by default, dark green in the website
+// theme: 1.9:1 on the dark panel), so the chip sets its own: the panel's
+// primary text on a faint line tint, in the panel's mono face, as the
+// alert history's conflict chips do.
+.ic-sync-box code {
+    font-family: $font-mono;
+    // A version spec is read letter by letter: no "==" drawn as one bar, no ">=" as "≥".
+    font-variant-ligatures: none;
+    color: $text-primary;
+    background: rgba(var(--rl-line-rgb), 0.4);
+    padding: 1px 6px;
+    border-radius: 4px;
+    min-width: 0;
+}
+
+.ic-sync-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.75rem;
+
+    &:hover { background: rgba(var(--rl-line-rgb), 0.15); }
+
+    input[type="checkbox"] { flex-shrink: 0; }
+    code {
+        font-size: 0.75rem;
+        word-break: break-all;
+    }
+}
+
+.ic-sync-tag {
+    font-size: 0.625rem;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    flex-shrink: 0;
+}
+
+// Text in green-text, nudged towards the ink: the light theme's green
+// (2.6:1 on this tint) and even its green-text (4.2:1) are short of 4.5:1.
+.ic-sync-tag-push {
+    background: rgba(var(--rl-green-rgb), 0.15);
+    color: color-mix(in srgb, var(--rl-green-text) 85%, var(--rl-fg));
+}
+
+.ic-sync-tag-pull {
+    background: rgba(var(--rl-cyan-rgb), 0.15);
+    color: var(--rl-cyan-text);
+}
+
+.ic-sync-tag-conflict {
+    background: rgba(var(--rl-amber-rgb), 0.15);
+    color: $state-warning-text;
+}
+
+.ic-sync-direction {
+    font-size: 0.6875rem;
+    color: $text-secondary;
+    flex-shrink: 0;
+    margin-left: auto;
+}
+
+.ic-sync-conflict {
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: rgba(var(--rl-amber-rgb), 0.05);
+    border-left: 3px solid $state-warning;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.ic-sync-conflict-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.8125rem;
+
+    code { font-size: 0.75rem; word-break: break-all; }
+}
+
+.ic-sync-conflict-field {
+    font-size: 0.75rem;
+    padding-left: 8px;
+    color: $text-secondary;
+
+    code {
+        padding-inline: 4px;
+        font-size: 0.6875rem;
+    }
+}
+
+.ic-sync-conflict-opts {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding-top: 4px;
+}
+
+.ic-sync-conflict-opt {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    padding: 2px 4px;
+
+    code {
+        font-size: 0.75rem;
+        word-break: break-all;
+    }
+}
+
+// Secondary text at full strength: at 70% opacity it was 2.9:1 (light) and
+// 3.6:1 (dark), under the 4.5:1 that text this small needs.
+.ic-sync-hint {
+    font-size: 0.6875rem;
+    color: $text-secondary;
+}
+
+.ic-sync-field-name {
+    font-weight: 600;
+    text-transform: capitalize;
+}
+
+// ── Backups tab ─────────────────────────────────────────────────────────────
+
+.ic-backups-panel {
+    padding: 4px 0;
+}
+
+.ic-backups-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 16px;
+
+    .rl-pager { margin-block-start: 0; margin-inline-start: auto; }
+}
+
+.ic-backups-error {
+    padding: 12px 16px;
+    background: rgba(var(--rl-red-rgb), 0.1);
+    border: 1px solid rgba(var(--rl-red-rgb), 0.3);
+    border-radius: 8px;
+    color: var(--rl-red);
+    font-size: 0.8125rem;
+}
+
+.ic-backups-empty {
+    padding: 32px;
+    text-align: center;
+    color: $text-secondary;
+    font-size: 0.8125rem;
+
+    i {
+        margin-right: 6px;
+        opacity: 0.6;
+    }
+}
+
+.ic-backup-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8125rem;
+
+    th {
+        text-align: left;
+        padding: 8px 16px;
+        color: $text-secondary;
+        font-weight: 500;
+        font-size: 0.6875rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        border-bottom: 1px solid rgba(var(--rl-fg-rgb), 0.06);
+    }
+
+    td {
+        padding: 6px 16px;
+        color: $text-primary;
+        border-bottom: 1px solid rgba(var(--rl-fg-rgb), 0.04);
+    }
+
+    tr:last-child td {
+        border-bottom: none;
+    }
+
+    tr:hover td {
+        background: rgba(var(--rl-fg-rgb), 0.02);
+    }
+}
+
+.ic-backup-type-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.6875rem;
+    font-weight: 600;
+
+    &.ic-bk-full {
+        background: rgba(var(--rl-muted-rgb), 0.15);
+        color: $text-secondary;
+    }
+
+    &.ic-bk-incremental {
+        background: var(--rl-green-soft);
+        color: var(--rl-green-text);
+    }
+}
+
+.ic-backups-info {
+    padding: 10px 14px;
+    background: rgba(var(--rl-muted-rgb), 0.08);
+    border: 1px solid $border;
+    border-radius: 8px;
+    color: $text-secondary;
+    font-size: 0.8125rem;
+    margin-bottom: 12px;
+
+    i { margin-right: 6px; }
+
+    &.ic-backups-warning {
+        background: var(--rl-amber-soft);
+        border-color: rgba(var(--rl-amber-rgb), 0.2);
+        color: var(--rl-amber-text);
+    }
+}
+
+.ic-bk-actions-col {
+    width: 80px;
+    text-align: right;
+}
+
+// The cell stays a table cell (a flex <td> leaves the row's alignment);
+// the buttons line up inside it.
+.ic-bk-actions-cell {
+    text-align: right;
+    vertical-align: middle;
+}
+
+.ic-bk-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 4px;
+}
+
+// Where a row cannot be restored: its button's room, so the columns hold.
+.ic-bk-action-slot {
+    width: 28px;
+    height: 28px;
+    flex: 0 0 28px;
+}
+
+.ic-bk-action-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border: 1px solid rgba(var(--rl-fg-rgb), 0.1);
+    border-radius: 4px;
+    background: transparent;
+    color: $text-secondary;
+    cursor: pointer;
+    font-size: 0.75rem;
+    transition: all 0.15s;
+    text-decoration: none;
+
+    &:hover {
+        background: rgba(var(--rl-fg-rgb), 0.08);
+        color: $text-primary;
+    }
+
+    &.ic-bk-restore-btn:hover {
+        background: var(--rl-red-soft);
+        color: var(--rl-red);
+        border-color: rgba(var(--rl-red-rgb), 0.3);
+    }
+
+}
+
+.ic-download-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 12px 0 8px;
+}
+
+.ic-download-group-label {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: $text-secondary;
+    margin-bottom: 2px;
+}
+
+.ic-download-opt {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid rgba(var(--rl-fg-rgb), 0.1);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s;
+
+    &:hover {
+        background: rgba(var(--rl-fg-rgb), 0.04);
+    }
+
+    input[type="radio"] {
+        margin-top: 3px;
+    }
+
+    strong {
+        display: block;
+        font-size: 0.8125rem;
+        color: $text-primary;
+    }
+}
+
+.ic-download-hint {
+    font-size: 0.6875rem;
+    color: $text-secondary;
+}
+
+// Domain editor
+.ic-domains-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+// One row per domain on the record grid (form standard §2): the host name
+// takes 5 parts, the redirect 4, then 301 with the certificate and the
+// remove button. The certificate keeps its fixed width (below).
+.ic-domain-row {
+    display: grid;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 4fr) auto 28px;
+    gap: 8px;
+    align-items: center;
+}
+
+.ic-domain-tls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+}
+
+// Hostname and redirect wear the same field look as every other control on
+// the form (`.rl-frow` in relay.scss), built from the theme tokens so they
+// read the same in light and dark (the certificate picker is an RlSelect,
+// which already does). The translucent fills they had before looked
+// disabled on the light theme.
+.ic-domain-hostname,
+.ic-domain-redirect {
+    padding: 9px 12px;
+    background: var(--rl-bg);
+    border: 1px solid var(--rl-line2);
+    border-radius: var(--rl-rsm);
+    color: var(--rl-fg);
+    font-family: var(--rl-fb);
+    font-size: 13.5px;
+    outline: none;
+    inline-size: 100%;
+    min-width: 0;
+
+    &:focus {
+        border-color: var(--rl-green);
+        box-shadow: 0 0 0 3px var(--rl-green-soft);
+    }
+}
+
+// 301 toggle. Only meaningful when a redirect target is set, so it dims
+// itself rather than disappearing — a control that comes and goes as you
+// type in the neighbouring field makes the row jump.
+.ic-domain-permanent {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    padding: 0 6px;
+    color: $text-secondary;
+    font-size: 0.6875rem;
+    cursor: pointer;
+    user-select: none;
+
+    input {
+        margin: 0;
+        cursor: pointer;
+    }
+
+    &--off {
+        opacity: 0.35;
+        cursor: default;
+
+        input {
+            cursor: default;
+        }
+    }
+}
+
+// Wraps the certificate RlSelect. A fixed width, wide enough for the
+// longest label in either language: sized by its content, the picker
+// would resize the row every time the choice changed.
+.ic-domain-cert {
+    flex: 0 0 auto;
+    inline-size: 13rem;
+}
+
+// Phone width: the five cannot share one line (the fixed 13rem picker
+// alone takes a third of 390 px). Each domain becomes a card (form
+// standard §9): the host name and the remove button, the redirect, then
+// 301 and the picker, which takes what is left.
+@media (max-width: 600px) {
+    .ic-domain-row {
+        grid-template-columns: minmax(0, 1fr) 28px;
+        padding: 10px;
+        border: 1px solid var(--rl-line);
+        border-radius: var(--rl-rsm);
+    }
+
+    .ic-domain-hostname { grid-area: 1 / 1; }
+    .ic-domain-remove { grid-area: 1 / 2; }
+    .ic-domain-redirect { grid-area: 2 / 1 / 3 / 3; }
+    .ic-domain-tls { grid-area: 3 / 1 / 4 / 3; }
+
+    .ic-domain-cert {
+        flex: 1 1 0;
+        inline-size: auto;
+        min-width: 0;
+    }
+}
+
+.ic-domain-remove {
+    width: 28px;
+    height: 28px;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: $text-secondary;
+    cursor: pointer;
+    flex-shrink: 0;
+    font-size: 0.75rem;
+
+    &:hover {
+        background: rgba(var(--rl-red-rgb), 0.15);
+        color: $state-error;
+    }
+}
+
+.ic-domain-add {
+    align-self: flex-start;
+    padding: 4px 12px;
+    border: 1px dashed rgba(var(--rl-fg-rgb), 0.15);
+    border-radius: 6px;
+    background: transparent;
+    color: $text-secondary;
+    font-size: 0.75rem;
+    cursor: pointer;
+
+    &:hover {
+        border-color: rgba(var(--rl-green-rgb), 0.3);
+        color: $primary-blue;
+    }
+}
+
+// Restore backup modal
+.ic-restore-backup-box {
+    max-width: 440px;
+}
+
+// Clone to staging modal
+.ic-clone-input {
+    margin: 12px 0;
+
+    label {
+        display: block;
+        font-size: 0.75rem;
+        color: $text-secondary;
+        margin-bottom: 6px;
+    }
+
+    input {
+        width: 100%;
+        padding: 8px 10px;
+        background: rgba(var(--rl-fg-rgb), 0.06);
+        border: 1px solid rgba(var(--rl-fg-rgb), 0.15);
+        border-radius: 6px;
+        color: $text-primary;
+        font-size: 0.8125rem;
+
+        &:focus {
+            outline: none;
+            border-color: rgba(var(--rl-green-rgb), 0.5);
+        }
+    }
+}
+
+.ic-danger-title {
+    color: var(--rl-red);
+
+    i { margin-right: 6px; }
+}
+
+.ic-restore-warning {
+    font-size: 0.8125rem;
+    color: $text-secondary;
+    line-height: 1.5;
+    margin: 6px 0;
+
+    strong { color: var(--rl-red); }
+}
+
+.ic-restore-confirm-input {
+    margin: 16px 0 8px;
+
+    label {
+        display: block;
+        font-size: 0.75rem;
+        color: $text-secondary;
+        margin-bottom: 6px;
+
+        strong {
+            color: $text-primary;
+            font-family: monospace;
+        }
+    }
+
+    input {
+        width: 100%;
+        padding: 8px 10px;
+        background: rgba(var(--rl-fg-rgb), 0.06);
+        border: 1px solid rgba(var(--rl-fg-rgb), 0.15);
+        border-radius: 6px;
+        color: $text-primary;
+        font-size: 0.8125rem;
+        font-family: monospace;
+
+        &:focus {
+            outline: none;
+            border-color: rgba(var(--rl-red-rgb), 0.5);
+        }
+    }
+}
+
+// ── Audit log filter bar ─────────────────────────────────────────────────────
+
+.ic-audit-filters {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+    padding: 10px 12px;
+    background: rgba(var(--rl-fg-rgb), 0.03);
+    border: 1px solid rgba(var(--rl-fg-rgb), 0.08);
+    border-radius: 8px;
+
+    input, select {
+        background: rgba(var(--rl-fg-rgb), 0.06);
+        border: 1px solid rgba(var(--rl-fg-rgb), 0.12);
+        border-radius: 6px;
+        color: $text-primary;
+        font-size: 0.8125rem;
+        padding: 5px 10px;
+        height: 32px;
+
+        &:focus {
+            outline: none;
+            border-color: rgba(var(--rl-green-rgb), 0.5);
+        }
+
+        option { background: var(--rl-surf2); }
+    }
+
+    .ic-audit-search  { width: 180px; }
+    .ic-audit-select  { width: 160px; }
+    .ic-audit-date    { width: 130px; }
+
+    .ic-audit-date-sep {
+        color: $text-muted;
+        font-size: 0.75rem;
+        flex-shrink: 0;
+    }
+
+    .ic-audit-spacer { flex: 1; min-width: 8px; }
+
+    .ic-audit-apply-btn {
+        height: 32px;
+        padding: 0 14px;
+        font-size: 0.8125rem;
+        border-radius: 6px;
+        background: var(--rl-green-btn);
+        color: var(--rl-green-fg);
+        border: none;
+        cursor: pointer;
+        white-space: nowrap;
+
+        &:hover, &:active { background: var(--rl-green-btn-hover); }
+    }
+
+    .ic-audit-reset-btn {
+        height: 32px;
+        padding: 0 12px;
+        font-size: 0.8125rem;
+        border-radius: 6px;
+        background: rgba(var(--rl-fg-rgb), 0.08);
+        color: $text-secondary;
+        border: 1px solid rgba(var(--rl-fg-rgb), 0.1);
+        cursor: pointer;
+        white-space: nowrap;
+
+        &:hover { background: rgba(var(--rl-fg-rgb), 0.12); }
+    }
+
+    .rl-pager { margin-block-start: 0; }
+}
+
+// Audit-log purge button now lives in the form footer (activity tab). Kept at
+// top level (was nested under .ic-audit-filters) so it styles correctly there,
+// left-aligned while "Save changes" stays on the right.
+.rl-formfoot .ic-audit-purge-btn {
+    height: 32px;
+    padding: 0 12px;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    border-radius: $radius-md;
+    background: rgba(var(--rl-red-rgb), 0.1);
+    color: $state-error;
+    border: 1px solid rgba(var(--rl-red-rgb), 0.25);
+    cursor: pointer;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-inline-end: auto;
+    transition: background $duration-fast ease, border-color $duration-fast ease;
+
+    &:hover:not(:disabled) {
+        background: rgba(var(--rl-red-rgb), 0.18);
+        border-color: rgba(var(--rl-red-rgb), 0.45);
+    }
+    &:disabled { opacity: 0.45; cursor: not-allowed; }
+}
+
+
+// ── Keep, inside the expiry pill ─────────────────────────────────
+// The button lives in the pill on purpose: the warning and the way to
+// answer it are the same object, so nobody has to go looking for the
+// undo after reading the threat.
+.ic-keep-btn {
+    margin-left: 8px;
+    padding: 0 7px;
+    border: 1px solid currentColor;
+    border-radius: 9px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+
+    &:hover:not(:disabled) {
+        background: currentColor;
+        filter: invert(1);
+    }
+
+    &:disabled {
+        opacity: 0.5;
+        cursor: default;
+    }
+}
+
+/* ── Mails tab ──────────────────────────────────────────────────────────
+   A staging's captured mailbox. Laid out as a list with the open message
+   underneath rather than side by side: the body is somebody else's HTML
+   and needs the full width to look like what the customer would get. */
+
+.ic-mails-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
+.ic-mails-spacer { margin-inline-start: auto; }
+
+.ic-mails-notice {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: rgba(var(--rl-muted-rgb), 0.9);
+
+    svg { flex: none; }
+}
+
+.rl-table--mails {
+    .ic-mail-row { cursor: pointer; }
+
+    .ic-mail-row.is-open { background: rgba(var(--rl-fg-rgb), 0.04); }
+
+    .ic-mails-size { text-align: end; white-space: nowrap; }
+}
+
+.ic-mail-clip {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    margin-inline-start: 8px;
+    font-size: 11px;
+    color: rgba(var(--rl-muted-rgb), 0.9);
+}
+
+.ic-mail-view {
+    margin-block-start: 16px;
+    border: 1px solid rgba(var(--rl-fg-rgb), 0.1);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.ic-mail-view-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    background: rgba(var(--rl-fg-rgb), 0.03);
+    border-bottom: 1px solid rgba(var(--rl-fg-rgb), 0.08);
+
+    strong { flex: 1; min-inline-size: 0; }
+}
+
+.ic-mail-close {
+    flex: none;
+    background: none;
+    border: 0;
+    padding: 2px;
+    cursor: pointer;
+    color: inherit;
+    opacity: 0.6;
+
+    &:hover { opacity: 1; }
+}
+
+.ic-mail-headers {
+    padding: 12px 14px;
+    display: grid;
+    gap: 4px;
+    font-size: 12px;
+    border-bottom: 1px solid rgba(var(--rl-fg-rgb), 0.06);
+
+    .rl-l {
+        display: inline-block;
+        inline-size: 80px;
+        color: rgba(var(--rl-muted-rgb), 0.9);
+    }
+}
+
+.ic-mail-atts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(var(--rl-fg-rgb), 0.06);
+}
+
+.ic-mail-att {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 8px;
+    border-radius: 6px;
+    background: rgba(var(--rl-fg-rgb), 0.05);
+    font-size: 12px;
+}
+
+.ic-mail-att-size { color: rgba(var(--rl-muted-rgb), 0.9); }
+
+.ic-mail-views {
+    display: flex;
+    gap: 4px;
+    padding: 8px 14px 0;
+}
+
+.ic-mail-body {
+    display: block;
+    inline-size: 100%;
+    block-size: 420px;
+    border: 0;
+    background: var(--rl-mail-canvas);
+}
+
+.ic-mail-text {
+    padding: 14px;
+    margin: 0;
+    background: transparent;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 12px;
+    block-size: auto;
+    max-block-size: 420px;
+    overflow: auto;
+}
+
+.ic-mail-trunc,
+.ic-mail-empty,
+.ic-mail-error {
+    padding: 10px 14px;
+    font-size: 12px;
+    color: rgba(var(--rl-muted-rgb), 0.9);
+}
+
+.ic-mail-error { color: var(--rl-red); }
+
+/* The same sentence as the Mails tab, shown where the relay is set up so
+   the difference between staging and production is stated once per
+   screen that can act on it. */
+.ic-smtp-note {
+    font-size: 12px;
+    color: rgba(var(--rl-muted-rgb), 0.9);
+}
+
+// No host to pick yet: the note, then the way to get one, on its own line.
+.ic-no-host-note { display: block; }
+.ic-no-host-add { margin-top: 6px; }
+
+// ── Monitoring tab: Recent requests ─────────────────────────────────────────
+// One card holding the search, the status chips, a table in a box of its
+// own (about fifteen rows, then it scrolls) and the page footer, so a
+// busy instance does not push the rest of the tab out of reach.
+.ic-requests {
+    padding: 0;
+    overflow: hidden;
+}
+
+.ic-requests-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    border-block-end: 1px solid var(--rl-line);
+}
+
+.ic-requests-search {
+    position: relative;
+    flex: 1 1 260px;
+    min-width: 0;
+
+    .fa {
+        position: absolute;
+        inset-inline-start: 10px;
+        top: 50%;
+        transform: translateY(-50%);
+        color: var(--rl-faint);
+        font-size: 12px;
+    }
+
+    input {
+        width: 100%;
+        box-sizing: border-box;
+        font: inherit;
+        font-size: 12.5px;
+        color: var(--rl-fg);
+        background: var(--rl-bg);
+        border: 1px solid var(--rl-line2);
+        border-radius: var(--rl-rsm);
+        padding-block: 6px;
+        padding-inline: 30px 10px;
+
+        &:focus-visible {
+            outline: 2px solid var(--rl-green);
+            outline-offset: 2px;
+        }
+    }
+}
+
+.ic-requests-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.ic-requests-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--rl-fg2);
+    background: var(--rl-surf);
+    border: 1px solid var(--rl-line2);
+    border-radius: 999px;
+    padding: 3px 10px;
+    cursor: pointer;
+
+    .ic-requests-n {
+        color: var(--rl-faint);
+        font-variant-numeric: tabular-nums;
+    }
+
+    &[aria-pressed="true"] {
+        background: var(--rl-green-soft);
+        border-color: var(--rl-green);
+        color: var(--rl-green-text);
+
+        .ic-requests-n { color: inherit; }
+    }
+
+    &:focus-visible {
+        outline: 2px solid var(--rl-green);
+        outline-offset: 2px;
+    }
+}
+
+// Fifteen rows plus the sticky header; the box scrolls, the page does not.
+.ic-requests-box {
+    max-block-size: calc(15 * 31px + 34px);
+    overflow: auto;
+    min-width: 0;
+
+    &:focus-visible {
+        outline: 2px solid var(--rl-green);
+        outline-offset: -2px;
+    }
+
+    thead th {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        background: var(--rl-surf2);
+        padding-inline: 12px;
+        white-space: nowrap;
+    }
+
+    td {
+        padding-block: 6px;
+        padding-inline: 12px;
+        font-family: var(--rl-fm);
+        font-size: 12px;
+        white-space: nowrap;
+    }
+
+    td.ic-path {
+        white-space: normal;
+        min-inline-size: 240px;
+    }
+
+    tbody tr:hover td { background: var(--rl-surf2); }
+
+    mark {
+        // Bootstrap pads <mark>; a match inside a path must not split it.
+        padding: 0;
+        background: var(--rl-amber-soft);
+        color: inherit;
+        border-radius: 2px;
+    }
+}
+
+.ic-requests-time { color: var(--rl-fg2); }
+
+.ic-requests-empty {
+    padding: 28px 14px;
+    text-align: center;
+    color: var(--rl-muted);
+}
+
+.ic-requests-foot {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 14px;
+    border-block-start: 1px solid var(--rl-line);
+    color: var(--rl-muted);
+    font-size: 12px;
+
+    .rl-pager { margin-block-start: 0; }
+}
+
+// Status code by class: the text token on its soft background, the pair
+// the panel already uses for state pills, so both themes stay legible.
+.ic-status {
+    display: inline-block;
+    border-radius: 4px;
+    padding-inline: 6px;
+    font-weight: 600;
+}
+.ic-status-2 { background: var(--rl-green-soft); color: var(--rl-green-text); }
+.ic-status-3 { background: var(--rl-cyan-soft); color: var(--rl-cyan-text); }
+.ic-status-4 { background: var(--rl-amber-soft); color: var(--rl-amber-text); }
+.ic-status-5 { background: var(--rl-red-soft); color: var(--rl-red-text); }
+
+// «Auto-rebuild on push» with GitLab lines whose webhook does not deliver.
+.ic-app .rl-th.ic-gitlab-hook-warn { color: var(--rl-amber-text); }
+
+// The relay's server with OAuth2 is Microsoft's: shown, not edited.
+.ic-smtp-note a { color: var(--rl-green-text); text-decoration: underline; }
+// As specific as the Relay rule that paints every row's input.
+.ic-app .rl-frow > input[readonly]:not([type=checkbox]):not([type=radio]) {
+    color: var(--rl-muted);
+    cursor: default;
+}
+
+// The relay's state and its test mail, under the relay's fields.
+.ic-relay-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+
+    .rl-v.ok { color: var(--rl-green-text); }
+    .rl-v.error { color: var(--rl-red-text); }
+}
+.ic-relay-status-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 8px;
+    flex: 1 1 280px;
+    min-width: 0;
+}
+.ic-relay-status-detail {
+    font-size: 12px;
+    color: rgba(var(--rl-muted-rgb), 0.9);
+    overflow-wrap: anywhere;
+}

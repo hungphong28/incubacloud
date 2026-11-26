@@ -1,0 +1,560 @@
+---
+# Deploy the central metrics stack (VictoriaMetrics and Loki, behind
+# vmauth). Driven by ObservabilityCentralExecutor.
+#
+# On a server the panel manages, never on the panel's own. The destination
+# is a plain parameter, so moving the central to another VPS is "point the
+# job at another host and re-run", not a rewrite. The panel draws every
+# chart itself, reading VictoriaMetrics through vmauth; Loki keeps the
+# hosts' security logs.
+#
+# ── Why vmauth sits in front ───────────────────────────────────────────
+# The central can be shared: several panels write to
+# and read from the same VictoriaMetrics. Single-node VM has no notion of
+# accounts, so the boundary has to be imposed by something in front.
+# vmauth is the auth proxy VictoriaMetrics ships for exactly this, and it
+# beats a hand-written nginx on the one thing that matters here:
+#
+#   * on WRITE, the route forces ``extra_label=ic_account=<user>``; a
+#     client that sends its own copy has it DROPPED for colliding, not
+#     merged. An agent runs on a machine its owner has root on, so its
+#     claim about who it is can never be trusted.
+#   * on READ, the route forces ``extra_filters[]={ic_account="<user>"}``
+#     the same way, so a client cannot widen the result by sending its
+#     own filter.
+#   * on LOGS, the account is the ``X-Scope-OrgID`` header, SET (not
+#     appended) from the authenticated user.
+#
+# Measured (lab, 2026-08-10) against real VM + Loki: the forced arg wins,
+# the client's is dropped, and a credential-less request is 401 — with no
+# hand-written reject rules to rot when VM changes a query arg's meaning.
+#
+# The central ran Grafana until 12-nov-2026. A deployment removes what it
+# left, once the boundary has answered (``ic_purge_grafana``).
+- name: Deploy the central metrics stack
+  hosts: all
+  gather_facts: true
+
+  vars:
+    ic_central_dir: "{{ ansible_env.HOME }}/observability-central"
+    ic_retention_days: 90
+    # VictoriaMetrics' key for deleting series. Empty starts it without
+    # one, which is how a central deployed before deletions existed runs.
+    ic_delete_auth_key: ""
+    # The whole vmauth access-control document, rendered by the executor.
+    ic_vmauth_config: ""
+    # The name the central is published under through this host's Traefik
+    # (``metrics_central_public_host``). Empty, as on a central next to
+    # its panel: nothing is published, the compose file is what it always
+    # was, and the panel's Traefik (or a hand-written route) reaches the
+    # bridge ports below.
+    ic_public_host: ""
+    # ``acme`` (a certificate of its own) or ``default`` (the host's, when
+    # a CDN fronts the name and that certificate covers it).
+    ic_public_tls: ""
+    # The central's direct name: published
+    # on the host's ``direct`` entrypoint for the platform's own servers.
+    # Empty changes nothing in the compose file.
+    ic_direct_host: ""
+    # Who may reach the operator's series-deletion route under the public
+    # name.
+    ic_operator_sources: []
+    # The central's single name (``metrics_central_single_path``): published
+    # on the host's platform port (the ``direct`` entrypoint,
+    # ``ic_central_port``) outside every CDN, with a certificate signed by
+    # the panel's own authority (``ic_central_cert`` and ``ic_central_key``).
+    # Empty publishes nothing more, and removes what an earlier deployment
+    # left for it.
+    ic_single_host: ""
+    ic_central_port: 0
+    ic_central_cert: ""
+    ic_central_key: ""
+    # Who may reach the operator's deletion route under the single name:
+    # the host, the private ranges (a panel beside the central arrives
+    # through Docker's DNAT with a container's address) and the
+    # operator's own.
+    ic_single_operator_sources: []
+    ic_traefik_dir: "{{ ansible_env.HOME }}/traefik"
+    # The public name reaches this host through a CDN, whose edge opens
+    # the connection: the deletion route then checks the address the CDN
+    # forwards (the rightmost X-Forwarded-For entry), not the edge's; so
+    # does the read route, which shares its list.
+    # Traefik only keeps that header from the ranges it trusts, so a
+    # caller reaching the host directly cannot hand it the address.
+    ic_public_forwarded: false
+    ic_vm_image: "victoriametrics/victoria-metrics:v1.102.0"
+    # Removed after the boundary answers: the volume of the Grafana the
+    # central ran until 12-nov-2026, its provisioning and its image. The
+    # executor sets it false while ``incubacloud.metrics_keep_grafana_data``
+    # exists (docs/observability-operations.md, «Undo»).
+    ic_purge_grafana: true
+    ic_grafana_image: "grafana/grafana:11.2.0"
+    # The account boundary. vmauth is VictoriaMetrics' own auth proxy;
+    # pinned to the same release train as the backend. The read
+    # credential's rotation relies on it admitting two passwords for one
+    # user (measured on this release, 14-nov-2026): try that again before
+    # moving to another.
+    ic_vmauth_image: "victoriametrics/vmauth:v1.102.0"
+    ic_loki_image: "grafana/loki:2.9.8"
+    # Anything that is not a security log: nothing new arrives since the
+    # agents stopped sending the proxy's access log (12-nov-2026). Kept at
+    # 30 days so the access lines already stored, which carry the
+    # instances' visitors' addresses, expire as before; 90 would keep them
+    # longer.
+    ic_log_retention_days: 30
+    # Hosts' security logs (SSH, sudo, auditd, fail2ban), where sent:
+    # kept longer, because an incident is often found weeks after it
+    # began. They carry operators' and attackers' addresses and, in the
+    # failed web logins to the instances, the address of whoever tried
+    # (with the instance and the time, never the user name or the
+    # password).
+    ic_security_log_retention_days: 90
+    # Series one LogQL query may return (Loki's default, 500, would break
+    # "top source addresses" during a distributed attack: review M4 of
+    # 13-nov-2026). Provisional: fixed with step M (M-c), measured with
+    # thousands of source addresses on the disposable QA server.
+    ic_loki_max_query_series: 5000
+    # How Loki splits a log query into subqueries, and how many of them
+    # it queues per account before answering 429. As it comes (2.9),
+    # every 30 minutes and 100: a week of a server's sign-ins, one
+    # request of the Security view, is 336 subqueries and was refused
+    # even alone (QA of 15-nov-2026). The security lines are few, so a
+    # day is one subquery's worth: a week is 7 or 8, and the queue holds
+    # a board's reads and the alerts' with room.
+    # Measured on 2.9.8 with a week of lines: the same board, 6 reads,
+    # 0.1-0.2 s, no refusal.
+    ic_loki_split_queries_by_interval: "24h"
+    ic_loki_max_outstanding_per_account: 2048
+    # Bound to the Docker bridge gateway, NOT to 127.0.0.1.
+    #
+    # Everything that consumes this stack is itself a container: the host
+    # agents' vmagent pushes to it, and the panel queries it. Loopback on
+    # the host is a different namespace from a container's loopback, so a
+    # 127.0.0.1 bind is unreachable to every one of them — verified live,
+    # where vmagent got "connection refused" against a healthy backend.
+    #
+    # One thing is published, on the bridge: vmauth, the account
+    # boundary. VictoriaMetrics and Loki have no host port at all:
+    # reachable only over the compose network, so nothing can bypass
+    # vmauth by talking to them directly; they authenticate nothing.
+    ic_bridge_ip: "{{ ansible_docker0.ipv4.address | default('172.17.0.1') }}"
+    ic_gateway_bind: "{{ ic_bridge_ip }}:8428"
+
+  tasks:
+    # ── Where confidentiality is enforced ─────────────────────────────
+    # On the DIRECTORY, not on the files inside it.
+    #
+    # The vmauth config is read by a process inside its container, and
+    # that process is not root: vmauth runs unprivileged. Writing it
+    # owner-only looked like the careful choice and was the opposite — the
+    # first live deployment (nginx, then) came up answering "permission
+    # denied" on its own credential file.
+    #
+    # So there is ONE gate, at the top: the root of the tree is not
+    # traversable by anyone but its owner, and everything under it is
+    # readable. A bind mount is resolved by the daemon, so a container
+    # reads what is mounted into it without traversing the host path —
+    # which is the asymmetry that makes this both work and stay closed.
+    # The gate is ours rather than inherited on purpose: the parent is
+    # the SSH user's home, and on a hardened host that is not 0700.
+    - name: Create the central directory
+      ansible.builtin.file:
+        path: "{{ ic_central_dir }}"
+        state: directory
+        mode: "0700"
+
+    # Traversable: they are mount points, read by the containers'
+    # processes, and their mode would otherwise be whatever the umask
+    # happened to be.
+    - name: Create the central subdirectories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ ic_central_dir }}/vmauth"
+        - "{{ ic_central_dir }}/victoriametrics"
+
+    - name: Write the backend's deletion key
+      # A file, not the flag's value: a flag is part of the container's
+      # command, which ``docker inspect`` shows to anyone in the docker
+      # group. VictoriaMetrics reads a ``file://`` key again every few
+      # seconds, so a new one takes effect with no restart (lab, v1.102.0,
+      # 12-nov-2026). Its directory is mounted rather than the file: a
+      # file mount keeps the inode the replaced copy no longer has.
+      ansible.builtin.copy:
+        dest: "{{ ic_central_dir }}/victoriametrics/delete_auth_key"
+        content: "{{ ic_delete_auth_key }}"
+        mode: "0600"
+      when: ic_delete_auth_key | length > 0
+      no_log: true
+
+    - name: Write the vmauth access-control config
+      # Shared with the account sync so the boundary has exactly one
+      # definition: same file, same renderer, two callers.
+      ansible.builtin.include_tasks: tasks/vmauth_acl_write.yml
+
+    - name: Write the log store configuration
+      # The hosts' security logs, 90 days; anything else 30 (see the
+      # variables). ``auth_enabled`` is what makes the account header
+      # meaningful — without it Loki ignores it and every account shares
+      # one namespace.
+      ansible.builtin.copy:
+        dest: "{{ ic_central_dir }}/loki.yaml"
+        mode: "0644"
+        content: |
+          auth_enabled: true
+          server:
+            http_listen_port: 3100
+          common:
+            instance_addr: 127.0.0.1
+            path_prefix: /loki
+            storage:
+              filesystem:
+                chunks_directory: /loki/chunks
+                rules_directory: /loki/rules
+            replication_factor: 1
+            ring:
+              kvstore:
+                store: inmemory
+          schema_config:
+            configs:
+              - from: 2020-10-24
+                store: tsdb
+                object_store: filesystem
+                schema: v13
+                index:
+                  prefix: index_
+                  period: 24h
+          limits_config:
+            allow_structured_metadata: false
+            max_query_series: {{ ic_loki_max_query_series | int }}
+            split_queries_by_interval: {{ ic_loki_split_queries_by_interval }}
+            retention_period: {{ ic_log_retention_days }}d
+            retention_stream:
+              - selector: '{log_type="security"}'
+                priority: 1
+                period: {{ ic_security_log_retention_days }}d
+          query_scheduler:
+            max_outstanding_requests_per_tenant: {{ ic_loki_max_outstanding_per_account | int }}
+          compactor:
+            working_directory: /loki/compactor
+            retention_enabled: true
+            delete_request_store: filesystem
+      register: ic_loki_cfg
+
+    # ── The single name's certificate ─────────────────────────────────
+    # Written by this job, not by Full Setup, so it works on a host whose
+    # proxy is kept by hand. The proxy mounts ``certs`` at /etc/certs and
+    # watches ``dynamic``: the document names the files and carries the
+    # certificate's digest, so a renewed certificate changes the document
+    # and Traefik loads it without a restart. It picks the certificate by
+    # SNI; the TLS option ``ic-central`` is the central's own, apart from
+    # the ``direct`` one, so a client certificate can be asked for there
+    # later without touching any other name on the port.
+    - name: Install the single name's certificate
+      when: ic_single_host | length > 0
+      block:
+        - name: Create the proxy's certificate and dynamic directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "{{ ic_traefik_dir }}/certs"
+            - "{{ ic_traefik_dir }}/dynamic"
+
+        - name: Write the single name's certificate
+          ansible.builtin.copy:
+            dest: "{{ ic_traefik_dir }}/certs/ic-central.crt"
+            content: "{{ ic_central_cert }}"
+            mode: "0644"
+
+        - name: Write the single name's key
+          ansible.builtin.copy:
+            dest: "{{ ic_traefik_dir }}/certs/ic-central.key"
+            content: "{{ ic_central_key }}"
+            mode: "0600"
+          no_log: true
+
+        - name: Name the certificate and the central's TLS option for Traefik
+          ansible.builtin.copy:
+            dest: "{{ ic_traefik_dir }}/dynamic/ic-central-tls.yml"
+            mode: "0644"
+            content: |
+              # Auto-generated by IncubaCloud. Do not edit by hand.
+              # certificate sha256: {{ ic_central_cert | hash('sha256') }}
+              tls:
+                certificates:
+                  - certFile: /etc/certs/ic-central.crt
+                    keyFile: /etc/certs/ic-central.key
+                options:
+                  ic-central:
+                    minVersion: VersionTLS12
+
+    # A certificate ACME obtained earlier under the same name (the name
+    # once published on 443) stays in the proxy's store and competes with
+    # the file's: Traefik serves one or the other after each reload, and
+    # the agents refuse the ACME one (spike of 13-nov-2026). Only looked
+    # for, and said: the store holds every name's key and is the proxy's.
+    # grep prints how many lines name it, so 0 with rc 1 is "none", and a
+    # store that cannot be read (no proxy, no store) is neither.
+    - name: Look for a stored certificate of the single name
+      when: ic_single_host | length > 0
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -p
+          - inverseproxy
+          - -f
+          - inverseproxy.yaml
+          - exec
+          - -T
+          - proxy
+          - grep
+          - -c
+          - -F
+          - '"{{ ic_single_host }}"'
+          - /etc/traefik/acme/acme.json
+        chdir: "{{ ic_traefik_dir }}"
+      register: ic_acme_grep
+      changed_when: false
+      failed_when: false
+
+    - name: Remove what the single name left
+      when: ic_single_host | length == 0
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ ic_traefik_dir }}/dynamic/ic-central-tls.yml"
+        - "{{ ic_traefik_dir }}/certs/ic-central.crt"
+        - "{{ ic_traefik_dir }}/certs/ic-central.key"
+
+    - name: Write the central compose file
+      ansible.builtin.copy:
+        dest: "{{ ic_central_dir }}/docker-compose.yaml"
+        mode: "0644"
+        content: |
+          services:
+            victoriametrics:
+              image: {{ ic_vm_image }}
+              restart: unless-stopped
+              command:
+                - '-retentionPeriod={{ ic_retention_days }}d'
+                - '-storageDataPath=/vmdata'
+                - '-httpListenAddr=:8428'
+          {% if ic_delete_auth_key %}
+                # Without it VictoriaMetrics deletes for anyone who can
+                # reach it. Only vmauth's operator deletion route carries
+                # it, so no account can delete — not even its own series.
+                # Read from the file written above, never named here.
+                - '-deleteAuthKey=file:///etc/victoriametrics/delete_auth_key'
+          {% endif %}
+                # Bound to the compose network only — see the header.
+              volumes:
+                - vmdata:/vmdata
+          {% if ic_delete_auth_key %}
+                - {{ ic_central_dir }}/victoriametrics:/etc/victoriametrics:ro
+          {% endif %}
+
+            loki:
+              image: {{ ic_loki_image }}
+              restart: unless-stopped
+              command: ['-config.file=/etc/loki/local-config.yaml']
+              volumes:
+                - {{ ic_central_dir }}/loki.yaml:/etc/loki/local-config.yaml:ro
+                - lokidata:/loki
+              # No host port, same as VictoriaMetrics: the account
+              # boundary is imposed by vmauth, and anything able to reach
+              # Loki directly would bypass it.
+
+            vmauth:
+              image: {{ ic_vmauth_image }}
+              restart: unless-stopped
+              # Listen on 8428 (not vmauth's 8427 default) so every
+              # address of this stack — the panel's, the health check,
+              # the agents' URLs — speaks one port.
+              command:
+                - '-auth.config=/etc/vmauth/auth.yml'
+                - '-httpListenAddr=:8428'
+              volumes:
+                - {{ ic_central_dir }}/vmauth/auth.yml:/etc/vmauth/auth.yml:ro
+              ports:
+                - "{{ ic_gateway_bind }}:8428"
+          {% if ic_public_host or ic_direct_host or ic_single_host %}
+              # Published under its own name through this host's Traefik,
+              # which reaches it over the shared network. The same routes
+              # as the hand-written gateway of a central next to its panel
+              # (docs/observability-operations.md, «Publishing the central»): the
+              # account prefixes for everyone (vmauth asks each for its
+              # credential), the operator's deletion route for the
+              # addresses in ``ic_operator_sources`` only.
+              networks:
+                - default
+                - inverseproxy_shared
+              labels:
+                traefik.enable: "true"
+                traefik.docker.network: inverseproxy_shared
+                traefik.http.services.ic-central-gateway.loadbalancer.server.port: "8428"
+          {% endif %}
+          {% if ic_public_host %}
+                traefik.http.routers.ic-central-data.rule: "Host(`{{ ic_public_host }}`) && (PathPrefix(`/w/`)
+                  || PathPrefix(`/r/`) || PathPrefix(`/lw/`) || PathPrefix(`/lr/`))"
+                traefik.http.routers.ic-central-data.entrypoints: https
+                traefik.http.routers.ic-central-data.service: ic-central-gateway
+                traefik.http.routers.ic-central-data.priority: "10"
+                traefik.http.routers.ic-central-delete.rule: "Host(`{{ ic_public_host }}`) && PathPrefix(`/admin-d/`)"
+                traefik.http.routers.ic-central-delete.entrypoints: https
+                traefik.http.routers.ic-central-delete.service: ic-central-gateway
+                traefik.http.routers.ic-central-delete.priority: "30"
+                traefik.http.routers.ic-central-delete.middlewares: ic-central-delete-sources
+                traefik.http.middlewares.ic-central-delete-sources.ipwhitelist.sourcerange: "{{ ic_operator_sources | join(',') }}"
+          {% if ic_public_forwarded %}
+                traefik.http.middlewares.ic-central-delete-sources.ipwhitelist.ipstrategy.depth: "1"
+          {% endif %}
+          {% for router in ['ic-central-data', 'ic-central-delete'] %}
+          {% if ic_public_tls == 'default' %}
+                traefik.http.routers.{{ router }}.tls: "true"
+          {% else %}
+                traefik.http.routers.{{ router }}.tls.certresolver: letsencrypt
+          {% endif %}
+          {% endfor %}
+          {% endif %}
+          {% if ic_direct_host %}
+                # The account prefixes again, under the direct name and on
+                # the host's direct entrypoint: the platform's own servers,
+                # admitted by the host's direct list, without the CDN. No
+                # operator route is published there. Its certificate comes
+                # from the direct-dns resolver, its TLS option asks no
+                # client certificate, and it outranks the entrypoint's
+                # catch-all refusal (priority 10000).
+                traefik.http.routers.ic-central-direct.rule: "Host(`{{ ic_direct_host }}`) && (PathPrefix(`/w/`)
+                  || PathPrefix(`/r/`) || PathPrefix(`/lw/`) || PathPrefix(`/lr/`))"
+                traefik.http.routers.ic-central-direct.entrypoints: direct
+                traefik.http.routers.ic-central-direct.service: ic-central-gateway
+                traefik.http.routers.ic-central-direct.priority: "10010"
+                traefik.http.routers.ic-central-direct.tls.certresolver: direct-dns
+                traefik.http.routers.ic-central-direct.tls.options: direct@file
+          {% endif %}
+          {% if ic_single_host %}
+                # The single name, on the platform port: the account prefixes
+                # for every address the port admits (vmauth asks each for
+                # its credential), the operator's deletion route for
+                # ``ic_single_operator_sources`` only. Its certificate is the
+                # file above, chosen by SNI; it outranks the entrypoint's
+                # catch-all refusal (priority 10000).
+                traefik.http.routers.ic-central.rule: "Host(`{{ ic_single_host }}`) && (PathPrefix(`/w/`)
+                  || PathPrefix(`/r/`) || PathPrefix(`/lw/`) || PathPrefix(`/lr/`))"
+                traefik.http.routers.ic-central.entrypoints: direct
+                traefik.http.routers.ic-central.service: ic-central-gateway
+                traefik.http.routers.ic-central.priority: "10010"
+                traefik.http.routers.ic-central.tls: "true"
+                traefik.http.routers.ic-central.tls.options: ic-central@file
+                traefik.http.routers.ic-central-operator.rule: "Host(`{{ ic_single_host }}`) && PathPrefix(`/admin-d/`)"
+                traefik.http.routers.ic-central-operator.entrypoints: direct
+                traefik.http.routers.ic-central-operator.service: ic-central-gateway
+                traefik.http.routers.ic-central-operator.priority: "10020"
+                traefik.http.routers.ic-central-operator.tls: "true"
+                traefik.http.routers.ic-central-operator.tls.options: ic-central@file
+                traefik.http.routers.ic-central-operator.middlewares: ic-central-operator-sources
+                traefik.http.middlewares.ic-central-operator-sources.ipwhitelist.sourcerange: "{{ ic_single_operator_sources | join(',') }}"
+          {% endif %}
+              depends_on:
+                - victoriametrics
+                - loki
+
+          {% if ic_public_host or ic_direct_host or ic_single_host %}
+          networks:
+            inverseproxy_shared:
+              external: true
+
+          {% endif %}
+          volumes:
+            vmdata:
+            lokidata:
+
+    - name: Bring the central stack up
+      ansible.builtin.command:
+        cmd: docker compose -p incubacloud-central -f docker-compose.yaml up -d --remove-orphans
+        chdir: "{{ ic_central_dir }}"
+      changed_when: true
+
+    - name: Restart Loki when its configuration changed  # noqa: no-handler
+      # Loki reads it at start only, and ``up -d`` does not recreate a
+      # container whose definition is unchanged: a new limit or retention
+      # never applied (found on 14-nov-2026, plan #84). The agents keep
+      # their lines and send them again once it answers.
+      ansible.builtin.command:
+        cmd: docker compose -p incubacloud-central -f docker-compose.yaml restart loki
+        chdir: "{{ ic_central_dir }}"
+      when: ic_loki_cfg is changed
+      changed_when: true
+
+    - name: Apply the access-control config and verify the boundary
+      # Shared with the account sync: reload vmauth if the document
+      # changed, wait for it through the front door, and refuse to finish
+      # if anonymous writes are accepted.
+      ansible.builtin.include_tasks: tasks/vmauth_acl_apply.yml
+
+    # ── What Grafana left ─────────────────────────────────────────────
+    # Only now, with the boundary answering and refusing an anonymous
+    # write: a deployment that fails before here leaves Grafana's data in
+    # place for the next one. ``--remove-orphans`` above removed its
+    # container, not its volume, which the compose file no longer names.
+    # Nothing in it was the only copy: its dashboards and organisations
+    # were written from the code. A failure here is said, not raised: the
+    # central works, and failing the job would raise
+    # ``metrics_central_failed`` for nothing (review of 12-nov-2026).
+    - name: Remove what Grafana left
+      when: ic_purge_grafana | bool
+      block:
+        - name: Remove Grafana's volume
+          ansible.builtin.command:
+            cmd: docker volume rm incubacloud-central_grafana-data
+          register: ic_grafana_volume_rm
+          changed_when: ic_grafana_volume_rm.rc == 0
+          failed_when: >-
+            ic_grafana_volume_rm.rc != 0
+            and 'no such volume' not in (ic_grafana_volume_rm.stderr | lower)
+
+        - name: Remove Grafana's provisioning and dashboards
+          ansible.builtin.file:
+            path: "{{ ic_central_dir }}/{{ item }}"
+            state: absent
+          loop:
+            - provisioning
+            - dashboards
+
+        - name: Remove Grafana's image
+          ansible.builtin.command:
+            cmd: docker image rm {{ ic_grafana_image }}
+          register: ic_grafana_image_rm
+          changed_when: ic_grafana_image_rm.rc == 0
+          failed_when: false
+
+        - name: Note what Grafana left removed
+          ansible.builtin.set_fact:
+            ic_grafana_purge: removed
+      rescue:
+        - name: Note what Grafana left not removed, and why
+          ansible.builtin.set_fact:
+            ic_grafana_purge: >-
+              failed: {{ ansible_failed_task.name | default('') }}:
+              {{ (ansible_failed_result.msg | default('') | string)[:300] }}
+
+    - name: Export the central facts
+      ansible.builtin.set_stats:
+        aggregate: false
+        data:
+          ic_central_up: "{{ (ic_vm_health.status | default(0)) == 200 }}"
+          ic_central_gateway: "http://{{ ic_gateway_bind }}"
+          # removed, failed and why, or kept (incubacloud.metrics_keep_grafana_data).
+          ic_grafana_purge: "{{ ic_grafana_purge | default('kept') }}"
+          # Under the single name: found, absent or unread; empty without it.
+          ic_acme_same_name: >-
+            {{ '' if (ic_acme_grep.rc is not defined)
+               else 'found' if (ic_acme_grep.rc == 0)
+               else 'absent' if (ic_acme_grep.rc == 1 and (ic_acme_grep.stdout | trim) == '0')
+               else 'unread' }}

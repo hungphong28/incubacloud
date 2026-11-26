@@ -1,0 +1,54 @@
+"""Pure-Python unit tests for GitHubSetupController._github_app_name.
+
+GitHub App names must be globally unique (across every panel) and at
+most 34 chars. The name is derived from the panel's host subdomain, so
+two panels sharing a company name still get distinct app names.
+"""
+from odoo.tests.common import BaseCase
+
+from odoo.addons.incubacloud.controllers.github_setup import (
+    GitHubSetupController,
+)
+
+
+class TestGitHubAppName(BaseCase):
+
+    def _name(self, base_url, fallback=""):
+        return GitHubSetupController._github_app_name(base_url, fallback)
+
+    def test_uses_host_subdomain(self):
+        self.assertEqual(
+            self._name("https://acme.example.com"),
+            "IncubaCloud-acme",
+        )
+
+    def test_distinct_per_panel_subdomain(self):
+        # Same base domain, different subdomain → different app names.
+        a = self._name("https://t1.example.com")
+        b = self._name("https://t2.example.com")
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, "IncubaCloud-t1")
+        self.assertEqual(b, "IncubaCloud-t2")
+
+    def test_sanitises_non_alphanumerics(self):
+        self.assertEqual(
+            self._name("https://my_panel--x.example.com"),
+            "IncubaCloud-my-panel-x",
+        )
+
+    def test_caps_at_34_chars(self):
+        name = self._name(
+            "https://a-very-long-subdomain-name-indeed.example.com",
+        )
+        self.assertLessEqual(len(name), 34)
+        self.assertTrue(name.startswith("IncubaCloud-"))
+
+    def test_falls_back_to_provided_host(self):
+        # No hostname in base_url → use the fallback host header.
+        self.assertEqual(
+            self._name("", "beta.example.com"),
+            "IncubaCloud-beta",
+        )
+
+    def test_falls_back_to_app_when_no_label(self):
+        self.assertEqual(self._name("", ""), "IncubaCloud-app")

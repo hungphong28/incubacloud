@@ -1,0 +1,147 @@
+// Backup backends — Relay rebuild (list grid + detail form).
+// Structure/primitives come from relay.scss; only screen-specific bits
+// live here.
+
+// ── Backends list (grid of cards) ──────────────────────────────────────────
+.ic-backups-dashboard {
+
+    // The name wraps where it must (a destination name often has no
+    // spaces) and the badge keeps its size on the first line, so a long
+    // name never pushes the badge out of the card.
+    .ic-backend-card-head {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        margin-bottom: 4px;
+
+        .rl-rname {
+            min-width: 0;
+            overflow-wrap: anywhere;
+        }
+
+        .rl-sb {
+            flex: none;
+        }
+    }
+
+    .ic-backend-card-dst {
+        margin-bottom: 12px;
+
+        code { font-family: var(--rl-fm); }
+    }
+
+    .ic-mbar-extra {
+        font-family: var(--rl-fm);
+        font-size: 10px;
+        color: var(--rl-faint);
+        margin-top: 3px;
+    }
+
+    .ic-metrics-placeholder {
+        font-size: 12px;
+        color: var(--rl-muted);
+        font-style: italic;
+        padding: 8px 0;
+    }
+
+    .ic-backend-card-foot {
+        margin-top: 10px;
+    }
+}
+
+// ── Backend detail form ─────────────────────────────────────────────────────
+.ic-backend-detail {
+
+    // The first card sits under the tabs' own 22 px, as on a project's page:
+    // the shared body's 24 px on top doubled the gap.
+    .ic-detail-body { padding-block-start: 0; }
+
+    // Type has one value and no list to open: without the chevron,
+    // «S3 Compatible» fits the half row a phone gives it.
+    .rl-sel__trigger:disabled .rl-sel__chevron { display: none; }
+
+    // Backup-destination preview chip.
+    .ic-backup-dst {
+        display: block;
+        padding: 6px 10px;
+        font-size: 12px;
+        background: var(--rl-bg);
+        border: 1px solid var(--rl-line2);
+        border-radius: var(--rl-rsm);
+        color: var(--rl-fg2);
+        word-break: break-all;
+    }
+
+    // Usage group: "Last measured …" + Refresh now on one row.
+    .ic-usage-meta-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 6px;
+        flex-wrap: wrap;
+    }
+
+    // The quota and its alert, under what the bucket holds.
+    .ic-usage-fields { margin-top: 16px; }
+
+    // Report on success, under the two addresses.
+    .ic-notify-toggle { margin-top: 16px; }
+}
+
+// The Delete button in the detail footer uses .ic-btn-danger. Kept here
+// (and not in settings.scss, which scopes it under .ic-settings) so the
+// rule applies in any database where no module on top is installed —
+// core must not depend on their SCSS. The button also carries rl-btn
+// rl-btn-danger for the Relay look; this rule is a defensive fallback and
+// the hook a layer's managed-backup patch targets.
+.ic-btn-danger {
+    border-radius: 6px;
+    padding: 7px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: opacity 0.15s, background 0.15s;
+    white-space: nowrap;
+    background: rgba(var(--rl-red-rgb), 0.1);
+    border: 1px solid rgba(var(--rl-red-rgb), 0.35);
+    color: $state-error;
+
+    &:hover:not(:disabled) {
+        background: rgba(var(--rl-red-rgb), 0.18);
+        border-color: $state-error;
+    }
+    &:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+    }
+}
+
+// SFTP: the key's buttons, and the server key a person compares before
+// trusting it.
+.ic-sftp-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.ic-sftp-label {
+    font-weight: 600;
+}
+
+.ic-sftp-presented {
+    margin-top: 8px;
+    padding: 12px;
+    border: 1px solid var(--rl-line);
+    border-radius: 6px;
+    overflow-wrap: anywhere;
+
+    p {
+        margin: 0 0 6px;
+    }
+}
+
+.ic-backup-dst,
+.ic-sftp-presented .rl-mono {
+    overflow-wrap: anywhere;
+}

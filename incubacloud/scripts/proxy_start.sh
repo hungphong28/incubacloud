@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Start the proxy with the files Full Setup just installed, or fall back
+# to the ones it ran with.
+#
+# Usage:
+#   proxy_start.sh keep    # before the new files are moved in
+#   proxy_start.sh start
+#
+# ``keep`` copies the running compose file, static and dynamic
+# configuration aside (``.ic-prev-*``). ``start`` brings the proxy up with
+# the new ones; when Docker refuses (a port already taken, a file it
+# cannot read), or the proxy is not running a few seconds later (Traefik
+# exits on a static file it cannot parse, and Docker reports nothing; in
+# a restart loop it also looks running between two restarts, so the
+# container's restart count must not have grown either),
+# the previous three go back, the proxy comes up with them and the step
+# fails. The proxy serves the whole host, so Full Setup must never leave
+# it down. A first setup has nothing to fall back to and simply fails.
+#
+# Docker Compose before 2.24 refuses the whole file for the proxy's
+# fixed address on ``shared`` (``mac_address`` under a service's
+# network): ``start`` drops that line first, with a warning, and the
+# proxy runs without it; the guard on that network (shared_guard.sh)
+# then stays open and says why.
+#
+# IC_TRAEFIK_DIR overrides ~/traefik and IC_PROXY_SETTLE the seconds
+# waited before the check (tests).
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/common.sh
+source "$(dirname "$0")/lib/common.sh"
+
+ic_require_args 1 "$#" "proxy_start.sh <keep|start>"
+
+dir="${IC_TRAEFIK_DIR:-$HOME/traefik}"
+files=(inverseproxy.yaml traefik.yml config.yml)
+# The proxy's fixed address on ``shared`` (``PROXY_SHARED_MAC``).
+proxy_mac="02:69:63:00:00:01"
+
+compose() {
+    (cd "$dir" && docker compose -p inverseproxy -f inverseproxy.yaml "$@")
+}
+
+# Whether the proxy container is running (not exited, not restarting).
+running() {
+    local id
+    id="$(compose ps -q proxy)" || return 1
+    [ -n "$id" ] || return 1
+    [ "$(docker inspect -f '{{.State.Status}}' "$id")" = "running" ]
+}
+
+# The proxy container's restart count, or '' when there is no container.
+restarts() {
+    local id
+    id="$(compose ps -q proxy)" || return 0
+    [ -n "$id" ] || return 0
+    docker inspect -f '{{.RestartCount}}' "$id" || true
+}
+
+# Drop the proxy's fixed address from its compose file when Docker
+# Compose is too old to take it.
+drop_mac_for_old_compose() {
+    local old line
+    old="$(ic_compose_older_than 2 24)"
+    [ -n "$old" ] || return 0
+    line="^[[:space:]]*mac_address:[[:space:]]*[\"']?${proxy_mac}[\"']?[[:space:]]*\$"
+    grep -Eq "$line" "$dir/inverseproxy.yaml" || return 0
+    sed -Ei "\#${line}#d" "$dir/inverseproxy.yaml"
+    ic_warn "Docker Compose $old is older than 2.24, which the proxy's fixed address on shared needs: the proxy starts without it, and the guard on that network stays open"
+}
+
+case "$1" in
+    keep)
+        for f in "${files[@]}"; do
+            if [ -f "$dir/$f" ]; then
+                cp -p "$dir/$f" "$dir/.ic-prev-$f"
+            else
+                rm -f "$dir/.ic-prev-$f"
+            fi
+        done
+        ;;
+    start)
+        drop_mac_for_old_compose
+        status=0
+        compose up -d --remove-orphans && compose restart proxy || status=$?
+        if [ "$status" -eq 0 ]; then
+            before="$(restarts)"
+            sleep "${IC_PROXY_SETTLE:-5}"
+            if running; then
+                [ "$(restarts)" = "$before" ] && exit 0
+                ic_warn "the proxy keeps restarting: its new files are not valid"
+            else
+                ic_warn "the proxy started and stopped: its new files are not valid"
+            fi
+            status=1
+        fi
+        if [ ! -f "$dir/.ic-prev-inverseproxy.yaml" ]; then
+            ic_warn "the proxy did not start and there is nothing to fall back to"
+            exit "$status"
+        fi
+        ic_warn "the proxy did not start (exit $status): putting the previous files back"
+        for f in "${files[@]}"; do
+            if [ -f "$dir/.ic-prev-$f" ]; then
+                cp -p "$dir/.ic-prev-$f" "$dir/$f"
+            fi
+        done
+        mkdir -p "$dir/dynamic"
+        cp "$dir/config.yml" "$dir/dynamic/config.yml"
+        compose up -d --remove-orphans \
+            || ic_warn "the previous files did not start the proxy either"
+        exit "$status"
+        ;;
+    *) ic_die "unknown operation: $1" ;;
+esac

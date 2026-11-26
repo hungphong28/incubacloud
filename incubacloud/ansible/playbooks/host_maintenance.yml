@@ -1,0 +1,292 @@
+---
+# Reclaim disk on a host by pruning unused Docker resources. Driven by
+# DockerPruneExecutor (a recurring cron job), which also sweeps /tmp of
+# what the panel's account left there.
+#
+# The reclaimed-space line is exported back to the panel so the job log
+# shows how much was freed.
+- name: Prune unused Docker resources
+  hosts: all
+  gather_facts: false
+
+  vars:
+    # Resources carrying this label are excluded from the prune: they are
+    # meant to stay around while stopped (an instance kept stopped on
+    # purpose is a stopped container by design, and an unfiltered prune
+    # wipes it). DockerPruneExecutor.get_extra_vars() overrides this
+    # with the same constant; the default keeps the playbook runnable
+    # standalone with identical semantics.
+    ic_protect_label: "incubacloud.protect=1"
+    # This account's leftovers in /tmp and /var/tmp: handoffs a day old
+    # whose restore never came (a production database each), in /var/tmp
+    # and in /tmp, where releases before 1.0.239 handed them over, what releases before
+    # 1.0.200 left at fixed names (root's and the odoo container's too:
+    # uid 1000, the live dumps; a pass through ``sudo -n`` only when a
+    # search finds something), the directories of jobs
+    # whose worker died, three days old, in /tmp and in /var/tmp (a
+    # restore's), and the grant directories of upload keys under
+    # /var/tmp/incubacloud-restore, and under /tmp/incubacloud-restore
+    # where releases before 1.0.239 put them, three days old too, in a
+    # root of this account's (``upload_dir_sweep``). DockerPruneExecutor passes the
+    # same command (``TMP_SWEEP``), sparing the handoffs a restore still
+    # waits for (``tmp_sweep``).
+    ic_tmp_sweep: >-
+      find /var/tmp -maxdepth 1 -type d -name '.incubacloud-handoff-*' -user
+      "$(id -u)" -mmin +1440 -exec rm -rf {} +; find /tmp -maxdepth 1 -type d
+      -name '.incubacloud-handoff-*' -user "$(id -u)" -mmin +1440 -exec rm -rf {}
+      +; find /tmp -mindepth 1 -maxdepth 1 -user
+      "$(id -u)" -mmin +1440 \( -type f -o -type d \) \( -name
+      '.incubacloud-handoff-*.zip' -o -name '.incubacloud-backup-*.zip' -o -name
+      '.incubacloud-bkdl-*' -o -name '.incubacloud-bkneu-*' -o -name
+      '.incubacloud-export-*' -o -name '.incubacloud-archived-purge-*' -o -name
+      '.incubacloud-*-answers.yml' -o -name '.incubacloud-*-addons.yaml' -o -name
+      '.incubacloud-*-repos.yaml' -o -name '.incubacloud-*-odoo.conf' -o -name
+      '.incubacloud-*-pip.txt' -o -name '.incubacloud-*-apt.txt' -o -name
+      '.incubacloud-*-override.yml' -o -name '.incubacloud-*-extra-*' -o -name
+      '.incubacloud-*-backup.env' -o -name '.incubacloud-*-incubacloud.env' -o
+      -name .incubacloud-acme.json -o -name '.incubacloud-traefik-*' -o -name
+      .incubacloud-whitelist.yaml -o -name .incubacloud-github-webhook.yml -o
+      -name '.incubacloud-scripts-*' -o -name '.icfree-*' -o -name '.ic-modules-*'
+      -o -name '.ic-sablier*' \) -exec rm -rf {} +; if [ "$(id -u)" = 0 ]; then
+      find /tmp -mindepth 1 -maxdepth 1 \( -user 0 -o -user 1000 \) -mmin +1440 \(
+      -type f -o -type d \) \( -name '.incubacloud-handoff-*.zip' -o -name
+      '.incubacloud-backup-*.zip' -o -name '.incubacloud-bkdl-*' -o -name
+      '.incubacloud-bkneu-*' -o -name '.incubacloud-export-*' -o -name
+      '.incubacloud-archived-purge-*' -o -name '.incubacloud-*-answers.yml' -o
+      -name '.incubacloud-*-addons.yaml' -o -name '.incubacloud-*-repos.yaml' -o
+      -name '.incubacloud-*-odoo.conf' -o -name '.incubacloud-*-pip.txt' -o -name
+      '.incubacloud-*-apt.txt' -o -name '.incubacloud-*-override.yml' -o -name
+      '.incubacloud-*-extra-*' -o -name '.incubacloud-*-backup.env' -o -name
+      '.incubacloud-*-incubacloud.env' -o -name .incubacloud-acme.json -o -name
+      '.incubacloud-traefik-*' -o -name .incubacloud-whitelist.yaml -o -name
+      .incubacloud-github-webhook.yml -o -name '.incubacloud-scripts-*' -o -name
+      '.icfree-*' -o -name '.ic-modules-*' -o -name '.ic-sablier*' \) -exec rm -rf
+      {} +; elif find /tmp -mindepth 1 -maxdepth 1 \( -user 0 -o -user 1000 \)
+      -mmin +1440 \( -type f -o -type d \) \( -name '.incubacloud-handoff-*.zip'
+      -o -name '.incubacloud-backup-*.zip' -o -name '.incubacloud-bkdl-*' -o -name
+      '.incubacloud-bkneu-*' -o -name '.incubacloud-export-*' -o -name
+      '.incubacloud-archived-purge-*' -o -name '.incubacloud-*-answers.yml' -o
+      -name '.incubacloud-*-addons.yaml' -o -name '.incubacloud-*-repos.yaml' -o
+      -name '.incubacloud-*-odoo.conf' -o -name '.incubacloud-*-pip.txt' -o -name
+      '.incubacloud-*-apt.txt' -o -name '.incubacloud-*-override.yml' -o -name
+      '.incubacloud-*-extra-*' -o -name '.incubacloud-*-backup.env' -o -name
+      '.incubacloud-*-incubacloud.env' -o -name .incubacloud-acme.json -o -name
+      '.incubacloud-traefik-*' -o -name .incubacloud-whitelist.yaml -o -name
+      .incubacloud-github-webhook.yml -o -name '.incubacloud-scripts-*' -o -name
+      '.icfree-*' -o -name '.ic-modules-*' -o -name '.ic-sablier*' \) -print -quit
+      2>/dev/null | grep -q .; then sudo -n find /tmp -mindepth 1 -maxdepth 1 \(
+      -user 0 -o -user 1000 \) -mmin +1440 \( -type f -o -type d \) \( -name
+      '.incubacloud-handoff-*.zip' -o -name '.incubacloud-backup-*.zip' -o -name
+      '.incubacloud-bkdl-*' -o -name '.incubacloud-bkneu-*' -o -name
+      '.incubacloud-export-*' -o -name '.incubacloud-archived-purge-*' -o -name
+      '.incubacloud-*-answers.yml' -o -name '.incubacloud-*-addons.yaml' -o -name
+      '.incubacloud-*-repos.yaml' -o -name '.incubacloud-*-odoo.conf' -o -name
+      '.incubacloud-*-pip.txt' -o -name '.incubacloud-*-apt.txt' -o -name
+      '.incubacloud-*-override.yml' -o -name '.incubacloud-*-extra-*' -o -name
+      '.incubacloud-*-backup.env' -o -name '.incubacloud-*-incubacloud.env' -o
+      -name .incubacloud-acme.json -o -name '.incubacloud-traefik-*' -o -name
+      .incubacloud-whitelist.yaml -o -name .incubacloud-github-webhook.yml -o
+      -name '.incubacloud-scripts-*' -o -name '.icfree-*' -o -name '.ic-modules-*'
+      -o -name '.ic-sablier*' \) -exec rm -rf {} +; fi 2>/dev/null || true; find
+      /tmp -mindepth 1 -maxdepth 1 -type d -name '.incubacloud-job-*' -user "$(id
+      -u)" -mmin +4320 -exec rm -rf {} +; find /var/tmp -mindepth 1 -maxdepth 1
+      -type d -name '.incubacloud-job-*' -user "$(id -u)" -mmin +4320 -exec rm
+      -rf {} +; { [ -d /var/tmp/incubacloud-restore ] && [ ! -h
+      /var/tmp/incubacloud-restore ] && [ -O /var/tmp/incubacloud-restore ] &&
+      find /var/tmp/incubacloud-restore -mindepth 1 -maxdepth 1 -type d -name
+      '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+      -user "$(id -u)" -mmin +4320 -exec rm -rf {} +; } || true; { [ -d
+      /tmp/incubacloud-restore ] && [ ! -h /tmp/incubacloud-restore ] && [ -O
+      /tmp/incubacloud-restore ] && find /tmp/incubacloud-restore -mindepth 1
+      -maxdepth 1 -type d -name
+      '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+      -user "$(id -u)" -mmin +4320 -exec rm -rf {} +; } || true
+
+    # What boot tests killed before their trap left, a day old: first
+    # their containers (``ic_boot_copy|pg|odoo_<id>``), which hold the
+    # volume; then the copy of the database in a volume ``ic_boot_<id>``
+    # that no container uses, and the test's network; and the copies
+    # releases before 1.0.228 made in /tmp/ic_boot_<id> (owned by the
+    # postgres uid 70: removed from a container). The panel passes the
+    # same command (``BOOT_TEST_SWEEP``).
+    ic_boot_test_sweep: >-
+      now=$(date +%s); for id in $(docker ps -aq --filter name=ic_boot_
+      2>/dev/null); do j=$(docker inspect "$id" 2>/dev/null) || continue;
+      n=$(printf '%s\n' "$j" | sed -n 's/^[[:space:]]*"Name":
+      *"\/\{0,1\}\([^"]*\)".*/\1/p' | head -n 1); case "$n" in
+      ic_boot_copy_*[!0-9]*|ic_boot_pg_*[!0-9]*|ic_boot_odoo_*[!0-9]*)
+      continue ;; ic_boot_copy_?*|ic_boot_pg_?*|ic_boot_odoo_?*) ;; *)
+      continue ;; esac; c=$(printf '%s\n' "$j" | sed -n
+      's/^[[:space:]]*"Created": *"\([^"]*\)".*/\1/p' | head -n 1); t=$(date
+      -d "$c" +%s 2>/dev/null) || continue; [ $((now - t)) -ge 86400 ] ||
+      continue; docker rm -f "$id" >/dev/null 2>&1 && echo "removed container
+      $n"; done; for v in $(docker volume ls -q --filter dangling=true
+      --filter name=ic_boot_ 2>/dev/null); do case "$v" in
+      ic_boot_*[!0-9]*|ic_boot_) continue ;; ic_boot_*) ;; *) continue ;;
+      esac; c=$(docker volume inspect "$v" 2>/dev/null | sed -n
+      's/.*"CreatedAt": *"\([^"]*\)".*/\1/p' | head -n 1); t=$(date -d "$c"
+      +%s 2>/dev/null) || continue; [ $((now - t)) -ge 86400 ] || continue;
+      docker volume rm "$v" >/dev/null 2>&1 && echo "removed volume $v"; done;
+      for id in $(docker network ls -q --filter name=ic_boot_ 2>/dev/null); do
+      j=$(docker network inspect "$id" 2>/dev/null) || continue; n=$(printf
+      '%s\n' "$j" | sed -n 's/^[[:space:]]*"Name":
+      *"\/\{0,1\}\([^"]*\)".*/\1/p' | head -n 1); case "$n" in
+      ic_boot_*[!0-9]*|ic_boot_) continue ;; ic_boot_*) ;; *) continue ;;
+      esac; c=$(printf '%s\n' "$j" | sed -n 's/^[[:space:]]*"Created":
+      *"\([^"]*\)".*/\1/p' | head -n 1); t=$(date -d "$c" +%s 2>/dev/null) ||
+      continue; [ $((now - t)) -ge 86400 ] || continue; docker network rm
+      "$id" >/dev/null 2>&1 && echo "removed network $n"; done; if find /tmp
+      -mindepth 1 -maxdepth 1 -type d -name 'ic_boot_[0-9]*' -mmin +1440
+      -print -quit 2>/dev/null | grep -q .; then docker run --rm -v
+      /tmp:/host_tmp alpine find /host_tmp -mindepth 1 -maxdepth 1 -type d
+      -name 'ic_boot_[0-9]*' -mmin +1440 -exec rm -rf {} + ; fi; true
+
+  tasks:
+    # First, so a prune that fails has still swept; as the account the
+    # panel connects as, never through a link (see ``TMP_SWEEP``). A
+    # sweep that cannot remove everything leaves the rest for the next
+    # day: it never fails the play. A shell: the command needs ``$(id -u)``
+    # and two ``find`` in a row, which the linter cannot see in a variable.
+    - name: Sweep this account's leftovers in /tmp and /var/tmp  # noqa: command-instead-of-shell
+      ansible.builtin.shell:
+        cmd: "{{ ic_tmp_sweep }}"
+      changed_when: false
+      failed_when: false
+
+    # Right after the sweep of /tmp, and like it never fails the play:
+    # what it cannot remove waits for the next night (``boot_test_sweep``).
+    - name: Remove the copies boot tests left behind  # noqa: command-instead-of-shell
+      ansible.builtin.shell:
+        cmd: "{{ ic_boot_test_sweep }}"
+      register: ic_boot_sweep
+      changed_when: "'removed ' in (ic_boot_sweep.stdout | default(''))"
+      failed_when: false
+
+    # Deliberately NOT ``docker system prune``: that prunes networks
+    # too, and a project's network cannot be protected the way its
+    # containers are. Labelling the network changes its definition, so
+    # ``docker compose`` recreates it and tears a live stack down
+    # mid-command; leaving it unlabelled lets the prune delete it the
+    # moment the stack is stopped, because a stopped container releases
+    # its endpoint and the network then counts as unused. That is not a
+    # theory: on 2026-08-20 this play deleted the networks of both
+    # instances kept stopped on purpose, whose labelled containers survived,
+    # and neither stack could start again.
+    #
+    # Pruning only what actually occupies disk sidesteps the choice.
+    # Networks reclaim no space, so never touching them costs nothing.
+    - name: Prune stopped containers, unused images and build cache
+      ansible.builtin.command:
+        cmd: "{{ item }}"
+      loop:
+        - docker container prune -f --filter "label!={{ ic_protect_label }}"
+        - docker image prune -af --filter "label!={{ ic_protect_label }}"
+        - docker builder prune -af
+      register: ic_prune
+      changed_when: true
+
+    # Docker keeps the record of each host's last builds, with their
+    # output: while an image cloned its repositories that output carried
+    # their URLs with a token (10-nov-2026). Emptied every day, for good;
+    # a Docker without ``buildx history`` fails nothing. Builds that run
+    # meanwhile go on.
+    - name: Remove the record of past image builds
+      ansible.builtin.command:
+        cmd: docker buildx history rm --all
+      register: ic_build_history
+      changed_when: ic_build_history.rc == 0
+      failed_when: false
+
+    # The trees of repositories ``deploy.sh fetch-repos`` keeps for the
+    # account's instances (``~/.incubacloud/git-trees``): each instance's
+    # tree is made of hard links to one of them, and links its marker,
+    # ``head``. A tree whose marker no instance links any more (one link
+    # left) and has not changed for two hours (longer than any job, so not
+    # one a job is linking now) goes, with the temporary trees of
+    # downloads killed that long ago. Never through a link; never fails
+    # the play.
+    #
+    # The cache's lock (``.lock``), which a job holds shared while it
+    # checks, links or stores a tree, is taken exclusive without waiting:
+    # held, nothing goes until the next night. An entry a cut removal left
+    # without its ``head`` goes too, two hours on (10-nov-2026).
+    - name: Remove the cached repository trees no instance uses  # noqa: command-instead-of-shell
+      ansible.builtin.shell:
+        cmd: >-
+          d="$HOME/.incubacloud/git-trees"; if [ -d "$d" ] && [ ! -L "$d" ] && [
+          ! -L "$d/.lock" ] && exec 9>>"$d/.lock" && flock -n -x 9; then find
+          "$d" -mindepth 2 -maxdepth 2 -type f -name head -links 1 -cmin +120
+          -exec sh -c 'rm -rf -- "${1%/head}"' sh {} \; ; find "$d" -mindepth 1
+          -maxdepth 1 -type d -name '.tmp-*' -mmin +120 -exec rm -rf {} +; find
+          "$d" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -mmin +120 ! -exec
+          test -e {}/head \; -exec rm -rf {} +; fi
+      changed_when: false
+      failed_when: false
+
+    # The image ``deploy.sh fetch-repos`` runs git in, under the local tag
+    # with the label the prune above spares, as ``ic_git_helper_prepare``
+    # (``scripts/lib/common.sh``) makes it: prepared here, after the prune,
+    # so no job pays its pull, about 730 MB, and with a cap on it; then the
+    # tags of other digests go, which the label would keep for ever, about
+    # 2 GB each (10-nov-2026). Only on a host with an
+    # instance that fetches (``ic_git_helper_image``); never fails the play.
+    - name: Prepare the git helper image  # noqa: command-instead-of-shell risky-shell-pipe
+      ansible.builtin.shell:
+        cmd: >-
+          img='{{ ic_git_helper_image }}'; tag="incubacloud-git-helper:$(printf
+          '%s' "${img##*@sha256:}" | cut -c1-12)"; docker image inspect "$tag"
+          >/dev/null 2>&1 || printf 'FROM %s\nLABEL {{ ic_protect_label }}\n'
+          "$img" | timeout -k 5 900 docker build -q -t "$tag" - >/dev/null;
+          docker image ls --format '{% raw %}{{.Repository}}:{{.Tag}}{% endraw %}'
+          incubacloud-git-helper 2>/dev/null | while read -r old; do [ "$old" =
+          "$tag" ] || docker image rm "$old" >/dev/null 2>&1; done; true
+      when: (ic_git_helper_image | default('')) is search('@sha256:')
+      changed_when: false
+      failed_when: false
+
+    # Post-prune inventory: every container still present, any state.
+    # The panel compares it against the containers each deployed
+    # instance must have, so a prune that swept a managed stack is
+    # alerted the minute it happens instead of surfacing days later as
+    # a failed backup. Docker's {{.Names}} template is wrapped in
+    # {% raw %} so Ansible does not try to expand it as Jinja2.
+    - name: Inventory the surviving containers
+      ansible.builtin.command:
+        cmd: "docker ps -a --format {% raw %}'{{.Names}}'{% endraw %}"
+      register: ic_survivors
+      changed_when: false
+
+    # The networks deleted instances left behind, and how many networks
+    # the host uses against how many its pools allow. The panel builds
+    # the command (``network_sweep``): it alone knows which projects are
+    # instances. Never fails the play: what it cannot remove waits for
+    # the next night. Before the inventory below, which then counts
+    # what is left.
+    - name: Sweep the networks deleted instances left behind  # noqa: command-instead-of-shell
+      ansible.builtin.shell:
+        cmd: "{{ ic_network_sweep | default('true') }}"
+      register: ic_net_sweep
+      changed_when: "'removed ' in (ic_net_sweep.stdout | default(''))"
+      failed_when: false
+
+    # Post-prune network inventory. The container check below cannot
+    # see this failure mode: the containers survive, the network does
+    # not, and the stack is unstartable until it is recreated. It
+    # surfaced days later as a failed backup, which is exactly what
+    # these checks exist to prevent.
+    - name: Inventory the surviving networks
+      ansible.builtin.command:
+        cmd: "docker network ls --format {% raw %}'{{.Name}}'{% endraw %}"
+      register: ic_networks
+      changed_when: false
+
+    - name: Export the reclaimed-space summary
+      ansible.builtin.set_stats:
+        aggregate: false
+        data:
+          ic_prune_stdout: >-
+            {{ ic_prune.results | map(attribute='stdout')
+               | select('string') | join('\n') }}
+          ic_containers_after: "{{ ic_survivors.stdout | default('') }}"
+          ic_networks_after: "{{ ic_networks.stdout | default('') }}"
+          ic_network_sweep_stdout: "{{ ic_net_sweep.stdout | default('') }}"

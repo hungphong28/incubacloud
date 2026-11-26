@@ -1,0 +1,730 @@
+<templates>
+
+    <t t-name="incubacloud.ProjectDetail">
+        <div class="ic-host-detail">
+
+            <t t-if="state.loading">
+                <div class="ic-rl-detail-scroll">
+                    <div class="ic-detail-loading">Loading project…</div>
+                </div>
+            </t>
+
+            <!-- Onboarding: no instances yet -->
+            <t t-elif="showOnboarding">
+                <div class="ic-rl-detail-scroll">
+                    <div class="rl-page">
+                        <div class="rl-stub ic-pd-onboarding">
+                            <span class="rl-si"><i class="fa fa-cloud"/></span>
+                            <h3>No instances yet</h3>
+                            <p>
+                                Create your first instance to get started with
+                                <strong t-esc="state.project.name"/>.
+                            </p>
+                            <div class="rl-grid rl-grid-2 ic-pd-onboarding-cards">
+                                <div class="rl-ghcard ic-pd-onboard-card env-production"
+                                     t-on-click="() => this.createInstance('production')">
+                                    <span class="rl-ghi"><t t-out="env.icon('rocket', 22)"/></span>
+                                    <h3>Production</h3>
+                                    <p>Live environment</p>
+                                </div>
+                                <!-- Not a way in: a staging is a copy of
+                                     production, and a customer used to
+                                     starting on a development copy made
+                                     staging their only instance. -->
+                                <div class="rl-ghcard ic-pd-onboard-card env-staging is-disabled"
+                                     aria-disabled="true">
+                                    <span class="rl-ghi"><t t-out="env.icon('flask', 22)"/></span>
+                                    <h3>Staging</h3>
+                                    <p>A copy of your production instance, to try changes on. Create production first, then clone it from the side menu.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </t>
+
+            <t t-elif="isCreate or state.project">
+
+                <div class="ic-rl-detail-scroll">
+                    <div class="rl-page">
+
+                        <!-- Breadcrumb (edit, non-embedded) -->
+                        <t t-if="!isCreate and !props.embedded">
+                            <div class="rl-crumb">
+                                <a t-on-click="goBack">Projects</a>
+                                <span class="rl-sep">/</span>
+                                <span class="rl-cur" t-esc="state.form.name or state.project.name"/>
+                            </div>
+                        </t>
+                        <t t-elif="isCreate and !props.embedded">
+                            <div class="rl-crumb">
+                                <a t-on-click="goBack">Projects</a>
+                                <span class="rl-sep">/</span>
+                                <span class="rl-cur">New project</span>
+                            </div>
+                        </t>
+
+                        <!-- Header -->
+                        <div class="rl-phead">
+                            <div class="rl-htext">
+                                <h1 class="rl-ptitle">
+                                    <t t-if="isCreate">New Project</t>
+                                    <t t-else="">Settings</t>
+                                    <t t-if="state.form.odoo_version">
+                                        <span class="rl-env" style="color:var(--rl-fg2)">Odoo <t t-esc="state.form.odoo_version"/></span>
+                                    </t>
+                                    <t t-if="!isCreate">
+                                        <span t-att-class="'rl-sb ' + statusBadgeClass(state.project.status)">
+                                            <span class="rl-d"/><t t-esc="statusLabel(state.project.status)"/>
+                                        </span>
+                                    </t>
+                                </h1>
+                                <t t-if="!isCreate and !props.embedded">
+                                    <p class="rl-psub">
+                                        <t t-esc="state.project.instance_count"/> instance<t t-if="state.project.instance_count !== 1">s</t>
+                                    </p>
+                                </t>
+                            </div>
+                            <!-- Same trash as the instance header, so
+                                 deleting does not mean scrolling to the
+                                 footer of a long form. -->
+                            <t t-if="!isCreate and canDeleteProject">
+                                <div class="rl-pactions">
+                                    <button class="rl-iconbtn danger"
+                                            title="Delete"
+                                            aria-label="Delete project"
+                                            t-on-click="deleteProject">
+                                        <t t-out="env.icon('trash', 15)"/>
+                                    </button>
+                                </div>
+                            </t>
+                        </div>
+
+                        <!-- Tabs -->
+                        <div class="rl-tabs" role="tablist">
+                            <button t-att-class="state.tab === 'general' ? 'rl-tab active' : 'rl-tab'"
+                                    role="tab"
+                                    t-att-aria-selected="state.tab === 'general' ? 'true' : 'false'"
+                                    t-on-click="() => this.setTab('general')">General</button>
+                            <button t-att-class="state.tab === 'repos' ? 'rl-tab active' : 'rl-tab'"
+                                    role="tab"
+                                    t-att-aria-selected="state.tab === 'repos' ? 'true' : 'false'"
+                                    t-on-click="() => this.setTab('repos')">
+                                Repositories
+                                <t t-if="state.repos.length">
+                                    <span class="ic-tab-count" t-esc="state.repos.length"/>
+                                </t>
+                            </button>
+                            <button t-att-class="state.tab === 'deps' ? 'rl-tab active' : 'rl-tab'"
+                                    role="tab"
+                                    t-att-aria-selected="state.tab === 'deps' ? 'true' : 'false'"
+                                    t-on-click="() => this.setTab('deps')">Dependencies</button>
+                            <t t-if="env.permissions?.can_create_project">
+                                <button t-att-class="state.tab === 'members' ? 'rl-tab active' : 'rl-tab'"
+                                        role="tab"
+                                        t-att-aria-selected="state.tab === 'members' ? 'true' : 'false'"
+                                        t-on-click="() => this.setTab('members')">
+                                    Members
+                                    <t t-if="state.members and state.members.length">
+                                        <span class="ic-tab-count" t-esc="state.members.length"/>
+                                    </t>
+                                </button>
+                            </t>
+                            <!-- Only when there is something archived: an
+                                 always-present empty tab would be noise on
+                                 every project, which is nearly all of them. -->
+                            <t t-if="state.archived.length">
+                                <button t-att-class="state.tab === 'archived' ? 'rl-tab active' : 'rl-tab'"
+                                        role="tab"
+                                        t-att-aria-selected="state.tab === 'archived' ? 'true' : 'false'"
+                                        t-on-click="() => this.setTab('archived')">
+                                    Archived
+                                    <span class="ic-tab-count" t-esc="state.archived.length"/>
+                                </button>
+                            </t>
+                        </div>
+
+                        <!-- Body -->
+                        <div class="ic-pd-body">
+
+                            <!-- General tab: one page of group cards on the
+                                 12-column grid (form standard §2, §3) -->
+                            <t t-if="state.tab === 'general'">
+                                <div class="ic-rec-col">
+                                    <div class="ic-set-block">
+                                        <div class="ic-set-block__body">
+                                            <div class="ic-rgrid">
+                                                <div class="rl-frow ic-w-m"
+                                                     t-att-class="validator.fieldError('name') ? 'has-error' : ''">
+                                                    <label for="pd-name">Name <span class="rl-req">*</span></label>
+                                                    <input id="pd-name"
+                    t-att-aria-invalid="validator.fieldError('name') ? 'true' : undefined"
+                    t-att-aria-describedby="validator.fieldError('name') ? 'pd-err-name' : undefined"
+                                                           t-att-value="state.form.name"
+                                                           t-on-input="(ev) => this.onInput('name', ev)"
+                                                           t-on-blur="() => validator.touch('name')"/>
+                                                    <t t-if="validator.fieldError('name')">
+                                                        <span class="ic-field-error"
+                      t-att-id="'pd-err-name'" t-esc="validator.fieldError('name')"/>
+                                                    </t>
+                                                </div>
+                                                <div class="rl-frow ic-w-s"
+                                                     t-att-class="validator.fieldError('odoo_version') ? 'has-error' : ''">
+                                                    <label for="pd-odoo_version">Odoo version<span class="rl-req"> *</span></label>
+                                                    <RlSelect id="'pd-odoo_version'"
+                                                              options="odooVersions"
+                    ariaInvalid="validator.fieldError('odoo_version') ? true : false"
+                    ariaDescribedby="validator.fieldError('odoo_version') ? 'pd-err-odoo_version' : undefined"
+                                                              value="state.form.odoo_version"
+                                                              onChange="(value) => this.onInput('odoo_version', { target: { value: value } })"
+                                                              ariaLabel="'Odoo version'"/>
+                                                    <t t-if="validator.fieldError('odoo_version')">
+                                                        <span class="ic-field-error"
+                      t-att-id="'pd-err-odoo_version'" t-esc="validator.fieldError('odoo_version')"/>
+                                                    </t>
+                                                </div>
+                                                <div class="ic-w-s ic-rgrid__gap" aria-hidden="true"/>
+                                                <div class="rl-frow ic-w-l">
+                                                    <label for="pd-tags">Tags</label>
+                                                    <TagSelector
+                                                        id="'pd-tags'"
+                                                        selected="state.selectedTags"
+                                                        available="state.allTags"
+                                                        onAdd.bind="addTag"
+                                                        onRemove.bind="removeTag"
+                                                        onCreate.bind="createTag"
+                                                    />
+                                                </div>
+                                                <div class="rl-frow ic-w-l">
+                                                    <label for="pd-description">Description</label>
+                                                    <textarea id="pd-description" rows="5"
+                                                              t-att-value="state.form.description"
+                                                              t-on-input="(ev) => this.onInput('description', ev)"/>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- What every instance of the project starts with -->
+                                    <section class="ic-set-block" aria-labelledby="pd-g-instances">
+                                        <div class="ic-set-block__head">
+                                            <h3 class="ic-set-block__title" id="pd-g-instances">Instances</h3>
+                                        </div>
+                                        <div class="ic-set-block__body">
+                                            <div class="ic-rgrid">
+                                                <div class="rl-frow ic-w-m">
+                                                    <label for="pd-lang">Initial language</label>
+                                                    <div class="ic-lang-picker">
+                                                        <input id="pd-lang" type="text"
+                                                               placeholder="— default (en_US) —"
+                                                               t-att-value="state.langSearch"
+                                                               t-on-input="onLangSearchInput"
+                                                               t-on-focus="() => { this._ensureLangs(); this.state.langOpen = true; }"
+                                                               t-on-blur="onLangBlur"/>
+                                                        <t t-if="state.langOpen">
+                                                            <div class="ic-lang-dropdown">
+                                                                <t t-if="state.langsLoading">
+                                                                    <div class="ic-lang-option" style="opacity:0.5">Loading…</div>
+                                                                </t>
+                                                                <t t-else="">
+                                                                    <div class="ic-lang-option ic-lang-option-default"
+                                                                         t-on-mousedown="() => this.selectLang(null)">
+                                                                        — default (en_US) —
+                                                                    </div>
+                                                                    <t t-foreach="filteredLangs" t-as="lang" t-key="lang.id">
+                                                                        <div t-att-class="'ic-lang-option' + (state.form.odoo_initial_lang === lang.id ? ' selected' : '')"
+                                                                             t-on-mousedown="() => this.selectLang(lang)"
+                                                                             t-esc="lang.name + ' (' + lang.code + ')'"/>
+                                                                    </t>
+                                                                </t>
+                                                            </div>
+                                                        </t>
+                                                    </div>
+                                                </div>
+                                                <div class="rl-frow ic-w-m">
+                                                    <label for="pd-backup_backend">Backup destination <span class="rl-opt">— only for production</span></label>
+                                                    <RlSelect id="'pd-backup_backend'"
+                                                              options="backupBackendOptions"
+                                                              value="state.form.backup_backend_id"
+                                                              disabled="backupBackendLocked"
+                                                              emptyLabel.translate="— Use global default —"
+                                                              onChange="(value) => this.onBackendChange({ target: { value: value } })"/>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </section>
+
+                                    <!-- A staging per pull or merge request; the
+                                         explanation folds under How it works -->
+                                    <SettingsBlock title.translate="Pull request previews"
+                                                   how.translate="Opening a pull request (GitHub) or a merge request (GitLab) on a repository a production instance follows creates a staging on the same host, with the request's branch and a neutralized copy of production data. It is rebuilt on every push and deleted when the request closes.">
+                                        <div class="ic-set-block__body">
+                                            <div class="rl-ftoggle">
+                                                <div class="rl-tl-label" id="pd-pr_reviews-label">Preview instances for pull requests and merge requests</div>
+                                                <button
+                                                    type="button"
+                                                    t-att-class="'rl-sw' + (state.form.pr_reviews_enabled ? ' on' : '')"
+                                                    role="switch"
+                                                    t-att-aria-checked="state.form.pr_reviews_enabled ? 'true' : 'false'"
+                                                    aria-labelledby="pd-pr_reviews-label"
+                                                    t-on-click="() => { state.form.pr_reviews_enabled = !state.form.pr_reviews_enabled; }"
+                                                />
+                                            </div>
+                                        </div>
+                                    </SettingsBlock>
+
+                                    <!-- The answers of the project's repository template -->
+                                    <section class="ic-set-block" aria-labelledby="pd-g-template">
+                                        <div class="ic-set-block__head">
+                                            <h3 class="ic-set-block__title" id="pd-g-template">Project template</h3>
+                                        </div>
+                                        <div class="ic-set-block__body">
+                                            <div class="ic-rgrid">
+                                                <div class="rl-frow ic-w-m">
+                                                    <label for="pd-author">Author</label>
+                                                    <input id="pd-author"
+                                                           placeholder="IncubaCloud"
+                                                           t-att-value="state.form.project_author"
+                                                           t-on-input="(ev) => this.onInput('project_author', ev)"/>
+                                                </div>
+                                                <div class="rl-frow ic-w-m">
+                                                    <label for="pd-license">License</label>
+                                                    <RlSelect id="'pd-license'"
+                                                              options="[
+                                                                  { value: 'no_license',        label: 'No license' },
+                                                                  { value: 'Apache-2.0',        label: 'Apache 2.0' },
+                                                                  { value: 'BSL-1.0',           label: 'Boost Software License 1.0' },
+                                                                  { value: 'AGPL-3.0-or-later', label: 'GNU AGPL 3.0 or later' },
+                                                                  { value: 'LGPL-3.0-or-later', label: 'GNU LGPL 3.0 or later' },
+                                                                  { value: 'MIT',               label: 'MIT' },
+                                                                  { value: 'OEEL-1.0',          label: 'Odoo Enterprise Edition License v1.0' },
+                                                                  { value: 'OPL-1.0',           label: 'Odoo Proprietary License v1.0' },
+                                                              ]"
+                                                              value="state.form.project_license"
+                                                              onChange="(value) => this.onInput('project_license', { target: { value: value } })"/>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </section>
+                                </div>
+                            </t>
+
+                            <!-- Dependencies tab -->
+                            <t t-if="state.tab === 'deps'">
+                                <div class="ic-deps-panel">
+                                    <div class="ic-deps-section-label">pip.txt — Python</div>
+                                    <p t-if="state.pipFocusName" class="ic-deps-focus-hint" role="status"
+                                       t-esc="pipFocusHint"/>
+                                    <div class="ic-code-editor-wrap">
+                                        <div class="ic-code-gutter">
+                                            <t t-foreach="getLineNumbers('pipDeps')" t-as="n" t-key="n">
+                                                <div class="ic-line-num" t-esc="n"/>
+                                            </t>
+                                        </div>
+                                        <textarea t-ref="pipArea"
+                                                  class="ic-code-area"
+                                                  spellcheck="false"
+                                                  autocomplete="off"
+                                                  autocorrect="off"
+                                                  autocapitalize="off"
+                                                  t-att-value="state.pipDeps"
+                                                  t-on-input="onDepsInput"
+                                                  t-on-scroll="onCodeScroll"/>
+                                    </div>
+                                    <div class="ic-deps-section-label" style="margin-top:16px">apt.txt — System</div>
+                                    <div class="ic-code-editor-wrap">
+                                        <div class="ic-code-gutter">
+                                            <t t-foreach="getLineNumbers('aptDeps')" t-as="n" t-key="n">
+                                                <div class="ic-line-num" t-esc="n"/>
+                                            </t>
+                                        </div>
+                                        <textarea class="ic-code-area"
+                                                  spellcheck="false"
+                                                  autocomplete="off"
+                                                  autocorrect="off"
+                                                  autocapitalize="off"
+                                                  t-att-value="state.aptDeps"
+                                                  t-on-input="onAptInput"
+                                                  t-on-scroll="onCodeScroll"/>
+                                    </div>
+                                </div>
+                            </t>
+
+                            <!-- Members tab -->
+                            <t t-if="state.tab === 'members'">
+                                <div class="ic-members-panel">
+                                    <div class="ic-members-add">
+                                        <input type="text"
+                                               class="ic-input"
+                                               placeholder="Search users to add..."
+                                               t-att-value="state.memberSearch || ''"
+                                               t-on-input="(ev) => this.searchMembers(ev.target.value)"/>
+                                    </div>
+                                    <t t-if="state.memberResults and state.memberResults.length">
+                                        <div class="ic-members-results">
+                                            <t t-foreach="state.memberResults" t-as="user" t-key="user.id">
+                                                <div class="ic-member-result"
+                                                     t-on-click="() => this.addMember(user)">
+                                                    <i class="fa fa-user-plus"/>
+                                                    <span t-esc="user.name"/>
+                                                    <small t-if="user.email" t-esc="user.email"/>
+                                                </div>
+                                            </t>
+                                        </div>
+                                    </t>
+                                    <t t-if="state.members and state.members.length">
+                                        <div class="ic-members-list">
+                                            <t t-foreach="state.members" t-as="member" t-key="member.id">
+                                                <div class="ic-member-item">
+                                                    <t t-out="env.icon('user', 15)"/>
+                                                    <span class="ic-member-name" t-esc="member.name"/>
+                                                    <button class="ic-member-remove"
+                                                            t-on-click="() => this.removeMember(member.id)">
+                                                        <t t-out="env.icon('x', 15)"/>
+                                                    </button>
+                                                </div>
+                                            </t>
+                                        </div>
+                                    </t>
+                                    <t t-elif="!state.members or !state.members.length">
+                                        <div class="rl-stub">
+                                            <span class="rl-si"><i class="fa fa-users"/></span>
+                                            <h3>No members assigned</h3>
+                                            <p>Add users to give Stakeholders and Consultants access to this project.</p>
+                                        </div>
+                                    </t>
+                                </div>
+                            </t>
+
+                            <!-- Archived tab -->
+                            <t t-if="state.tab === 'archived'">
+                                <div class="ic-archived-panel">
+                                    <p class="ic-archived-intro">
+                                        These instances were removed from their host but kept in the
+                                        panel. Nothing of them runs anywhere; what is left is the
+                                        backup copy below, and reviving one deploys it again and
+                                        restores that copy into it.
+                                    </p>
+                                    <t t-if="state.archivedError">
+                                        <div class="ic-archived-error" role="alert" t-esc="state.archivedError"/>
+                                    </t>
+                                    <div class="ic-archived-list">
+                                        <t t-foreach="state.archived" t-as="inst" t-key="inst.id">
+                                            <div class="ic-archived-row">
+                                                <div class="ic-archived-main">
+                                                    <span class="ic-archived-name" t-esc="inst.name"/>
+                                                    <span class="rl-tag" t-esc="inst.environment"/>
+                                                    <t t-if="inst.odoo_version">
+                                                        <span class="rl-tag" t-esc="'Odoo ' + inst.odoo_version"/>
+                                                    </t>
+                                                    <span class="ic-archived-when">
+                                                        archived <t t-esc="archivedOn(inst)"/>
+                                                        <t t-if="inst.host_name"> from <t t-esc="inst.host_name"/></t>
+                                                    </span>
+                                                </div>
+                                                <div class="ic-archived-copy">
+                                                    <t t-if="inst.has_copy">
+                                                        <span t-att-class="'rl-sb ' + archivedCopyClass(inst)">
+                                                            <span class="rl-d"/>
+                                                            <t t-esc="archivedCopyLabel(inst)"/>
+                                                        </span>
+                                                        <span class="ic-archived-size" t-esc="archivedSize(inst)"/>
+                                                        <span class="ic-archived-checked" t-esc="archivedCheckedAgo(inst)"/>
+                                                    </t>
+                                                    <t t-else="">
+                                                        <span class="rl-sb draft">
+                                                            <span class="rl-d"/>
+                                                            No copy
+                                                        </span>
+                                                        <span class="ic-archived-checked">
+                                                            archived without a backup destination
+                                                        </span>
+                                                    </t>
+                                                </div>
+                                                <div class="ic-archived-where">
+                                                    <t t-if="inst.backup_backend_name">
+                                                        <span class="ic-archived-backend" t-esc="inst.backup_backend_name"/>
+                                                    </t>
+                                                    <t t-if="inst.backup_dst">
+                                                        <code class="ic-archived-dst" t-esc="inst.backup_dst"/>
+                                                    </t>
+                                                </div>
+                                                <div class="ic-archived-actions">
+                                                    <t t-if="canReviveArchived">
+                                                        <button class="rl-btn rl-btn-sm"
+                                                                t-att-disabled="!canRevive(inst)"
+                                                                t-att-title="canRevive(inst) ? 'Deploy it again and restore its copy' : 'There is no copy left to restore'"
+                                                                t-on-click="() => this.openRevive(inst)">
+                                                            <t t-out="env.icon('refresh', 14)"/> Revive
+                                                        </button>
+                                                    </t>
+                                                    <t t-if="env.permissions?.can_manage_hosts">
+                                                        <button class="rl-btn rl-btn-sm rl-btn-danger"
+                                                                title="Delete the record and erase its copy"
+                                                                t-on-click="() => this.openDeleteArchived(inst)">
+                                                            <t t-out="env.icon('trash', 14)"/> Delete
+                                                        </button>
+                                                    </t>
+                                                </div>
+                                            </div>
+                                        </t>
+                                    </div>
+                                </div>
+                            </t>
+
+                            <!-- Repositories tab — kept mounted to preserve branch cache -->
+                            <div class="rl-repolist ic-repos-list"
+                                 t-att-style="state.tab !== 'repos' ? 'display:none' : ''">
+                                <div class="ic-repos-toolbar">
+                                    <button class="rl-btn rl-btn-ghost rl-btn-sm" t-on-click="addRepo">
+                                        <t t-out="env.icon('plus', 14)"/> Add repository
+                                    </button>
+                                    <t t-if="state.repos.length">
+                                        <button class="rl-btn rl-btn-ghost rl-btn-sm" t-on-click="freezeAllRepos"
+                                                t-att-disabled="state.freezingAll"
+                                                title="Pin all repos to their current HEAD">
+                                            <t t-out="env.icon('lock', 15)"/> Freeze all
+                                        </button>
+                                        <button class="rl-btn rl-btn-ghost rl-btn-sm" t-on-click="unfreezeAllRepos"
+                                                title="Unpin all repos — rebuilds will use branch tips">
+                                            <t t-out="env.icon('unlock', 15)"/> Unfreeze all
+                                        </button>
+                                        <input class="ic-repos-search"
+                                               type="text"
+                                               placeholder="Filter repos…"
+                                               aria-label="Filter repositories"
+                                               t-att-value="state.repoSearch"
+                                               t-on-input="(ev) => { state.repoSearch = ev.target.value; }"/>
+                                    </t>
+                                </div>
+                                <t t-foreach="filteredRepos" t-as="repo" t-key="repo._key">
+                                    <RepoEditor
+                                        repo="repo"
+                                        hasAddons="true"
+                                        repoModel="'cloud.project.repo'"
+                                        onChange="(field, value) => this.onRepoChange(repo._key, field, value)"
+                                        onRemove="() => this.removeRepo(repo._key)"
+                                        preferredBranch="state.form.odoo_version || ''"
+                                        onFetchRequirements="(url, branch) => this._fetchAndMergeRequirements(url, branch)"
+                                    />
+                                </t>
+                                <t t-if="!state.repos.length">
+                                    <div class="ic-repos-empty">
+                                        No repositories yet — click Add to link a repo.
+                                    </div>
+                                </t>
+                            </div>
+
+                        </div>
+
+                        <!-- Footer (create): the button that creates it -->
+                        <div t-if="isCreate" class="rl-formfoot">
+                            <t t-if="!isValid">
+                                <span class="rl-ff-hint">
+                                    <span class="rl-req">*</span> Name and Odoo version are required.
+                                </span>
+                            </t>
+                            <t t-else="">
+                                <span class="rl-ff-hint"/>
+                            </t>
+                            <button class="rl-btn rl-btn-primary"
+                                    t-att-disabled="!isValid || state.saving || null"
+                                    t-on-click="save">
+                                <t t-if="state.saving">
+                                    <i class="fa fa-spinner fa-spin" style="margin-right:5px"/>
+                                    <t t-if="isCreate">Creating…</t>
+                                </t>
+                                <t t-else="">
+                                    <t t-if="isCreate">Create Project</t>
+                                </t>
+                            </button>
+                        </div>
+                        <!-- End of the page (edit): what is wrong, and Delete;
+                             saving is the save bar's -->
+                        <div t-elif="!isValid or canDeleteProject" class="rl-formfoot">
+                            <t t-if="!isValid">
+                                <span class="rl-ff-hint">
+                                    <span class="rl-req">*</span> Name and Odoo version are required.
+                                </span>
+                            </t>
+                            <t t-else="">
+                                <span class="rl-ff-hint"/>
+                            </t>
+                            <t t-if="canDeleteProject">
+                                <button class="rl-btn rl-btn-danger" t-on-click="deleteProject">
+                                    <t t-out="env.icon('trash', 15)"/> Delete
+                                </button>
+                            </t>
+                        </div>
+                        <SaveBar t-if="!isCreate" count="unsavedCount" saving="state.saving"
+                                 canSave="isValid" onSave.bind="save" onDiscard.bind="discard"
+                                 reserveSpace="true"/>
+
+                    </div>
+                </div>
+
+            </t>
+
+            <t t-elif="state.error">
+                <div class="ic-rl-detail-scroll">
+                    <div class="rl-page">
+                        <div class="rl-alert" role="alert">
+                            <span class="rl-ai"><t t-out="env.icon('alert', 18)"/></span>
+                            <div>
+                                <div class="rl-at" t-esc="state.error"/>
+                            </div>
+                        </div>
+                        <button class="rl-btn rl-btn-ghost" style="margin-top:14px" t-on-click="goBack">
+                            <t t-out="env.icon('back', 15)"/> Back to Projects
+                        </button>
+                    </div>
+                </div>
+            </t>
+
+            <!-- Confirm dialog -->
+            <IcConfirmDialog t-if="state.confirmDialog"
+                             title="state.confirmDialog.title"
+                             message="state.confirmDialog.message"
+                             confirmLabel="state.confirmDialog.confirmLabel"
+                             isDanger="state.confirmDialog.isDanger"
+                             onConfirm="state.confirmDialog.onConfirm"
+                             onCancel="state.confirmDialog.onCancel"/>
+
+            <!-- Revive an archived instance -->
+            <IcModal t-if="state.reviveModal"
+                     title="'Revive instance'"
+                     boxClass="'ic-confirm-box'"
+                     onClose="() => this.closeRevive()">
+                <h3 class="ic-confirm-title">
+                    Revive <t t-esc="state.reviveModal.instance.name"/>
+                </h3>
+                <p class="ic-revive-sub">
+                    This deploys the instance again and then restores its archived
+                    copy into it. The copy is checked before anything is deployed,
+                    so if it is gone you get an error instead of an empty instance.
+                </p>
+                <div class="ic-revive-field">
+                    <label for="pd-revive-host">Host</label>
+                    <t t-if="state.reviveModal.loading">
+                        <span class="ic-revive-loading">Loading hosts…</span>
+                    </t>
+                    <t t-elif="!reviveHostOptions.length">
+                        <span class="ic-revive-loading">
+                            No host can take an instance right now.
+                        </span>
+                    </t>
+                    <t t-else="">
+                        <RlSelect id="'pd-revive-host'"
+                                  options="reviveHostOptions"
+                                  value="state.reviveModal.hostId"
+                                  ariaLabel="'Host to revive on'"
+                                  placeholder.translate="Pick a host"
+                                  onChange="(v) => this.setReviveHost(v)"/>
+                    </t>
+                </div>
+                <div class="ic-confirm-actions">
+                    <button class="ic-confirm-btn-cancel"
+                            t-on-click="closeRevive">Cancel</button>
+                    <button class="ic-confirm-btn-ok"
+                            t-att-disabled="state.reviveModal.submitting or !state.reviveModal.hostId"
+                            t-on-click="confirmRevive">
+                        <t t-if="state.reviveModal.submitting">Reviving…</t>
+                        <t t-else="">Revive</t>
+                    </button>
+                </div>
+            </IcModal>
+
+            <!-- Delete an archived instance, chain included -->
+            <IcModal t-if="state.deleteArchivedModal"
+                     title="'Delete archived instance'"
+                     boxClass="'ic-remove-box'"
+                     onClose="() => this.closeDeleteArchived()">
+                <h3 class="ic-confirm-title">Delete archived instance</h3>
+                <p class="ic-confirm-message">
+                    Delete "<strong t-esc="state.deleteArchivedModal.instance.name"/>"
+                    and the backup copy it still owns?
+                </p>
+                <p class="ic-remove-note danger"
+                   t-if="state.deleteArchivedModal.instance.has_copy">
+                    Its copy in
+                    <strong t-esc="state.deleteArchivedModal.instance.backup_backend_name or 'storage'"/>
+                    is erased first, and the record is removed only once that
+                    succeeded — nothing is left behind that no instance owns.
+                    There is no way back from this: the instance is not
+                    running anywhere, so the copy is all there is of it.
+                </p>
+                <p class="ic-remove-note danger" t-else="">
+                    This instance was archived without a backup destination,
+                    so there is nothing left of it but the record.
+                </p>
+
+                <!-- The name is asked for from memory or from the row
+                     behind the dialog: it is NOT rendered selectable in
+                     here, or the barrier would evaporate. -->
+                <label class="ic-remove-typed-label" for="pd-delete-typed">
+                    To delete it, type the instance name:
+                    <input id="pd-delete-typed"
+                           type="text"
+                           class="ic-remove-typed"
+                           autocomplete="off"
+                           spellcheck="false"
+                           t-att-value="state.deleteArchivedModal.typed"
+                           t-on-input="(ev) => this.onDeleteArchivedInput(ev)"/>
+                </label>
+
+                <div class="ic-confirm-actions">
+                    <button class="ic-confirm-btn-cancel"
+                            t-on-click="closeDeleteArchived">Cancel</button>
+                    <button class="ic-confirm-btn-ok danger"
+                            t-att-disabled="!deleteArchivedConfirmed or state.deleteArchivedModal.submitting"
+                            t-on-click="confirmDeleteArchived">
+                        <t t-if="state.deleteArchivedModal.submitting">Deleting…</t>
+                        <t t-else="">Delete</t>
+                    </button>
+                </div>
+            </IcModal>
+
+            <!-- Pip conflict resolve modal -->
+            <IcModal t-if="state.pipConflictModal"
+                     title="'Resolve Pip Conflicts'"
+                     boxClass="'ic-confirm-box ah-resolve-box'"
+                     onClose="() => this.closePipConflictModal()">
+                <h3 class="ic-confirm-title">Resolve Pip Conflicts</h3>
+                <p class="ah-resolve-sub">Choose which version spec to keep for each package:</p>
+                <div class="ah-conflicts-list">
+                    <t t-foreach="state.pipConflictModal.conflicts" t-as="c" t-key="c.name">
+                        <div class="ah-conflict-row">
+                            <span class="ah-conflict-pkg" t-esc="c.name"/>
+                            <div class="ah-conflict-options">
+                                <label class="ah-conflict-opt">
+                                    <input type="radio"
+                                           t-att-name="'conflict_' + c.name"
+                                           t-att-checked="state.pipConflictModal.choices[c.name] === c.existing"
+                                           t-on-change="() => this.setPipChoice(c.name, c.existing)"/>
+                                    <code t-esc="c.existing"/>
+                                    <span class="ah-conflict-hint"
+                                          t-esc="'(' + (c.existingSource || 'existing') + ')'"/>
+                                </label>
+                                <label class="ah-conflict-opt">
+                                    <input type="radio"
+                                           t-att-name="'conflict_' + c.name"
+                                           t-att-checked="state.pipConflictModal.choices[c.name] === c.incoming"
+                                           t-on-change="() => this.setPipChoice(c.name, c.incoming)"/>
+                                    <code t-esc="c.incoming"/>
+                                    <span class="ah-conflict-hint"
+                                          t-esc="'(' + (c.incomingSource || 'incoming') + ')'"/>
+                                </label>
+                            </div>
+                        </div>
+                    </t>
+                </div>
+                <div class="ic-confirm-actions ah-resolve-actions">
+                    <button class="ic-confirm-btn-cancel" t-on-click="closePipConflictModal">Edit Manually</button>
+                    <button class="ic-confirm-btn-ok" t-on-click="confirmPipResolve">Apply &amp; Resolve</button>
+                </div>
+            </IcModal>
+
+        </div>
+    </t>
+
+</templates>

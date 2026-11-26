@@ -1,0 +1,669 @@
+#!/usr/bin/env bash
+# Shared helpers sourced by every incubacloud remote operation script.
+#
+# Entry scripts live next to this file under ``scripts/`` and are
+# uploaded to the host by ``AbstractExecutor.run_script()``, which
+# invokes them as ``bash <dir>/<name>.sh <args...>``. Source this
+# library with:
+#
+#     source "$(dirname "$0")/lib/common.sh"
+#
+# It deliberately does NOT enable strict mode on behalf of its caller:
+# every entry script declares its own ``set -euo pipefail`` so that
+# choice stays visible where the script is read.
+#
+# The ERROR prefix is not cosmetic: the job log classifier renders any
+# line matching \b(ERROR|FATAL|CRITICAL)\b as a red [err] entry, so
+# ic_die surfaces correctly in the panel without extra plumbing.
+
+#: The ``timeout`` for the calls whose status says why they ended. The
+#: uutils one of Ubuntu 26.04 answers a TERM from outside with 124 whatever
+#: the child did, so a stopped call would read as one out of time; the GNU
+#: one, kept there as ``gnutimeout``, passes the child's status on.
+IC_TIMEOUT="$(command -v gnutimeout || printf timeout)"
+
+# Print a progress line to the job log.
+ic_log() {
+    printf '[incubacloud] %s\n' "$*"
+}
+
+# Print a non-fatal warning to the job log.
+ic_warn() {
+    printf '[incubacloud] WARNING: %s\n' "$*" >&2
+}
+
+# Print an error and abort the script with a non-zero exit status.
+ic_die() {
+    printf '[incubacloud] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+# Run a command in a session of its own, where a stop's TERM, sent to the
+# caller's session and to its process group, does not reach it: for the
+# docker calls of a trap that has to finish what it started. The docker
+# client sets its own signal handlers, so a TERM the calling shell ignores
+# still kills it. Without ``setsid`` (util-linux), as it is.
+_apart() {
+    if command -v setsid >/dev/null 2>&1; then
+        setsid -w "$@"
+    else
+        "$@"
+    fi
+}
+
+# Expand a leading ``~/`` in a path.
+#
+# Instance directories are stored as ``~/project/instance`` (see
+# cloud.instance.get_remote_dir) and reach a script as a quoted
+# argument, so the shell never expands the tilde for us. Expanding it
+# here — on the host, against the real $HOME — is also more correct than
+# guessing the remote home from the panel.
+ic_expand_home() {
+    # SC2088 fires on the literal tilde in these patterns, which is
+    # precisely the point: we are matching an *unexpanded* tilde that
+    # arrived as data, not writing one we expect the shell to expand.
+    # shellcheck disable=SC2088
+    case "$1" in
+        "~") printf '%s\n' "$HOME" ;;
+        "~/"*) printf '%s\n' "${HOME}${1#\~}" ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+# Run copier with a git cache of the template all its own.
+#
+# Copier keeps one mirror of the template per account, and every run writes to
+# the mirror's config ("git submodule sync"). Git does not wait for that file's
+# lock: two runs meeting there fail with "could not lock config file", and a
+# panel claimed in the same second as another on its host stayed in error (load
+# test, 2-nov-2026). The mirror is 3 MB, so one per run costs a second or two,
+# and every run already asks GitHub for what is new. Copier 9.15, on the oldest
+# hosts, has no cache and ignores the variable.
+#
+# With IC_COPIER_SETTINGS naming a file, copier reads its settings from it
+# (COPIER_SETTINGS_PATH): the panel writes there the defaults of questions the
+# template never asks, which reach the render and, on an update, the replay of
+# the project's last one (``_odoo_versions.copier_defaults``).
+#
+# Arguments: what copier takes. Returns copier's exit status.
+ic_copier() {
+    local cache status=0
+    local -a settings=()
+    if [ -n "${IC_COPIER_SETTINGS:-}" ]; then
+        settings=(env "COPIER_SETTINGS_PATH=$IC_COPIER_SETTINGS")
+    fi
+    cache="$(mktemp -d -t ic-copier-cache.XXXXXXXX)"
+    COPIER_CACHE_DIR="$cache" "${settings[@]}" "$HOME/.local/bin/copier" "$@" \
+        || status=$?
+    rm -rf "$cache"
+    return "$status"
+}
+
+# Keep a path of the copier project out of its git repository's index.
+#
+# The project directory is a git repository, and a rebuild commits
+# whatever it holds before ``copier update`` (rebuild.sh commit-dirty).
+# Two kinds of path do not belong in it:
+#
+# * What the instance's stack writes on its own: Odoo its live log in
+#   ``logs/`` (instance_logs.sh), continuous recovery's pitr agent its
+#   spool in ``.walg/`` (incubacloud_pitr), a mark per uploaded segment,
+#   their removal an hour later and each filestore copy. Tracked, the
+#   working tree goes dirty again between ``git add -A`` and the moment
+#   ``copier update`` looks — and copier refuses to run on a dirty tree,
+#   failing the whole rebuild after every other step has already
+#   succeeded. Measured in production for the log: only the instance
+#   with live traffic failed; its idle sibling, rebuilt in the same
+#   second, did not. In QA for the spool (run 7016, 2026-10-27): a plan
+#   change, whose failure holds the instance's queue.
+# * Secrets: committed, they stay in the history for good, past any
+#   rotation of the file.
+#
+# Written to ``.git/info/exclude`` and not ``.gitignore`` because copier
+# owns ``.gitignore``: editing it would provoke the very template
+# conflict this exists to avoid.
+#
+# Nothing here is fatal. Failing to exclude leaves the path in the next
+# commit, which is worse than a rebuild but not worse than aborting one.
+#
+# Usage: ic_git_exclude <dir> <path>
+#   <dir>   the copier project directory
+#   <path>  relative to it, as a .gitignore line anchored at its top: a
+#           directory ends in ``/`` (``logs/``), a file or a pattern
+#           does not (``odoo/custom/conf.d/*.conf``)
+ic_git_exclude() {
+    local dir="$1" path="$2" exclude
+    [ -d "$dir/.git" ] || return 0
+    exclude="$dir/.git/info/exclude"
+    mkdir -p "$dir/.git/info" 2>/dev/null || true
+    if ! grep -qxF "/$path" "$exclude" 2>/dev/null; then
+        # A file not ending in a newline would glue the pattern onto
+        # whatever the last line happens to be.
+        if [ -s "$exclude" ] && [ -n "$(tail -c 1 "$exclude")" ]; then
+            printf '\n' >> "$exclude" 2>/dev/null || true
+        fi
+        printf '/%s\n' "$path" >> "$exclude" 2>/dev/null \
+            || ic_warn "could not write $exclude: $path stays tracked"
+    fi
+    # Untrack what earlier rebuilds already committed. ``--cached``
+    # leaves every file on disk: this only takes them out of the index.
+    # ``-f`` because git refuses a path staged with content that neither
+    # HEAD nor the disk has (a commit that failed after staging, then a
+    # file rewritten), and ``--cached`` makes forcing it lose nothing.
+    if git -C "$dir" ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+        git -C "$dir" rm -r --cached -f --quiet "$path" \
+            || ic_warn "could not untrack $path in $dir: the next commit still takes it"
+    fi
+}
+
+# Print the local tag a host keeps the git helper image <image> under:
+# ``incubacloud-git-helper:`` and the first 12 hex of its digest. An
+# image not pinned by digest is printed as it is.
+#
+# Usage: ic_git_helper_tag <image>
+ic_git_helper_tag() {
+    local image="$1" digest
+    if [[ "$image" != *@sha256:* ]]; then
+        printf '%s' "$image"
+        return 0
+    fi
+    digest="${image##*@sha256:}"
+    printf 'incubacloud-git-helper:%s' "${digest:0:12}"
+}
+
+# Seconds the pull of the git helper image may take when a job has to
+# prepare it (ic_git_helper_prepare): about 730 MB, which the daily
+# maintenance prepares beforehand on a host whose instances fetch their
+# repositories, so a job pays it only on a host that has not had that
+# night yet. A cap of its own, so a slow registry fails the step saying
+# so instead of eating the download's budget (10-nov-2026).
+# IC_GIT_HELPER_PULL_TIMEOUT overrides it (Full setup gives it longer).
+IC_GIT_HELPER_PULL_TIMEOUT="${IC_GIT_HELPER_PULL_TIMEOUT:-300}"
+
+# Make sure the host has the git helper image <image> under its local tag
+# (ic_git_helper_tag), built from it with the label the daily prune spares
+# (``incubacloud.protect=1``): the prune removes every image no container
+# uses, and the helper would be pulled again, hundreds of MB, every day.
+# The tag takes no more disk than the image. The pull has its own cap
+# (IC_GIT_HELPER_PULL_TIMEOUT). Then the tags of other digests go
+# (ic_git_helper_drop_old). <docker> is the command that runs Docker
+# (``sudo docker`` while a host is being prepared).
+#
+# Usage: ic_git_helper_prepare <image> [docker...]
+# Returns 0 when the tag is there, Docker's status otherwise (124 or 137
+# when the pull ran out of time).
+ic_git_helper_prepare() {
+    local image="$1" tag
+    shift
+    [ "$#" -gt 0 ] || set -- docker
+    tag="$(ic_git_helper_tag "$image")"
+    [ "$tag" != "$image" ] || return 0
+    if ! "$@" image inspect "$tag" >/dev/null 2>&1; then
+        printf 'FROM %s\nLABEL incubacloud.protect=1\n' "$image" \
+            | "$IC_TIMEOUT" -k 5 "$IC_GIT_HELPER_PULL_TIMEOUT" "$@" build -q -t "$tag" - \
+            >/dev/null || return
+    fi
+    ic_git_helper_drop_old "$tag" "$@"
+}
+
+# Remove every local ``incubacloud-git-helper`` tag but <tag>: the label
+# that spares the helper from the daily prune would otherwise keep the
+# tag of each digest core used before, about 2 GB a change on every host
+# (10-nov-2026). A tag a running container still uses is
+# left for the next time; this never fails.
+#
+# Usage: ic_git_helper_drop_old <tag> [docker...]
+ic_git_helper_drop_old() {
+    local tag="$1" old
+    shift
+    [ "$#" -gt 0 ] || set -- docker
+    while IFS= read -r old; do
+        if [ -n "$old" ] && [ "$old" != "$tag" ]; then
+            "$@" image rm "$old" >/dev/null 2>&1 || true
+        fi
+    done < <("$@" image ls --format '{{.Repository}}:{{.Tag}}' \
+        incubacloud-git-helper 2>/dev/null || true)
+}
+
+# Keep the instance's live Odoo log out of the copier repo's index
+# (see ic_git_exclude).
+#
+# Usage: ic_git_exclude_logs <dir>
+ic_git_exclude_logs() {
+    ic_git_exclude "$1" logs/
+}
+
+# Abort unless a script received the arguments it needs.
+# Usage: ic_require_args <needed> "$#" "<usage line>"
+ic_require_args() {
+    local needed="$1" given="$2" usage="${3-}"
+    if [ "$given" -lt "$needed" ]; then
+        ic_die "expected at least ${needed} argument(s), got ${given}.${usage:+ Usage: ${usage}}"
+    fi
+}
+
+# Print Docker Compose's version when it is older than <major>.<minor>;
+# nothing when it is that one or later, or its version cannot be read.
+# Usage: ic_compose_older_than <major> <minor>
+ic_compose_older_than() {
+    local version
+    version="$(docker compose version --short 2>/dev/null || true)"
+    version="${version#v}"
+    [[ "$version" =~ ^([0-9]+)\.([0-9]+) ]] || return 0
+    if [ "${BASH_REMATCH[1]}" -lt "$1" ] || {
+        [ "${BASH_REMATCH[1]}" -eq "$1" ] && [ "${BASH_REMATCH[2]}" -lt "$2" ]
+    }; then
+        printf '%s\n' "$version"
+    fi
+}
+
+# Print the service list of the compose in the current directory,
+# retrying once. Returns 1 — with docker's own error in the job log —
+# when the command fails both times.
+#
+# ``docker compose config`` failing and it answering a list without a
+# given service are different facts with different fixes, and a caller
+# that pipes the command straight into ``grep`` cannot tell them apart:
+# a failed read looks exactly like an empty list. Production,
+# 2026-09-19: two deletes fired on one host in the same millisecond,
+# one of them saw the command die in under 110 ms, and the purge
+# reported "this host's compose declares no backup service" — a
+# permanent-drift diagnosis, with "rebuild the instance" as its advice —
+# for something the same command answered correctly 11 minutes later.
+# The stderr that would have said why was going to /dev/null.
+#
+# So the caller only ever sees a real list. The retry is here and not in
+# the executor because the read has no side effects: a second attempt
+# costs two seconds on the host, not a second job.
+#
+# The line logged on retry is deliberate: a transient that a retry
+# absorbs is otherwise invisible, and one that keeps happening should
+# not be.
+ic_compose_services() {
+    local err out attempt
+    err="$(mktemp)"
+    for attempt in 1 2; do
+        if out="$(docker compose config --services 2>"$err")"; then
+            rm -f "$err"
+            printf '%s\n' "$out"
+            return 0
+        fi
+        if [ "$attempt" -eq 1 ]; then
+            # stderr on purpose: stdout is this function's return value
+            # and callers capture it, so a line printed there would be
+            # swallowed into the service list instead of reaching the log.
+            ic_log "docker compose config failed; retrying once in 2s" >&2
+            sleep 2
+        fi
+    done
+    ic_warn "could not read the compose in $PWD; docker compose config said:"
+    sed 's/^/[docker] /' "$err" >&2
+    rm -f "$err"
+    return 1
+}
+
+# ── One-off containers ───────────────────────────────────────────────────
+#
+# A ``docker compose run`` container inherits its service's labels, and
+# what reads those labels takes it for the live service. Traefik routes
+# visitors to a container that serves nothing. Sablier counts it in a
+# sleeping instance's group: while it lives, visitors get the waiting page
+# instead of their panel (QA, 2026-10-22: an ``odoo shell`` push of the
+# panel's settings, in the very seconds the customer first opened the
+# panel), and an expired session or a Sablier restart stops it
+# mid-work. Sablier has no setting to leave one-offs out; it only reads
+# ``sablier.enable``.
+#
+# So every one-off a script starts goes through ic_compose_run, and every
+# "what is running" a script asks goes through ic_running_services. A
+# test (tests/test_oneoff_containers.py) fails on the raw commands.
+
+# The labels that keep a one-off out of Traefik and Sablier; the
+# executors' COMPOSE_RUN (models/abstract_executor.py) carries the same.
+IC_ONEOFF_LABELS=(--label traefik.enable=false --label sablier.enable=false)
+
+# ``docker compose run`` for the compose in the current directory, out of
+# Traefik and Sablier. Takes exactly the arguments ``docker compose run``
+# takes.
+ic_compose_run() {
+    docker compose run "${IC_ONEOFF_LABELS[@]}" "$@"
+}
+
+# Print the services of the compose in the current directory that are
+# running now, one per line, one-off containers left out. Returns 1 when
+# docker cannot list them, so a caller can tell "nothing runs" from
+# "could not read".
+#
+# ``docker compose ps --services --status running`` counts a one-off as
+# its service from compose 2.29 on (the hosts run 5.x), and so do
+# ``ps --format`` and ``ps -q --status running``; 2.20 did not. The
+# ``com.docker.compose.oneoff`` label is what every version agrees on.
+#
+# A container gone between the listing and the inspect (a one-off that
+# just ended) makes ``docker inspect`` fail for that id alone; it is not
+# running, so that is not a failed read.
+ic_running_services() {
+    local ids
+    ids="$(docker compose ps -q --status running)" || return 1
+    [ -n "$ids" ] || return 0
+    # Word splitting is the point: one container id per word.
+    # shellcheck disable=SC2086
+    { docker inspect -f '{{if ne (index .Config.Labels "com.docker.compose.oneoff") "True"}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}' $ids 2>/dev/null || true; } \
+        | awk 'NF' | sort -u
+}
+
+# ── The instance's database tool ─────────────────────────────────────────
+#
+# What dumps and loads an instance's database inside its ``odoo``
+# container depends on the instance's Odoo series, and the panel knows
+# it (``models/_odoo_versions.py``): the executor names it in
+# ``IC_DB_TOOL``, and the two functions below turn an operation into the
+# argv of that tool, in ``IC_DB_ARGS``, so a script reads the same
+# whichever tool is in use:
+#
+#     ic_db_dump_args "$dbname" /host-tmp/out.zip all
+#     ic_compose_run --rm odoo "${IC_DB_ARGS[@]}"
+#
+# ``click-odoo`` (click-odoo-contrib, every series up to 19) and
+# ``odoo-db`` (``odoo db``, Odoo 18 and later, the only one on 20). Unset
+# means click-odoo, so a script run by hand behaves as it always did. A
+# series that needs a third tool is one more case here and a value in
+# its card, nothing else.
+
+# The argv the two functions below build, read by the script that
+# called them ("${IC_DB_ARGS[@]}").
+# shellcheck disable=SC2034  # set here, read by the calling script
+IC_DB_ARGS=()
+
+# Print the tool in use, refusing one this library does not implement.
+ic_db_tool() {
+    local tool="${IC_DB_TOOL:-click-odoo}"
+    case "$tool" in
+        click-odoo|odoo-db) printf '%s\n' "$tool" ;;
+        *) ic_die "unknown database tool: $tool (expected click-odoo or odoo-db)" ;;
+    esac
+}
+
+# Fill IC_DB_ARGS with the argv that dumps <db> into <archive>.
+#   ic_db_dump_args <db> <archive> <all|db>
+# ``all`` carries the filestore, ``db`` the database alone. Both tools
+# write Odoo's own zip (dump.sql, manifest.json, and filestore/ for
+# ``all``), so a download is the same archive whichever tool made it.
+# shellcheck disable=SC2034  # IC_DB_ARGS is read by the calling script
+ic_db_dump_args() {
+    local database="$1" archive="$2" scope="$3" tool
+    tool="$(ic_db_tool)" || exit 1
+    case "$scope" in
+        all|db) ;;
+        *) ic_die "ic_db_dump_args: unknown scope: $scope (expected all or db)" ;;
+    esac
+    case "$tool" in
+        click-odoo)
+            if [ "$scope" = all ]; then
+                IC_DB_ARGS=(click-odoo-backupdb --filestore "$database" "$archive")
+            else
+                IC_DB_ARGS=(click-odoo-backupdb --no-filestore "$database" "$archive")
+            fi
+            ;;
+        odoo-db)
+            if [ "$scope" = all ]; then
+                IC_DB_ARGS=(odoo db dump "$database" "$archive")
+            else
+                IC_DB_ARGS=(odoo db dump --no-filestore "$database" "$archive")
+            fi
+            ;;
+    esac
+}
+
+# Print the way a copy is neutralized, refusing one this library does not
+# implement. Unset means Odoo's own, as for a script run by hand.
+ic_neutralizer() {
+    local way="${IC_NEUTRALIZE:-odoo}"
+    case "$way" in
+        odoo|sql) printf '%s\n' "$way" ;;
+        *) ic_die "unknown neutralizer: $way (expected odoo or sql)" ;;
+    esac
+}
+
+# Fill IC_DB_ARGS with the argv that neutralizes <db> after its load, for a
+# series without Odoo's own (before 16.0); empty when the load did it. What
+# 16.0's neutralize.sql files do that matters on a copy: no scheduled action
+# but the vacuum, no mail in or out, no payment provider charging. The tables
+# differ between series, so each is looked for first.
+#   ic_db_neutralize_args <db>
+# shellcheck disable=SC2034  # IC_DB_ARGS is read by the calling script
+ic_db_neutralize_args() {
+    local database="$1" way
+    way="$(ic_neutralizer)" || exit 1
+    IC_DB_ARGS=()
+    [ "$way" = sql ] || return 0
+    IC_DB_ARGS=(psql -v ON_ERROR_STOP=1 -d "$database" -c "$(cat <<'SQL'
+DO $$
+BEGIN
+    UPDATE ir_cron SET active = false WHERE id NOT IN (
+        SELECT res_id FROM ir_model_data
+        WHERE module = 'base' AND name = 'autovacuum_job'
+    );
+    IF to_regclass('ir_mail_server') IS NOT NULL THEN
+        UPDATE ir_mail_server SET active = false;
+    END IF;
+    IF to_regclass('fetchmail_server') IS NOT NULL THEN
+        UPDATE fetchmail_server SET active = false;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'payment_acquirer' AND column_name = 'state'
+    ) THEN
+        UPDATE payment_acquirer SET state = 'disabled';
+    ELSIF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'payment_acquirer' AND column_name = 'environment'
+    ) THEN
+        UPDATE payment_acquirer SET environment = 'test';
+    END IF;
+    DELETE FROM ir_config_parameter WHERE key = 'database.is_neutralized';
+    INSERT INTO ir_config_parameter (key, value)
+        VALUES ('database.is_neutralized', 'true');
+END $$;
+SQL
+)")
+}
+
+# Fill IC_DB_ARGS with the argv that loads <archive> into <db>, replacing
+# a database of that name, as a copy (a new database uuid, so the copy
+# never answers for the original) and neutralized when <neutralize> is 1.
+# With <as> set to ``move`` it is the same database changing machines: Odoo
+# keeps its ``database.secret`` (the links it signed stay valid), its
+# ``database.uuid`` and its ``web.base.url``, which a copy regenerates.
+# Sessions are not carried: they live in the data dir's ``sessions/``,
+# which the archive does not hold.
+#   ic_db_load_args <db> <archive> <0|1> [copy|move]
+# shellcheck disable=SC2034  # IC_DB_ARGS is read by the calling script
+ic_db_load_args() {
+    local database="$1" archive="$2" neutralize="${3:-0}" as="${4:-copy}" tool
+    tool="$(ic_db_tool)" || exit 1
+    case "$as" in
+        copy|move) ;;
+        *) ic_die "ic_db_load_args: unknown load: $as (expected copy or move)" ;;
+    esac
+    local flags=()
+    # A series without Odoo's own neutralization loads plainly, and its
+    # script then runs what ic_db_neutralize_args builds.
+    [ "$neutralize" = 1 ] && [ "$(ic_neutralizer)" = odoo ] \
+        && flags+=(--neutralize)
+    case "$tool" in
+        click-odoo)
+            IC_DB_ARGS=(click-odoo-restoredb "${flags[@]}" "--$as" --force "$database" "$archive")
+            ;;
+        odoo-db)
+            # ``odoo db load`` copies unless told --move.
+            [ "$as" = move ] && flags+=(--move)
+            IC_DB_ARGS=(odoo db load "${flags[@]}" --force "$database" "$archive")
+            ;;
+    esac
+}
+
+# ── The mark of a rebuild left unapplied (#96) ──────────────────────────
+#
+# ``copier update`` rewrites the stack's files in place, and a rebuild's
+# image build retags the image, before the boot test, the module update
+# and the restart put them in service. A rebuild that ends between the
+# two (stopped, failed, its worker dead) leaves the instance running its
+# previous build over files and an image nothing has tried, and whatever
+# recreates its containers would start them. So ``rebuild.sh
+# copier-update`` lays a mark in the instance's directory right before
+# copier, and the rebuild's restart lifts it (``rebuild.sh
+# clear-unapplied``). The mark holds three lines, ``job=<id>``,
+# ``kind=build|files`` and ``at=<UTC>``: ``build`` from a job that builds
+# the image, ``files`` from one that only rewrites files (a plan change).
+# Only a ``build`` mark holds anything back: what recreates containers
+# (compose_op.sh), a script that boots the image apart, and, from
+# the panel, restores and moves. ``rebuild.sh clear-unapplied <dir>``
+# without a job is the way out by hand (docs/runbooks/RB-42).
+
+#: The mark's name, in the instance's directory; kept out of the
+#: project's repository (``ic_git_exclude``).
+IC_UNAPPLIED_FILE=.incubacloud-unapplied
+#: The exit of a script that refused to go on because of a ``build`` mark
+#: (COMPOSE_OP_EXIT_UNAPPLIED in models/abstract_executor.py).
+IC_EXIT_UNAPPLIED=26
+#: Where the way out by hand is written down.
+IC_UNAPPLIED_DOC="docs/runbooks/RB-42-rebuild-left-unapplied.md"
+
+# Read the mark of <dir> into IC_UNAPPLIED_JOB and IC_UNAPPLIED_KIND.
+# Returns 0 when there is one, 1 when there is none. A mark that cannot
+# be read, or names no kind this library knows, is taken for a
+# ``build`` one: it holds back rather than let an untried image through.
+#
+# Usage: ic_unapplied_read <dir>
+ic_unapplied_read() {
+    local file="$1/$IC_UNAPPLIED_FILE" line
+    IC_UNAPPLIED_JOB=""
+    IC_UNAPPLIED_KIND=""
+    [ -e "$file" ] || return 1
+    if [ -r "$file" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                job=*) IC_UNAPPLIED_JOB="${line#job=}" ;;
+                kind=*) IC_UNAPPLIED_KIND="${line#kind=}" ;;
+            esac
+        done < "$file"
+    fi
+    case "$IC_UNAPPLIED_KIND" in
+        build|files) ;;
+        *) IC_UNAPPLIED_KIND=build ;;
+    esac
+    return 0
+}
+
+# Print what a ``build`` mark read by ic_unapplied_read means, and the
+# ways out, as one sentence for the job log.
+ic_unapplied_message() {
+    printf 'rebuild #%s did not apply what it left on this server (rewritten files and an image neither boot-tested nor applied to the database): rebuild the instance first. To use those files as they are, the mark can be lifted by hand with "rebuild.sh clear-unapplied <dir>" (%s).' \
+        "${IC_UNAPPLIED_JOB:-?}" "$IC_UNAPPLIED_DOC"
+}
+
+# Exit IC_EXIT_UNAPPLIED, saying why, when <dir> holds a ``build`` mark;
+# return 0 otherwise. A ``files`` mark holds nothing back.
+#
+# Usage: ic_unapplied_refuse <dir>
+ic_unapplied_refuse() {
+    ic_unapplied_read "$1" || return 0
+    [ "$IC_UNAPPLIED_KIND" = build ] || return 0
+    printf '[incubacloud] ERROR: %s\n' "$(ic_unapplied_message)" >&2
+    exit "$IC_EXIT_UNAPPLIED"
+}
+
+# Lift the mark of <dir>: only when it is <job>'s, or whichever it is
+# without a job. Never fails: a mark that cannot be removed is warned
+# of, and holds back as before.
+#
+# Usage: ic_unapplied_clear <dir> [<job>]
+ic_unapplied_clear() {
+    local dir="$1" job="${2:-}"
+    ic_unapplied_read "$dir" || return 0
+    if [ -n "$job" ] && [ "$IC_UNAPPLIED_JOB" != "$job" ]; then
+        return 0
+    fi
+    if rm -f "$dir/$IC_UNAPPLIED_FILE"; then
+        ic_log "lifted the mark of rebuild #${IC_UNAPPLIED_JOB:-?} (${IC_UNAPPLIED_KIND})"
+    else
+        ic_warn "could not remove $dir/$IC_UNAPPLIED_FILE: the mark of rebuild #${IC_UNAPPLIED_JOB:-?} stays"
+    fi
+    return 0
+}
+
+# Keep needrestart off cloud-init's hotplug hook, where needrestart is
+# installed (Ubuntu).
+#
+# At the end of every apt run, needrestart restarts the services still on
+# files that run replaced. One of them can be cloud-init's hotplug hook
+# (cloud-init-hotplugd, Ubuntu on Hetzner): Docker's interfaces start it
+# when their MAC begins with 86:, as Hetzner's private networks' do, and it
+# spends seconds to minutes on the metadata service. It is a oneshot unit
+# fed by a FIFO, so restarted by hand it waits on the FIFO for good, and the
+# apt run that restarted it waits with it, holding apt's lock: a Full Setup
+# on Ubuntu 24.04 hung at the pip/venv install until its 3600 s (QA,
+# 15-nov-2026), and an unattended upgrade would stop the patches the same
+# way. Ubuntu's own rule, ``qr(^cloud-(init-local|init|config|final)\.service$)``,
+# does not cover that unit.
+#
+# Writes the drop-in ``50-incubacloud-hotplug.conf`` in needrestart's
+# ``conf.d`` (IC_NEEDRESTART_CONF_DIR in the tests), as root (directly, or
+# through ``sudo -n``), and only when that directory is there. needrestart
+# dies on a drop-in it cannot parse, in every apt run, so the text is first
+# read in a scratch file the way needrestart reads it, and checked to keep
+# the unit out; only then it replaces the drop-in, in one move. A drop-in
+# already saying the same is left as it is. Never prints on stdout.
+#
+# Usage: ic_needrestart_keep_hotplug
+# Returns 0 when the drop-in is in place or needrestart is not installed;
+# 1, after a warning saying why, when the drop-in could not be checked or
+# written (an earlier one, if any, is left as it was).
+ic_needrestart_keep_hotplug() {
+    local dir="${IC_NEEDRESTART_CONF_DIR:-/etc/needrestart/conf.d}"
+    local conf tmp
+    local -a root=()
+    conf="$dir/50-incubacloud-hotplug.conf"
+    [ "$(id -u)" -eq 0 ] || root=(sudo -n)
+    "${root[@]}" test -d "$dir" || return 0
+    tmp="$(mktemp -t ic-needrestart.XXXXXXXX)" || {
+        ic_warn "needrestart: no scratch file for the hotplug drop-in"
+        return 1
+    }
+    # SC2016: the single quotes are intentional: Perl reads ``$nrconf``.
+    # shellcheck disable=SC2016
+    printf '%s\n' \
+        '# Written by IncubaCloud: restarted by hand, this oneshot unit waits' \
+        '# on its FIFO for good, and so does the apt run.' \
+        '$nrconf{override_rc}{qr(^cloud-init-hotplugd)} = 0;' >"$tmp"
+    if "${root[@]}" cmp -s "$tmp" "$conf"; then
+        rm -f "$tmp"
+        return 0
+    fi
+    # As needrestart.conf loads each drop-in: eval of its whole text, and
+    # ``die`` on an error.
+    # shellcheck disable=SC2016
+    if ! perl -e '
+        our %nrconf;
+        my $fn = shift;
+        eval do { local (@ARGV, $/) = $fn; <> };
+        die "Error parsing $fn: $@" if $@;
+        my ($re) = grep { "cloud-init-hotplugd.service" =~ $_ }
+            keys %{ $nrconf{override_rc} || {} };
+        exit(defined $re && !$nrconf{override_rc}{$re} ? 0 : 1);
+    ' "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        ic_warn "needrestart: the hotplug drop-in did not read as needrestart reads it; $conf left as it was"
+        return 1
+    fi
+    if ! "${root[@]}" install -m 0644 "$tmp" "$conf.tmp" \
+            || ! "${root[@]}" mv -f "$conf.tmp" "$conf"; then
+        "${root[@]}" rm -f "$conf.tmp" 2>/dev/null || true
+        rm -f "$tmp"
+        ic_warn "needrestart: could not write $conf"
+        return 1
+    fi
+    rm -f "$tmp"
+    return 0
+}

@@ -1,0 +1,6848 @@
+import asyncio
+import dataclasses
+import hashlib
+import json
+import logging
+import re
+import unicodedata
+from datetime import timedelta
+from urllib.parse import urlsplit
+
+from odoo import _, api, fields, models
+from odoo.exceptions import AccessError, UserError, ValidationError
+from odoo.tools import SQL
+
+from odoo.addons.queue_job.exception import RetryableJobError
+
+from ..github.client import GitHubAPIError, GitHubAppClient
+from ..github.http_utils import HTTPBudget
+from ..net.outbound import OutboundError
+from ..net.restore_source import (
+    curl_resolve_argument,
+    shown_link,
+    split_credentials,
+    validate as validate_restore_url,
+)
+from ..restore_staging import purge_stale
+from . import _odoo_versions, _relay_oauth, sftp_dst
+from ._odoo_versions import ODOO_VERSION_SELECTION
+from ._backup_dst import dst_covers, dst_is_valid, dst_key
+from . import _config_snapshot_diff as _snapshot_diff
+from ._backup_retention import TEMPLATE_BACKUP_RETENTION, valid_backup_retention
+from ._repo_requirements import (
+    GitReadBudget,
+    _normalize_url,
+    detect_addon_conflicts,
+    detect_pip_conflicts,
+)
+from .big_integer import BigInteger
+from .cloud_host import parse_memory_to_gb
+from .cloud_host_whitelist import DEFAULT_WHITELIST
+from .host_probe_executor import MIN_DISK_GB
+from ._concurrency import is_concurrency_error
+from .cloud_gitlab_mr_note import PR_PREVIEW_NOTE_FAILED_CODE
+from .cloud_gitlab_mr_note import MAX_NOTE_PAGES as NOTE_MAX_PAGES
+from .cloud_gitlab_mr_note import RETRY_SECONDS as NOTE_RETRY_SECONDS
+from .cloud_rate_limit import consume_quota, refund_quota
+from .cloud_repo_mixin import _DERIVED_FROM_URL, repo_url_key
+from .cloud_security_mixin import defaults_as_sent
+from .encrypted_char import EncryptedChar
+from .password_utils import generate_password, generate_secret_key
+from .res_users_ext import as_platform
+
+_logger = logging.getLogger(__name__)
+_GLOBAL_BACKUP_PARAM = "incubacloud.backup_backend_id"
+# What the GitHub trees of an addon check may read in all: each answer
+# is parsed whole, so this guards memory, not time.
+_ADDON_CHECK_MAX_BYTES = 128 * 1024 * 1024
+#: How long the addon check of a request a person waits on (a save, a
+#: deploy) may take, every GitHub request included: a GitHub that is
+#: slow with many repositories would otherwise outlast the request.
+ADDON_CHECK_SECONDS = 20
+#: Test mails one production's relay sends in an hour
+#: (``send_relay_test_mail``). Each is a real mail through the provider,
+#: which counts what the mailbox sends (Microsoft 365: 30 a minute,
+#: 10 000 recipients a day); five covers fixing and trying again several
+#: times.
+RELAY_TEST_MAILS_PER_HOUR = 5
+
+# Staging autopurge: how much notice an expiring staging gets, in days
+# before its deadline. Constants rather than settings because the two
+# steps only make sense relative to each other and to the window's
+# lower bound — an operator who could set them independently could
+# order them wrongly and get a final warning before the first one.
+AUTOPURGE_WARN_DAYS = 14
+AUTOPURGE_FINAL_DAYS = 3
+# Two codes and not one that escalates: ``cloud.alert`` only dispatches
+# notifications when the row is *created*, so raising the same alert
+# again at a higher level reaches nobody. The second code is critical,
+# which is the only level the default notification preference delivers.
+AUTOPURGE_WARN_ALERT_CODE = "staging_expiring"
+AUTOPURGE_FINAL_ALERT_CODE = "staging_expiring_final"
+
+
+def _smtp_canonical_domain(inst):
+    """Derive the SMTP canonical domain for SRS and the mailserver hostname.
+
+    Priority:
+      1. Domain part of smtp_relay_user email (user@example.com → example.com)
+      2. Strip first label from smtp_relay_host (mail.example.com → example.com)
+      3. Empty string (copier will skip SMTP service)
+
+    Module-level (not a method) so unit tests can exercise it with a
+    plain attribute namespace, no ORM record required.
+    """
+    user = inst.smtp_relay_user or ""
+    if "@" in user:
+        return user.split("@")[-1]
+    host = inst.smtp_relay_host or ""
+    parts = host.split(".")
+    if len(parts) > 2:
+        return ".".join(parts[1:])
+    return host
+
+# Docker compose project names / COMPOSE_PROJECT_NAME, DNS labels and the
+# path segment used by executors must be lowercase alnum + [_-], 1-63 chars.
+# Blocks every shell metachar (;|&$`"' space \) and path traversal (/ ..).
+_INSTANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
+# ~/..., /..., or relative path. Each segment is [A-Za-z0-9._-]+ and we
+# explicitly reject '..' segments. No shell metacharacters.
+_REMOTE_DIR_RE = re.compile(r"^(~/|/)?[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*/?$")
+
+# PostgreSQL identifier (database / role name). Used in psql -U/-d
+# arguments that flow through SSH shell to docker compose exec, so we
+# must keep them free of any character bash or psql could misinterpret.
+# 1-63 chars, lowercase letter or underscore start, then alnum + '_'.
+_PG_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+
+# The mail relay's host: an RFC 1123 hostname or an IPv4 address, either
+# case. The copier template renders it inside double-quoted YAML scalars
+# of the compose files, so it carries no quote, space, colon or brace.
+_SMTP_HOST_RE = re.compile(
+    r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+)
+
+
+def _yaml_text_unsafe(value, refused='"\\'):
+    """Whether *value* holds a character a one-line YAML scalar cannot.
+
+    One of *refused*, or any Unicode control, format or separator
+    character other than the plain space: YAML reads U+0085, U+2028 and
+    U+2029 as line breaks too.
+
+    :param str value: the text to check.
+    :param str refused: the printable characters refused besides those;
+        a double quote and a backslash by default.
+    :returns: True when one such character is in it.
+    :rtype: bool
+    """
+    return any(
+        ch in refused
+        or (ch != " " and unicodedata.category(ch)[0] in "CZ")
+        for ch in value
+    )
+
+
+def _yaml_dq_escape(value):
+    """Escape *value* for the inside of a double-quoted YAML scalar.
+
+    JSON's string escapes are YAML's: the result, put between the
+    template's double quotes, reads back as *value* itself. Text with
+    nothing to escape comes back unchanged.
+
+    :param str value: the text the template renders.
+    :returns: the escaped text, without the surrounding quotes.
+    :rtype: str
+    """
+    return json.dumps(value or "", ensure_ascii=False)[1:-1]
+
+#: What only the platform writes on an instance (``_check_guarded_vals``).
+#: A move's markers say which jobs a rollback and the watchdog cancel and
+#: on which host the cleanup removes a copy, and the copy a cutover froze
+#: on the old host with its cut's length; a pull or merge request's
+#: identity is what the GitHub or GitLab webhook rebuilds and deletes by
+#: when the request changes or closes, and its state what the merge
+#: request's note follows; ``removal_finalized`` tells a teardown there is
+#: nothing left to remove; the relay's state is what the health probe and
+#: the relay's test mail read of its deliveries. ``move_to_host``, the
+#: rollback, the watchdog, the move's executors, the webhook, the teardown,
+#: the probe and the test mail write them with ``sudo``. The backup path's
+#: suffix keeps an instance's copies out of a path another of the same name
+#: holds (``_claim_own_backup_path``): cleared by hand, its chain would join
+#: that one's.
+_PLATFORM_FIELDS = frozenset({
+    "move_origin_host_id", "move_target_host_id", "move_chain_job_ids",
+    "move_rollback_in_progress", "move_frozen_source_host_id",
+    "move_frozen_until", "move_cut_started_at", "move_last_cut_seconds",
+    "move_cut_parts", "move_last_cut_breakdown",
+    "pr_number", "pr_repo", "pr_head_branch", "pr_comment_id",
+    "pr_installation_id", "pr_provider_id", "pr_state", "pr_update_error",
+    "pr_update_cut_off", "pr_rebuild_failed_job",
+    "removal_finalized",
+    "smtp_relay_state", "smtp_relay_checked_at", "smtp_relay_error",
+    "backup_path_suffix",
+})
+
+#: When an instance was archived and up to when its purge deletes: set by
+#: the platform alone, and cleared by a revive.
+_PLATFORM_STAMPS = frozenset({"archived_at", "purge_cutoff_at"})
+
+#: The least time between an archive and the creation of the instance of
+#: the same name that holds its backup path, for the two to be taken for a
+#: succession (``_backup_succession``). Asked of the gap, not added to the
+#: purges' bounds: what one side would gain the other would lose. The panel's
+#: clock and the storage's, both on NTP, are seconds apart; a minute leaves
+#: room and is far below the time between an archive and a new instance.
+#: Decided on 15-nov-2026.
+_SUCCESSION_MARGIN = timedelta(seconds=60)
+
+#: Where an instance lives on its host and where its copy is kept: the
+#: directory a teardown removes and the place a purge empties. An
+#: administrator's to set, as an import does.
+_MANAGER_FIELDS = frozenset({"custom_remote_dir", "custom_backup_dst"})
+
+
+class CloudInstance(models.Model):
+    _name = "cloud.instance"
+    _inherit = [
+        "cloud.security.mixin",
+        "cloud.audit.tracked.mixin",
+        "cloud.pip.provenance.mixin",
+    ]
+    _description = "Cloud Instance"
+
+    # A partial unique index, not the table constraint ``unique
+    # (project_id, name)`` it was until 1.0.228: PostgreSQL counts the
+    # index of such a constraint as a key, so moving an instance to
+    # another project took its row FOR UPDATE and failed to serialize
+    # every older REPEATABLE READ transaction (a job's) that then stored a
+    # row pointing at it. A partial index is no key. The predicate leaves
+    # out only rows the constraint never compared either (NULLs are
+    # distinct), so the rule is the same. Migration 1.0.228 drops the old
+    # constraint, whose index would otherwise be kept under this name.
+    _name_project_uniq = models.UniqueIndex(
+        "(project_id, name) WHERE project_id IS NOT NULL",
+        "Instance name must be unique within a project.",
+    )
+    _one_production_per_project = models.Constraint(
+        "EXCLUDE (project_id WITH =) WHERE (environment = 'production' AND project_id IS NOT NULL)",
+        "A project can only have one production instance.",
+    )
+
+    active = fields.Boolean(default=True)
+    auto_rebuild = fields.Boolean(
+        string="Auto-Rebuild on Push",
+        default=True,
+        help="Automatically trigger a rebuild when a push event is "
+        "received on a matching (unfrozen) repo branch.",
+    )
+    last_auto_rebuild = fields.Datetime(
+        string="Last Auto-Rebuild",
+        readonly=True,
+    )
+    auto_update = fields.Boolean(
+        string="Auto-Update Modules on Rebuild",
+        default=True,
+        help="Run click-odoo-update during rebuild, and after a database "
+        "is restored into the instance, to apply module "
+        "schema/data changes. Disable for instances that manage "
+        "module state manually or cannot accept automatic updates "
+        "(e.g. frozen production with a change-management policy). "
+        "Disabling also skips the safe boot test that relies on "
+        "click-odoo-update.",
+    )
+    # Its own switch since #91 (decided on 6-nov-2026): before it the only
+    # way to skip the test was to turn off ``auto_update``, which leaves
+    # the modules unapplied too.
+    boot_test = fields.Boolean(
+        string="Test the New Image Before Applying It",
+        default=True,
+        help="Before a rebuild puts its new image into service, it boots "
+        "the image on a copy of the database and updates the copy's "
+        "modules: if that fails, the instance is left as it was. With "
+        "large databases on ext4 the copy takes about 30 minutes for "
+        "every 500 GB. Turned off, the rebuild applies the image and "
+        "the module update straight to the instance, says so first in "
+        "its result and leaves a warning. Independent of Auto-Update "
+        "Modules on Rebuild; with that off there is no boot test either.",
+    )
+
+    # ── Smart rebuild fingerprint ─────────────────────────────────────────
+    rebuild_fingerprint = fields.Char(
+        string="Rebuild Fingerprint",
+        compute="_compute_rebuild_fingerprint",
+        store=True,
+        help="Hash of fields that affect the Docker image. When this "
+        "differs from last_rebuild_fingerprint, a full rebuild "
+        "(--pull --no-cache) is triggered instead of a cached one.",
+    )
+    last_rebuild_fingerprint = fields.Char(
+        string="Last Rebuild Fingerprint",
+        readonly=True,
+        help="Fingerprint saved after the last successful rebuild/deploy.",
+    )
+
+    name = fields.Char(
+        required=True,
+        translate=True,
+    )
+    doodba_project_name = fields.Char(
+        compute="_compute_doodba_project_name",
+        string="Doodba Project Name",
+        help="Composite name used as copier project_name: "
+        "{remote_folder}-{name}. Ensures unique Docker "
+        "container names across projects on the same host.",
+    )
+    project_id = fields.Many2one(
+        comodel_name="cloud.project",
+        string="Project",
+    )
+    host_id = fields.Many2one(
+        comodel_name="cloud.host",
+        string="Host",
+    )
+    move_origin_host_id = fields.Many2one(
+        comodel_name="cloud.host",
+        string="Move Origin Host",
+        copy=False,
+        help="Set to the source host while a cross-host move is in "
+        "flight; cleared once the destination is cut over. A "
+        "non-empty value left after a failed move marks an instance "
+        "an operator can roll back.",
+    )
+    move_target_host_id = fields.Many2one(
+        comodel_name="cloud.host",
+        string="Move Target Host",
+        copy=False,
+        help="Destination host while a cross-host move is in flight; "
+        "cleared on cutover. Lets stuck-move recovery identify the "
+        "half-built destination copy for cleanup.",
+    )
+    move_chain_job_ids = fields.Char(
+        string="Move Chain Job IDs",
+        copy=False,
+        help="Comma-separated cloud.job IDs of the current move chain. "
+        "Set by move_to_host(), cleared on cutover success or "
+        "rollback completion. Lets rollback inspect each step's "
+        "state to decide what to undo.",
+    )
+    move_rollback_in_progress = fields.Boolean(
+        string="Move Rollback In Progress",
+        copy=False,
+        default=False,
+        help="True while a rollback is running. Distinguishes "
+        '"migrating" from "rolling back" in the UI and prevents '
+        "duplicate rollbacks.",
+    )
+    move_frozen_source_host_id = fields.Many2one(
+        comodel_name="cloud.host",
+        string="Frozen Copy Host",
+        copy=False,
+        readonly=True,
+        help="Host where the last move left the instance's old copy, "
+        "stopped and with its data intact, so an operator can still "
+        "restore from it by hand. Cleared once that copy is removed.",
+    )
+    move_frozen_until = fields.Datetime(
+        string="Frozen Copy Until",
+        copy=False,
+        readonly=True,
+        help="When the frozen copy left by the last move may be removed. "
+        "An hourly cron removes it once this has passed.",
+    )
+    move_cut_started_at = fields.Datetime(
+        string="Move Cut Started At",
+        copy=False,
+        readonly=True,
+        help="When the stop of the source began to drain its traffic, "
+        "during a move: the start of the cut the customer waits through.",
+    )
+    move_last_cut_seconds = fields.Float(
+        string="Last Move Cut (s)",
+        copy=False,
+        readonly=True,
+        help="How long the last move kept the instance unavailable, from "
+        "the drain of its source to its destination answering healthy.",
+    )
+    move_cut_parts = fields.Json(
+        string="Move Cut Parts",
+        copy=False,
+        readonly=True,
+        help="What each job of the move under way noted of the cut: when "
+        "it started, connected, prepared and uploaded its scripts, when it "
+        "ended and what each of its steps took. Reset when the cut starts "
+        "and cleared when it ends.",
+    )
+    move_last_cut_breakdown = fields.Json(
+        string="Last Move Cut Breakdown",
+        copy=False,
+        readonly=True,
+        help="Seconds of the last move's cut by part: drain, dns, "
+        "fingerprint, dump, relay, restore, start, health, overhead "
+        "(connections and script uploads), queue (from the end of one job's "
+        "steps to the start of the next, including its closing hook and "
+        "the close of its connection) and other (what the parts do not "
+        "cover); with total, and incomplete when a part is missing.",
+    )
+    scheduling_priority = fields.Selection(
+        selection=[
+            ("low", "Low"),
+            ("normal", "Normal"),
+            ("high", "High"),
+        ],
+        string="Scheduling Priority",
+        default="normal",
+        required=True,
+        help="Share of the host's CPU this instance gets when the host is "
+        "busy, and, at High, memory kept for it: Low gives half the CPU "
+        "weight of Normal, High twice as much and reserves half of each "
+        "service's memory limit. Applied on the next deploy, rebuild or "
+        "resource update.",
+    )
+    status = fields.Selection(
+        selection=[
+            ("ok", "OK"),
+            ("warning", "Warning"),
+            ("error", "Error"),
+        ],
+        string="Status",
+        required=True,
+        default="ok",
+        help="Health of the instance, independent of where it is in its "
+        "lifecycle: 'ok' while it behaves, 'warning'/'error' when a "
+        "health check or a job says otherwise. Lifecycle lives in "
+        "``state``.",
+    )
+    state = fields.Selection(
+        selection=[
+            ("draft", "Draft"),
+            ("deploying", "Deploying"),
+            ("deployed", "Deployed"),
+            ("deleting", "Deleting"),
+        ],
+        string="Lifecycle State",
+        required=True,
+        default="draft",
+        copy=False,
+        help="Where the instance is in its lifecycle. Written only by "
+        "``_transition()``, which rejects illegal jumps. Rebuild, "
+        "restore, move, start and stop all happen *inside* 'deployed' — "
+        "they are operations, not states.",
+    )
+    deployed = fields.Boolean(
+        string="Deployed",
+        compute="_compute_deployed",
+        store=True,
+        help="True while the instance exists on a host — that is, in "
+        "'deployed' and also in 'deleting', whose teardown has not "
+        "finished yet. Stored because search domains, the SPA and "
+        "the related fields of modules on top read it; derived from "
+        "``state`` so there is a single source of truth.",
+    )
+    running = fields.Boolean(string="Running", default=False)
+    service_states = fields.Json(
+        string="Service States",
+        copy=False,
+        readonly=True,
+        help="What each container of the stack was doing when the health "
+        "probe last looked, e.g. {'odoo': 'running', 'db': 'running'}. "
+        "The probe has always known this and only ever raised alerts "
+        "with it; the panel painted one dot per service from the single "
+        "``running`` flag instead, so every service always showed the "
+        "same state. Empty until the first probe lands.",
+    )
+    stop_is_expected = fields.Boolean(
+        string="Stopped On Purpose",
+        compute="_compute_stop_is_expected",
+        help="True when this instance being down is normal rather than "
+        "an incident. Always False here: base knows no reason for a "
+        "deployed instance to be stopped. A layer above may — one "
+        "that puts an idle instance to sleep — and answers by "
+        "overriding ``_stop_is_expected``.",
+    )
+    custom_remote_dir = fields.Char(
+        string="Custom Remote Directory",
+        copy=False,
+        help="Override for the remote directory path. "
+        "When set, used instead of the computed ~/project/instance path. "
+        "Set automatically when importing existing instances.",
+    )
+    environment = fields.Selection(
+        selection=[
+            ("staging", "Staging"),
+            ("production", "Production"),
+        ],
+        string="Environment",
+        required=True,
+        default="staging",
+    )
+    tag_ids = fields.Many2many(
+        comodel_name="cloud.instance.tag",
+        relation="cloud_instance_tag_rel",
+        column1="instance_id",
+        column2="tag_id",
+        string="Tags",
+    )
+
+    # ── PR preview fields ────────────────────────────────────────────────────
+    pr_number = fields.Integer(
+        string="PR Number",
+        copy=False,
+        index=True,
+        help="Number of the GitHub pull request, or of the GitLab merge "
+        "request, that created this instance. When set, this instance is a "
+        "preview — auto-destroyed when the request closes.",
+    )
+    pr_repo = fields.Char(
+        string="PR Repository",
+        copy=False,
+        help="Repository of the request: owner/repo on GitHub, the "
+        "project's path on GitLab.",
+    )
+    pr_head_branch = fields.Char(
+        string="PR Branch",
+        copy=False,
+        help="Head branch of the PR.",
+    )
+    pr_comment_id = BigInteger(
+        string="GitHub Comment ID",
+        help="ID of the comment posted on the pull request, or of the "
+        "note on the merge request.",
+    )
+    pr_installation_id = fields.Char(
+        string="GitHub App Installation",
+        copy=False,
+        help="The installation of the panel's GitHub App that sent the "
+        "pull request's event: the comment on the pull request is written "
+        "and deleted with its token.",
+    )
+    pr_provider_id = fields.Many2one(
+        "cloud.git.provider",
+        string="Merge Request Provider",
+        copy=False,
+        ondelete="restrict",
+        index="btree_not_null",
+        help="The GitLab server of a merge request preview; empty for a "
+        "GitHub pull request.",
+    )
+    pr_state = fields.Selection(
+        [("open", "Open"), ("closed", "Closed")],
+        string="Request State",
+        copy=False,
+        help="Whether the request of a preview is still open. Written "
+        "closed when it closes, before the note is taken off the merge "
+        "request.",
+    )
+    pr_update_error = fields.Char(
+        string="Preview Update Error",
+        copy=False,
+        help="Why the restore of a preview could not update its modules to "
+        "the request's code, as its comment or note says; empty once a "
+        "restore or a rebuild of it succeeds.",
+    )
+    pr_rebuild_failed_job = fields.Integer(
+        string="Preview Rebuild Failed",
+        copy=False,
+        help="The id of the last rebuild of a preview, when it failed: its "
+        "comment or note says so, with a link to its log while the job "
+        "exists. A number and not a link, so that purging old jobs keeps "
+        "the mark. Cleared (0) when a rebuild of it succeeds.",
+    )
+    pr_update_cut_off = fields.Boolean(
+        string="Preview Update Cut Off",
+        copy=False,
+        help="The update of a preview's restore never answered (the "
+        "connection dropped or the step ran out of time) and may still run "
+        "on the server: a push does not rebuild the preview past the "
+        "restore's alert until someone dismisses it. Cleared with the "
+        "update error.",
+    )
+
+    # ── Copier template parameters ──────────────────────────────────────────
+
+    # A new instance takes its project's series (``create``); one without
+    # a project, the newest series this panel offers.
+    odoo_version = fields.Selection(
+        selection=ODOO_VERSION_SELECTION,
+        string="Odoo Version",
+        default=_odoo_versions.new_record_default,
+    )
+    stack_template_ref = fields.Char(
+        string="Doodba Template of the Stack",
+        readonly=True,
+        copy=False,
+        help="The doodba template version this instance's stack was last "
+             "rendered with (copier's --vcs-ref). Empty for a stack "
+             "rendered before the panel recorded it: those predate the "
+             "egress gatekeeper of template v10.",
+    )
+    odoo_commit_sha = fields.Char(
+        string="Pinned Odoo Commit",
+        help=(
+            "When set, the Odoo core repository is frozen to this exact"
+            " commit SHA instead of following the branch tip."
+        ),
+    )
+    odoo_initial_lang = fields.Many2one(
+        "res.lang",
+        string="Initial Language",
+        context={"active_test": False},
+        help="Language installed via odoo -i base -l <code> on first deploy.",
+    )
+    odoo_admin_password = EncryptedChar(
+        string="Admin Password",
+        groups="incubacloud.group_cloud_developer",
+    )
+    odoo_admin_user_password = EncryptedChar(
+        string="Admin User Password",
+        groups="incubacloud.group_cloud_developer",
+    )
+    odoo_proxy = fields.Selection(
+        [("traefik", "Traefik"), ("none", "None")],
+        string="Proxy",
+        default="traefik",
+    )
+
+    postgres_version = fields.Selection(
+        [(major, major) for major in _odoo_versions.POSTGRES_MAJORS],
+        string="PostgreSQL Version",
+        default="17",
+    )
+    postgres_dbname = fields.Char(string="DB Name", default="prod")
+    postgres_username = fields.Char(string="DB User", default="odoo")
+    postgres_password = EncryptedChar(
+        string="DB Password",
+        groups="incubacloud.group_cloud_developer",
+    )
+    # The panel keeps the key; the host only receives it. A host that is
+    # lost, or an instance moved off it, used to take the key along:
+    # the new copy generated another one and could no longer read what
+    # its database had encrypted (two panels, 18-oct-2026).
+    secret_key = EncryptedChar(
+        string="Encryption Key",
+        groups="incubacloud.group_cloud_developer",
+        copy=False,
+        help="The INCUBACLOUD_SECRET_KEY chain this instance's Odoo "
+        "encrypts its own secrets with (comma-separated Fernet keys, "
+        "primary first). Generated with the instance and written to "
+        ".docker/incubacloud.env on every deploy and rebuild; what the "
+        "host already holds is merged in first, so no key is ever "
+        "dropped. A neutralized copy of production keeps its own.",
+    )
+
+    domain_ids = fields.One2many(
+        "cloud.instance.domain",
+        "instance_id",
+        string="Domains",
+    )
+    whitelist_ids = fields.One2many(
+        "cloud.instance.whitelist",
+        "instance_id",
+        string="Egress Whitelist",
+        help="Hostnames this staging may reach on the open internet, "
+        "through a NAT gateway of its own. Empty means it falls back "
+        "to the host's central whitelist. Production ignores it: a "
+        "production instance is not filtered by this platform.",
+    )
+    domain = fields.Char(
+        string="Primary Domain",
+        compute="_compute_domain",
+        store=True,
+    )
+
+    @api.depends("name", "project_id.remote_folder")
+    def _compute_doodba_project_name(self):
+        for inst in self:
+            folder = inst.project_id.remote_folder if inst.project_id else ""
+            if folder:
+                inst.doodba_project_name = f"{folder}-{inst.name}"
+            else:
+                inst.doodba_project_name = inst.name
+
+    def get_remote_dir(self):
+        """Return the remote directory path for this instance.
+
+        Uses ``custom_remote_dir`` if set (imported instances),
+        otherwise computes ~/project_remote_folder/instance_name/.
+        """
+        self.ensure_one()
+        if self.custom_remote_dir:
+            return self.custom_remote_dir
+        project_folder = (
+            self.project_id.remote_folder if self.project_id else ""
+        ) or "instances"
+        return f"~/{project_folder}/{self.name}"
+
+    @api.depends("domain_ids.hostname", "domain_ids.sequence")
+    def _compute_domain(self):
+        # Sort explicitly by (sequence, id) instead of relying on
+        # cloud.instance.domain._order. The value of ``inst.domain``
+        # flows into _base_url() and from there into psql -c "..." in
+        # deploy/rebuild executors (see H-MOD-2 fix). Sorting here
+        # makes the resolution independent of any future change to
+        # the related model's _order, so a refactor cannot silently
+        # alter which hostname becomes the primary domain.
+        for inst in self:
+            domains = inst.domain_ids.sorted(
+                key=lambda d: (d.sequence, d.id),
+            )
+            first = domains[:1]
+            inst.domain = first.hostname if first else ""
+
+    odoo_admin_email = fields.Char(string="Admin Email")
+
+    smtp_relay_host = fields.Char(string="SMTP Host")
+    smtp_relay_port = fields.Integer(string="SMTP Port", default=587)
+    smtp_relay_security = fields.Selection(
+        selection=[
+            ("none", "None"),
+            ("starttls", "STARTTLS"),
+            ("ssl", "SSL/TLS"),
+        ],
+        string="SMTP Security",
+        default="starttls",
+    )
+    smtp_relay_user = fields.Char(string="SMTP User")
+    smtp_relay_password = EncryptedChar(
+        string="SMTP Password",
+        groups="incubacloud.group_cloud_developer",
+    )
+    # How the production relay signs in to its server. With OAuth2 the
+    # server is Microsoft 365's (``_relay_oauth.MICROSOFT_SMTP_SERVER``),
+    # ``smtp_relay_user`` is the sender mailbox and the password, kept,
+    # is not used: switching back finds it.
+    smtp_relay_auth = fields.Selection(
+        selection=[
+            (_relay_oauth.AUTH_PASSWORD, "Password"),
+            (_relay_oauth.AUTH_OAUTH2_MICROSOFT, "OAuth2 – Microsoft 365"),
+        ],
+        string="SMTP Authentication",
+        required=True,
+        default=_relay_oauth.AUTH_PASSWORD,
+    )
+    smtp_relay_oauth_directory_id = fields.Char(string="Directory ID")
+    smtp_relay_oauth_client_id = fields.Char(string="Application (client) ID")
+    # Read by the system alone, as a host's password: the platform reads
+    # it with ``sudo`` to write the credentials file
+    # (``_relay_oauth_secret``). Written by a developer, as the relay's
+    # password (``_WRITE_ONLY_FIELDS``).
+    smtp_relay_oauth_client_secret = EncryptedChar(
+        string="Client Secret",
+        groups="base.group_system",
+    )
+    # What the platform last read of the relay's deliveries to its
+    # server: the health probe and the relay's test mail write them.
+    smtp_relay_state = fields.Selection(
+        selection=[
+            ("unknown", "Not checked"),
+            ("ok", "Delivering"),
+            ("failing", "Not delivering"),
+        ],
+        string="Relay State",
+        default="unknown",
+        readonly=True,
+    )
+    smtp_relay_checked_at = fields.Datetime(
+        string="Relay Checked At", readonly=True,
+    )
+    smtp_relay_error = fields.Char(string="Relay Error", readonly=True)
+
+    # ── Resource limits (docker-compose.override.yml) ─────────────────
+    odoo_memory_limit = fields.Char(
+        string="Odoo Memory Limit",
+        default="2g",
+        help="Docker mem_limit for odoo service (e.g. 2g, 512m)",
+    )
+    odoo_cpus = fields.Float(string="Odoo CPUs", default=2.0)
+    db_memory_limit = fields.Char(
+        string="DB Memory Limit",
+        default="1g",
+    )
+    db_cpus = fields.Float(string="DB CPUs", default=1.0)
+    backup_memory_limit = fields.Char(
+        string="Backup Memory Limit",
+        default="512m",
+    )
+    backup_cpus = fields.Float(string="Backup CPUs", default=0.5)
+    smtp_memory_limit = fields.Char(
+        string="SMTP Memory Limit",
+        default="256m",
+    )
+    smtp_cpus = fields.Float(string="SMTP CPUs", default=0.25)
+
+    odoo_conf = fields.Text(
+        string="Odoo Configuration",
+        default=(
+            "[options]\n"
+            "workers = 2\n"
+            "server_wide_modules = web\n"
+            "limit_time_cpu = 600\n"
+            "limit_time_real = 1200\n"
+            "max_cron_threads = 1\n"
+        ),
+    )
+
+    pip_dependencies = fields.Text(
+        string="Python Dependencies",
+        default=(
+            "git+https://github.com/OCA/openupgradelib.git@master\n"
+            "unicodecsv\n"
+            "unidecode\n"
+        ),
+        help="Contents written to odoo/custom/dependencies/pip.txt on deploy.",
+    )
+    apt_dependencies = fields.Text(
+        string="System (APT) Dependencies",
+        help="Contents written to odoo/custom/dependencies/apt.txt on deploy.",
+    )
+
+    repo_ids = fields.One2many(
+        comodel_name="cloud.instance.repo",
+        inverse_name="instance_id",
+        string="Repositories",
+    )
+
+    alert_ids = fields.One2many(
+        comodel_name="cloud.alert",
+        inverse_name="instance_id",
+        string="Alerts",
+    )
+
+    last_health_check = fields.Datetime(
+        string="Last Health Check",
+        readonly=True,
+    )
+    cpu_over_threshold_streak = fields.Integer(
+        default=0,
+        readonly=True,
+        help=(
+            "Consecutive instance_health cycles with CPU above the "
+            "warning threshold. Reset to 0 the moment we read a value "
+            "below threshold. An alert is only raised once the streak "
+            "reaches the configured hysteresis depth."
+        ),
+    )
+    mem_over_threshold_streak = fields.Integer(
+        default=0,
+        readonly=True,
+        help=(
+            "Consecutive instance_health cycles with memory above the "
+            "warning threshold. Hysteresis counterpart of "
+            "cpu_over_threshold_streak."
+        ),
+    )
+    http_fail_streak = fields.Integer(
+        default=0,
+        readonly=True,
+        help=(
+            "Consecutive instance_health cycles where the container was "
+            "running but visitors could not reach Odoo: it did not answer "
+            "on 8069 or, under a gatekeeper, it was outside the network "
+            "of the gatekeeper running now. The critical "
+            "instance_unresponsive alert waits for the same hysteresis "
+            "depth as CPU and memory: a container that is up but not "
+            "listening yet is what every boot looks like from outside, "
+            "and a restart caught midway leaves odoo behind its "
+            "gatekeeper for seconds, so a single failed probe is not an "
+            "incident."
+        ),
+    )
+
+    compose_services = fields.Char(
+        string="Compose Services",
+        default="odoo,db",
+        help=(
+            "Comma-separated list of Docker Compose service names"
+            " detected from the YAML."
+        ),
+    )
+
+    backup_backend_id = fields.Many2one(
+        comodel_name="cloud.backup.backend",
+        string="Backup Destination",
+        help="Backup backend for this instance. Overrides the project default.",  # noqa: E501
+    )
+    effective_backup_backend = fields.Many2one(
+        comodel_name="cloud.backup.backend",
+        string="Effective Backup Destination",
+        compute="_compute_effective_backup_backend",
+    )
+
+    instance_backup_dst = fields.Char(
+        string="Instance Backup Path",
+        compute="_compute_instance_backup_dst",
+        help="Per-instance duplicity DST: {backend_dst}/{project}/{instance}",
+    )
+    custom_backup_dst = fields.Char(
+        string="Custom Backup Path",
+        copy=False,
+        help="Override for the backup destination path. "
+        "When set, used instead of the computed path. "
+        "Set automatically when importing existing instances.",
+    )
+
+    @api.depends("backup_backend_id", "project_id.backup_backend_id")
+    def _compute_effective_backup_backend(self):
+        ICP = self.env["ir.config_parameter"].sudo()
+        global_id = int(ICP.get_param(_GLOBAL_BACKUP_PARAM, 0) or 0)
+        Backend = self.env["cloud.backup.backend"]
+        global_backend = Backend.browse(global_id) if global_id else Backend
+        for inst in self:
+            inst.effective_backup_backend = (
+                inst.backup_backend_id
+                or inst.project_id.backup_backend_id
+                or global_backend
+            )
+
+    backup_path_suffix = fields.Char(
+        copy=False,
+        readonly=True,
+        help="Added to the backup path the destination computes when "
+             "another instance of the same name already holds that path, "
+             "an archived one included, so this one's copies form a chain "
+             "of their own. Set by the panel when the instance is created, "
+             "renamed or moved to another project.",
+    )
+
+    @api.depends(
+        "custom_backup_dst",
+        "effective_backup_backend",
+        "name",
+        "project_id.remote_folder",
+        "backup_path_suffix",
+    )
+    def _compute_instance_backup_dst(self):
+        for inst in self:
+            inst.instance_backup_dst = (
+                inst.custom_backup_dst or inst._computed_backup_dst()
+            )
+
+    def _computed_backup_dst(self):
+        """The path the destination computes for this instance, ignoring its own.
+
+        ``{backup_dst}/{project folder}/{name}{suffix}``: where the panel
+        puts an instance's copies when nothing else is written
+        (``custom_backup_dst``). The suffix is empty unless another
+        instance of the same name held the path first
+        (``_claim_own_backup_path``).
+
+        :return: the path, or ``""`` without a destination or a name
+        :rtype: str
+        """
+        self.ensure_one()
+        bb = self.effective_backup_backend
+        if not (bb and bb.backup_dst and self.name):
+            return ""
+        return f"{bb.backup_dst}/{self._backup_folder()}/{self.name}" \
+            f"{self.backup_path_suffix or ''}"
+
+    def _backup_folder(self):
+        """The folder of the destination this instance's copies go under.
+
+        :return: its project's remote folder, or ``default``
+        :rtype: str
+        """
+        self.ensure_one()
+        return (self.project_id.remote_folder if self.project_id else "") \
+            or "default"
+
+    def _backup_path_tails(self, suffix):
+        """How the paths this instance would compute with *suffix* end.
+
+        Core's chain: ``/{folder}/{name}{suffix}``. An addon that keeps
+        more of the copy beside it adds the ending of its prefix. Compared
+        by the ending and not the whole path, so the check holds before
+        the instance has a destination, and whatever destination another
+        record's path is on.
+
+        :param str suffix: a ``backup_path_suffix``, ``""`` for none
+        :rtype: list
+        """
+        self.ensure_one()
+        return [f"/{self._backup_folder()}/{self.name}{suffix}"]
+
+    def _claim_own_backup_path(self):
+        """Give each instance a backup path no other record holds.
+
+        An instance that takes the name of another, an archived one above
+        all, computes the same path: its copies would continue that one's
+        duplicity chain, and a purge of either would take the other's.
+        When another record already holds a path that ends as this one's
+        would (``_backup_path_tails``), the instance takes the suffix
+        ``-<id>``; otherwise none. Another record is one of the same name,
+        or one with a suffix of its own, whose name and suffix may spell
+        this one's name; a suffix taken by an instance of that spelling is
+        passed over for the next. The path is otherwise left as the
+        destination computes it, the one imports, runbooks and a recovery
+        by hand use.
+
+        Called when the computed path moves anyway: on creation, when
+        the name, the project or the project's folder changes, and when a
+        path written by hand is emptied on an instance without a suffix
+        (one with a suffix already has a path of its own). Not for an instance with a path
+        of its own written (``custom_backup_dst``), which the field's
+        check holds to the same rule. Of several claimed together, the
+        first keeps the path and the later ones take suffixes.
+        """
+        Instance = self.env["cloud.instance"].sudo().with_context(
+            active_test=False,
+        )
+        for inst in self:
+            if inst.custom_backup_dst or not inst.name:
+                continue
+            for suffix in ("", *(f"-{inst.id}" + (f"-{n}" if n else "")
+                                 for n in range(10))):
+                tails = inst._backup_path_tails(suffix)
+                others = Instance.search([
+                    ("id", "!=", inst.id), "|", "|",
+                    ("name", "=", inst.name),
+                    ("name", "=", f"{inst.name}{suffix}"),
+                    ("backup_path_suffix", "!=", False),
+                ]).filtered(lambda other: other not in self or other.id < inst.id)
+                if not any(
+                    (path or "").rstrip("/").endswith(tail)
+                    for other in others for path in other._backup_paths_held()
+                    for tail in tails
+                ):
+                    break
+            if (inst.backup_path_suffix or "") != suffix:
+                inst.sudo().write({"backup_path_suffix": suffix or False})
+
+    def _backup_paths_held(self):
+        """The backup paths this instance's copies are kept under.
+
+        Core's is the duplicity chain's (``instance_backup_dst``); a module
+        that keeps more of the copy elsewhere in the bucket adds its
+        prefix. What :meth:`_backup_prefix_conflict` protects from another
+        record's purge.
+
+        :rtype: list
+        """
+        self.ensure_one()
+        return [self.instance_backup_dst] if self.instance_backup_dst else []
+
+    def _backup_prefix_conflict(self, prefix, held=False):
+        """What emptying *prefix* for this instance would reach besides its own copy.
+
+        A purge deletes everything under ``prefix/`` older than its cutoff
+        (``lib/purge_prefix.sh``), and the cutoff protects only what was
+        written after it. Refused: a prefix that is a backup destination's
+        path (``backup_dst``) or above it, where every instance of the
+        destination keeps its copies, unless it is this instance's own
+        destination's path and no other instance uses that destination
+        (an import names one after the path it read); and one that is or
+        holds the path of another instance, archived included. One that is
+        the same path as another instance of the same name is not when the
+        dates prove a succession (``_backup_succession``): one of the two
+        archived, and the other created at least a minute after: the
+        purges' bounds keep each one's objects apart. Two live ones, two
+        that lived at the same time or one archived without its date are
+        refused. Compared bucket and parts as the purge
+        reads them (``_backup_dst.dst_key``), whatever the endpoint: two
+        destinations naming one bucket are taken for one, which refuses
+        more, never less.
+
+        With *held*, *prefix* is a path to write as this instance's own
+        (``custom_backup_dst``): one under another instance's path is
+        refused too, as that one's purge would empty it, and so is the
+        path of one of the same name, whose chain it would continue: an
+        instance that takes the name of another computes a path of its
+        own (``_claim_own_backup_path``).
+
+        :param str prefix: the duplicity or wal-g prefix
+        :param bool held: also refuse a *prefix* under another's path
+        :return: ``(backup destination, None)`` (empty for a bucket's
+            root), ``(None, instance)`` or None when nothing else is
+            reached
+        :rtype: tuple
+        """
+        self.ensure_one()
+        key = dst_key(prefix)
+        if key is None:
+            # No bucket: nothing a purge could empty (``purge_prefix.sh``
+            # refuses it), nor a path a write may hold (its grammar).
+            return None
+        if not key[1]:
+            # A bucket's root: every destination in it.
+            return self.env["cloud.backup.backend"].browse(), None
+        others = self.env["cloud.instance"].sudo().with_context(
+            active_test=False,
+        ).search([("id", "!=", self.id)])
+        own = self.effective_backup_backend
+        for backend in self.env["cloud.backup.backend"].sudo().search(
+            [("backup_dst", "!=", False)],
+        ):
+            root = dst_key(backend.backup_dst)
+            if not dst_covers(key, root):
+                continue
+            if key == root and backend == own and not any(
+                other.effective_backup_backend == backend for other in others
+            ):
+                # Its own destination's path, which no other instance
+                # uses: what an import names after the path it read. Kept
+                # rather than having the import name its destination after
+                # the parent path: the imports made so far would be
+                # refused every purge. Its limit: a purge of it also
+                # reaches what the panel does not record under that path
+                # (another tool's objects, a recovery prefix a delete left
+                # behind), which only an administrator, or an import he
+                # starts, can have written there.
+                continue
+            return backend, None
+        for other in others:
+            for path in other._backup_paths_held():
+                theirs = dst_key(path)
+                if (
+                    theirs == key and other.name == self.name and not held
+                    and self._backup_succession(other)
+                ):
+                    continue
+                if dst_covers(key, theirs) or (held and dst_covers(theirs, key)):
+                    return None, other
+        return None
+
+    def _backup_prefix_refusal(self, prefix):
+        """Why a purge of *prefix* is refused, for the job's log and its alert.
+
+        :param str prefix: the prefix the purge would empty
+        :return: the reason, or ``""`` when the purge may go on
+        :rtype: str
+        """
+        conflict = self._backup_prefix_conflict(prefix)
+        if conflict is None:
+            return ""
+        backend, other = conflict
+        if other:
+            return (
+                f"The purge of '{self.name}' would empty {prefix}, which holds "
+                f"the copy of '{other.name}' (id {other.id}): refused, nothing "
+                "deleted. Correct the backup path of either instance."
+            )
+        return (
+            f"The purge of '{self.name}' would empty {prefix}, the path of "
+            f"the backup destination '{backend.name or '?'}' or above it, "
+            "where every instance keeps its copies: refused, nothing "
+            "deleted. Correct the instance's backup path."
+        )
+
+    def _backup_succession(self, other):
+        """Whether one of the two took the other's name once it was archived.
+
+        One is archived (inactive, with ``archived_at``) and the other was
+        created at least ``_SUCCESSION_MARGIN`` after: what each one stored
+        in a path they share is then told apart by the storage's dates,
+        the archived one's before the other's creation. Anything else (two
+        live ones, two that lived at the same time, an archive without its
+        date) proves nothing.
+
+        :param other: another ``cloud.instance``
+        :rtype: bool
+        """
+        self.ensure_one()
+
+        def took_over(archived, successor):
+            """Whether *successor* was created a margin after *archived* was archived."""
+            return bool(
+                not archived.active and archived.archived_at
+                and successor.create_date
+                and archived.archived_at + _SUCCESSION_MARGIN
+                <= successor.create_date
+            )
+
+        return took_over(self, other) or took_over(other, self)
+
+    def _backup_purge_before(self, prefix, cutoff):
+        """Up to when a purge of this instance's *prefix* deletes.
+
+        *cutoff*, the instant the purge was decided, unless an instance
+        of the same name that holds the same path was created after this
+        one, the successor that took its name: then its creation, when
+        earlier. A delete decided after the successor's first copy would
+        otherwise take what the successor stored until then; the oldest
+        such creation, so one that was archived in turn keeps its copy
+        too. The purges of an archived instance's copy and of a recovery
+        archive switched off read it (``PURGE_BEFORE``).
+
+        :param str prefix: the duplicity or wal-g prefix the purge empties
+        :param datetime.datetime cutoff: naive UTC
+        :return: the bound, naive UTC
+        :rtype: datetime.datetime
+        """
+        self.ensure_one()
+        key = dst_key(prefix)
+        if not (key and key[1] and self.name and self.create_date and cutoff):
+            return cutoff
+        namesakes = self.env["cloud.instance"].sudo().with_context(
+            active_test=False,
+        ).search([
+            ("id", "!=", self.id), ("name", "=", self.name),
+            ("create_date", ">", self.create_date),
+        ])
+        later = [
+            other.create_date for other in namesakes
+            if any(dst_key(path) == key for path in other._backup_paths_held())
+        ]
+        return min([cutoff, *later])
+
+    def _backup_purge_since(self, prefix):
+        """Where a purge of this instance's *prefix* starts, or ``""`` to empty it whole.
+
+        Another instance of the same name that holds the same path and
+        was created before this one, the archived one whose name this one
+        took (``_backup_prefix_conflict`` lets it through), keeps there
+        what was stored before this one was created: this one's purges
+        are bounded to what came after (``PURGE_SINCE``,
+        ``lib/purge_prefix.sh``), the delete of this one live and, once
+        it is archived in turn or its recovery archive switched off, the
+        purge of that copy. The earlier one's own purge is bounded to what
+        came before (``PURGE_BEFORE``, ``_backup_purge_before``).
+
+        Only one created before: one created after is this one's
+        successor, which ``_backup_prefix_conflict`` refuses to a live
+        instance's delete, and whose creation already ends this one's
+        archived purge. Counted, it would leave behind, with the record
+        gone, what an imported instance's path held from before its
+        record was created.
+
+        :param str prefix: the duplicity or wal-g prefix the purge empties
+        :return: this instance's creation as ISO-8601 UTC, to the second
+            and rounded down, or ``""`` when no earlier instance holds it
+        :rtype: str
+        """
+        self.ensure_one()
+        key = dst_key(prefix)
+        if not (key and key[1] and self.name and self.create_date):
+            return ""
+        namesakes = self.env["cloud.instance"].sudo().with_context(
+            active_test=False,
+        ).search([
+            ("id", "!=", self.id), ("name", "=", self.name),
+            ("create_date", "<", self.create_date),
+        ])
+        if not any(
+            dst_key(path) == key
+            for other in namesakes for path in other._backup_paths_held()
+        ):
+            return ""
+        return self.create_date.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+    @api.depends(
+        "odoo_version",
+        "odoo_commit_sha",
+        "pip_dependencies",
+        "apt_dependencies",
+        "odoo_proxy",
+        "repo_ids.url",
+        "repo_ids.branch",
+        "repo_ids.commit_sha",
+        "repo_ids.addons",
+        "repo_ids.excludes",
+    )
+    def _compute_rebuild_fingerprint(self):
+        for inst in self:
+            parts = [
+                inst.odoo_version or "",
+                inst.odoo_commit_sha or "",
+                inst.pip_dependencies or "",
+                inst.apt_dependencies or "",
+                inst.odoo_proxy or "",
+            ]
+            for repo in inst.repo_ids.sorted("id"):
+                parts.extend(
+                    [
+                        repo.url or "",
+                        repo.branch or "",
+                        repo.commit_sha or "",
+                        repo.addons or "",
+                        repo.excludes or "",
+                    ]
+                )
+            raw = "|".join(parts)
+            inst.rebuild_fingerprint = hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    # ── Config drift: saved config vs what the last deploy shipped ────────
+    # The panel stores configuration; a deploy/rebuild applies it. Between
+    # the two, the UI used to say nothing — an edited domain (or SMTP
+    # relay, or backup backend, …) read as "saved" while the server kept
+    # serving the previous state. The snapshot below is everything a
+    # rebuild would ship, so ANY present or future field that feeds the
+    # copier answers counts automatically; only the extras tuple needs
+    # maintaining for inputs shipped outside the answers file.
+
+    applied_config_hash = fields.Char(
+        copy=False,
+        readonly=True,
+        help="Hash of the config snapshot the last successful deploy or "
+             "rebuild shipped. Compared against the current snapshot to "
+             "surface unapplied changes.",
+    )
+    applied_config_snapshot = fields.Json(
+        copy=False,
+        readonly=True,
+        help="The snapshot behind applied_config_hash. Kept so the drift "
+             "pill can say which keys moved instead of just that "
+             "something did.",
+    )
+    config_dirty = fields.Boolean(
+        compute="_compute_config_dirty",
+        help="True when the saved configuration differs from what the "
+             "last deploy shipped; a rebuild applies it.",
+    )
+
+    #: Deploy inputs shipped OUTSIDE the copier answers file (compose
+    #: resource overrides, odoo.conf, dependency manifests, the pinned
+    #: odoo commit used in repos.yaml). Inheriting modules may extend.
+    _CONFIG_SNAPSHOT_EXTRA_FIELDS = (
+        "odoo_conf",
+        "odoo_memory_limit", "odoo_cpus",
+        "db_memory_limit", "db_cpus",
+        "backup_memory_limit", "backup_cpus",
+        "smtp_memory_limit", "smtp_cpus",
+        "pip_dependencies", "apt_dependencies",
+        "odoo_commit_sha",
+    )
+
+    def _render_copier_answers(self):
+        """Return the copier answers dict a deploy of this instance ships.
+
+        Single source of truth shared by the deploy executor (which dumps
+        it to the remote answers file) and the config-drift hash. Must
+        stay deterministic: values come from stored state only — never
+        tokens, timestamps or anything minted per run.
+        """
+        self.ensure_one()
+        # sudo: executor path is trusted; secret fields carry group
+        # restrictions that would otherwise hide them from the render.
+        inst = self.sudo()
+
+        entries = []
+        for d in inst.domain_ids:
+            hostname = (
+                (d.hostname or "")
+                .replace("https://", "")
+                .replace("http://", "")
+                .strip("/")
+            )
+            if not hostname:
+                continue
+            entry = {"hosts": [hostname]}
+            if d.redirect_to:
+                entry["redirect_to"] = d.redirect_to
+                if d.redirect_permanent:
+                    entry["redirect_permanent"] = True
+            # Always emitted, never left to the template default: the
+            # copier copy runs against a moving upstream ref, and a
+            # default that changes between template releases would
+            # silently change every instance's TLS on the next rebuild.
+            entry["cert_resolver"] = d._cert_resolver_answer()
+            entries.append(entry)
+
+        if inst.environment == "production":
+            domains_prod = entries
+            domains_test = []
+        else:
+            domains_prod = []
+            domains_test = entries
+
+        bb = inst.effective_backup_backend
+        if bb:
+            bb = bb.sudo()
+        has_backup = inst._backup_enabled()
+
+        relay_host = inst.smtp_relay_host
+        relay_port = inst.smtp_relay_port or 587
+        relay_password = inst.smtp_relay_password or ""
+        if inst._relay_oauth_renders():
+            # The same keys with other values: Microsoft's server, and the
+            # token file's path where the password goes, which is what
+            # sasl-xoauth2 reads from ``sasl_passwd``. The credentials
+            # travel in a file of their own (``_extra_env_files``).
+            server = _relay_oauth.MICROSOFT_SMTP_SERVER
+            relay_host = server["smtp_relay_host"]
+            relay_port = server["smtp_relay_port"]
+            relay_password = _relay_oauth.TOKEN_PATH
+        answers = {
+            "project_author": inst.project_id.project_author or "IncubaCloud",
+            "project_license": inst.project_id.project_license or "BSL-1.0",
+            "project_name": inst.doodba_project_name,
+            "odoo_version": float(inst.odoo_version),
+            "odoo_initial_lang": inst.odoo_initial_lang.code or "en_US",
+            "odoo_admin_password": inst.odoo_admin_password or "",
+            "odoo_proxy": inst.odoo_proxy or "traefik",
+            "postgres_version": str(inst.postgres_version or "17"),
+            "postgres_dbname": inst.postgres_dbname or "prod",
+            "postgres_username": inst.postgres_username or "odoo",
+            "postgres_password": inst.postgres_password or "",
+            "domains_prod": domains_prod,
+            "domains_test": domains_test,
+            # The template renders the host, the user, the default sender
+            # and the canonical domain inside double-quoted YAML scalars:
+            # escaped for them, so a row stored before the model checked
+            # these fields still renders as its own text. A valid value
+            # has nothing to escape and goes out as it is.
+            "smtp_relay_host": _yaml_dq_escape(relay_host),
+            "smtp_relay_port": relay_port,
+            "smtp_relay_version": "latest",
+            "smtp_relay_user": _yaml_dq_escape(inst.smtp_relay_user),
+            "smtp_relay_password": relay_password,
+            "smtp_default_from": _yaml_dq_escape(
+                inst.smtp_relay_user or inst.odoo_admin_email
+            ),
+            # canonical_default = sending domain (from relay user email
+            # if set, else strip first subdomain off relay host, e.g.
+            # mail.x.com → x.com)
+            "smtp_canonical_default": _yaml_dq_escape(
+                _smtp_canonical_domain(inst)
+            ),
+            "smtp_canonical_domains": [],
+            # Backup defaults (always empty/disabled; overridden below
+            # when a backup backend is configured and enabled).
+            "backup_dst": "",
+            "backup_image_version": "",
+            "backup_email_from": "",
+            "backup_email_to": "",
+            "backup_smtp_report_success": False,
+            "backup_deletion": False,
+            "backup_tz": "UTC",
+            "backup_aws_access_key_id": "",
+            "backup_aws_secret_access_key": "",
+            "backup_passphrase": "",
+            # Answered explicitly even though we never use it. The
+            # template added this question in v9.7.0 with a literal
+            # placeholder as its default, and ``copier --defaults``
+            # takes defaults for questions we leave out — which would
+            # write ``BACKEND_PASSWORD=example-backup-backend-password``
+            # into every backup.env. Empty keeps the line out of the
+            # file entirely. Only password-capable duplicity backends
+            # (SFTP) read it: an SFTP destination that logs in with a
+            # password gets it in backup.env from the deploy
+            # (``DeployInstanceExecutor._backup_env_content``), never
+            # through the answers, which the configuration snapshot keeps.
+            "backup_backend_password": "",
+            # Egress allow-list — always answered, never left to the
+            # template, for the same reason as the line above: its
+            # default is a 32-host list (payment gateways and tax
+            # agencies among them) that nobody here chose.
+            #
+            # From template v9.6.0 on, a non-empty list makes the test
+            # compose file grow a NAT gateway (``proxy_general``) plus a
+            # sidecar sharing the odoo container's network namespace
+            # (``odoo_net_setup``), both with ``NET_ADMIN``. Empty keeps
+            # the staging on the host's central whitelist network, which
+            # the template declares and joins either way.
+            #
+            # What the template also does, unconditionally and with no
+            # question to switch it off, is mount the host's docker
+            # socket into that sidecar and ship it with its healthcheck
+            # disabled. Both are undone in the deploy's override — see
+            # ``_resource_override_content``, which is where this
+            # answer's consequences are paid for.
+            "whitelisted_hosts_test": inst._egress_whitelist(),
+            # Which compose project the sidecar looks itself up in.
+            # The template falls back to ``$COMPOSE_PROJECT_NAME``,
+            # which only resolves because the deploy writes that
+            # variable into ``.env`` — so say it outright rather than
+            # depend on one file to rescue another.
+            "whitelist_docker_project_test": inst.doodba_project_name or "",
+            # The generated devel.yaml is never used (the panel points
+            # docker-compose.yml at prod.yaml or test.yaml), but leaving
+            # the question unanswered would let the template's default
+            # decide part of a file we ship. Determinism over apathy.
+            "whitelisted_hosts_devel": [],
+        }
+        if has_backup and bb:
+            answers.update(
+                {
+                    "backup_dst": inst.instance_backup_dst or "",
+                    "backup_image_version": bb.backup_image_version or "latest",
+                    # Inside the template's double quotes, as the SMTP
+                    # answers above: escaped for them, so a value saved
+                    # before the destination checked it renders as its
+                    # own text (``_check_backup_answers_shape``).
+                    "backup_email_from": _yaml_dq_escape(bb.email_from),
+                    "backup_email_to": _yaml_dq_escape(bb.email_to),
+                    "backup_smtp_report_success": bb.smtp_report_success,
+                    "backup_deletion": bb.retention_owner == "cron",
+                    "backup_tz": _yaml_dq_escape(bb.backup_tz or "UTC"),
+                    "backup_passphrase": bb.passphrase or "",
+                }
+            )
+            if bb.backend_type == "s3":
+                answers.update({
+                    "backup_aws_access_key_id": bb.s3_access_key_id or "",
+                    "backup_aws_secret_access_key": bb.s3_secret_access_key or "",
+                })
+        return answers
+
+    def _render_config_snapshot(self):
+        """Return the full deterministic dict of what a rebuild ships.
+
+        Copier answers + the token-free repos description + the extras
+        tuple. Deliberately excluded: the GitHub tokens injected into
+        repos.yaml (they rotate hourly) and the template url/ref pin
+        (bumps are governed by their runbook, not per-instance drift).
+        """
+        self.ensure_one()
+        inst = self.sudo()
+        return {
+            "answers": inst._render_copier_answers(),
+            "repos": [
+                {
+                    "url": r.url or "",
+                    "branch": r.branch or "",
+                    "commit_sha": r.commit_sha or "",
+                    "addons": r.addons or "",
+                    "excludes": r.excludes or "",
+                }
+                for r in inst.repo_ids.sorted("id")
+            ],
+            "extras": {
+                f: inst[f] or "" for f in self._CONFIG_SNAPSHOT_EXTRA_FIELDS
+            },
+            # Only when on: an instance with the page blocked, the
+            # default, hashes as it did before the switch existed, so
+            # the fleet does not all come out with changes to apply.
+            **({"website_info_public": True} if inst.website_info_public else {}),
+            # Only for an OAuth2 relay, for the same reason. The answers
+            # do not carry the credentials, which go in a file of their
+            # own: without this a new secret left nothing to apply. The
+            # secret as a salted fingerprint, never in clear.
+            **(
+                {"smtp_relay_oauth": inst._relay_oauth_snapshot()}
+                if inst._relay_oauth_renders() else {}
+            ),
+            # The retention the backup container's cleanup runs, once it
+            # is not the template's: until 1.0.232 none other applied,
+            # and a retention changed since left nothing to apply. Only
+            # then, so the rest of the fleet hashes as before.
+            **(
+                {"backup_retention": retention}
+                if (retention := inst._cron_backup_retention())
+                and retention != TEMPLATE_BACKUP_RETENTION else {}
+            ),
+            # Only for an SFTP destination, for the same reason: the key
+            # pair and the trusted server key reach the host in files of
+            # their own (``_extra_env_files``). Fingerprints, never a key.
+            **(
+                {"backup_sftp": inst._backup_sftp_backend()._sftp_snapshot()}
+                if inst._backup_sftp_backend() else {}
+            ),
+        }
+
+    def _backup_sftp_backend(self):
+        """Return the SFTP destination this instance backs up to, if any.
+
+        :return: the effective ``cloud.backup.backend``, as the platform,
+            when backups are on and it is SFTP; an empty recordset else
+        :rtype: cloud.backup.backend
+        """
+        self.ensure_one()
+        bb = self.effective_backup_backend.sudo()
+        if bb and bb.backend_type == "sftp" and self._backup_enabled():
+            return bb
+        return self.env["cloud.backup.backend"]
+
+    #: Fields a group writes and only the system reads: ``{field: group}``.
+    #: Saving the OAuth2 relay's client secret is a developer's, as its
+    #: password is, and nobody reads it back (``_has_field_access``).
+    _WRITE_ONLY_FIELDS = {
+        "smtp_relay_oauth_client_secret": "incubacloud.group_cloud_developer",
+    }
+
+    def _has_field_access(self, field, operation):
+        """Let a write-only field be written by its group, read by none.
+
+        A field of :attr:`_WRITE_ONLY_FIELDS` keeps ``base.group_system``
+        on its definition, so ``read``, ``search_read`` and an export
+        refuse it to everyone else; writing it asks for the group listed
+        there instead, so the form's save, ``create`` and the constraints
+        that run with it work as for any field.
+
+        :param field: the field
+        :param str operation: ``read`` or ``write``
+        :rtype: bool
+        """
+        group = self._WRITE_ONLY_FIELDS.get(field.name)
+        if group and operation == "write" and not self.env.su:
+            return self.env.user.has_group(group)
+        return super()._has_field_access(field, operation)
+
+    def _relay_oauth_renders(self):
+        """Whether a deploy renders this instance's relay with OAuth2.
+
+        See ``_relay_oauth.renders``.
+
+        :rtype: bool
+        """
+        self.ensure_one()
+        return _relay_oauth.renders(self)
+
+    def _relay_oauth_secret(self):
+        """Return the client secret, read as the platform.
+
+        :rtype: str
+        """
+        self.ensure_one()
+        return self.sudo().smtp_relay_oauth_client_secret or ""
+
+    def _relay_oauth_snapshot(self):
+        """Return what the configuration snapshot keeps of OAuth2.
+
+        :returns: the provider, both identifiers, and the secret's
+            fingerprint salted with the instance's id
+        :rtype: dict
+        """
+        self.ensure_one()
+        return {
+            "provider": "microsoft",
+            "directory_id": self.smtp_relay_oauth_directory_id or "",
+            "client_id": self.smtp_relay_oauth_client_id or "",
+            "client_secret_hash": _relay_oauth.fingerprint(
+                self.id, self._relay_oauth_secret(),
+            ),
+        }
+
+    def _relay_oauth_fingerprint(self):
+        """Return the fingerprint of everything the credentials file holds.
+
+        The ``smtp`` service carries it as a label, so a deploy or a
+        rebuild recreates the relay whenever the file changed
+        (``_relay_oauth.CREDENTIALS_LABEL``).
+
+        :rtype: str
+        """
+        self.ensure_one()
+        return _relay_oauth.fingerprint(
+            self.id,
+            self.smtp_relay_oauth_directory_id,
+            self.smtp_relay_oauth_client_id,
+            self._relay_oauth_secret(),
+            self.smtp_relay_user,
+        )
+
+    def _config_snapshot_hash(self):
+        """SHA-256 hex digest of the canonical-JSON config snapshot."""
+        self.ensure_one()
+        raw = json.dumps(
+            self._render_config_snapshot(), sort_keys=True, default=str,
+        )
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def _applied_config_vals(self):
+        """Write values that anchor this instance's config to right now.
+
+        Every successful deploy / rebuild (a layer's own builds too) stamps
+        through here so the hash and the snapshot behind it can never drift
+        apart — a stamp that recorded only one of them would leave the
+        pill unable to explain itself.
+        """
+        self.ensure_one()
+        return {
+            "applied_config_hash": self._config_snapshot_hash(),
+            "applied_config_snapshot": _snapshot_diff.normalize(
+                self._render_config_snapshot(),
+            ),
+        }
+
+    def _config_drift_diff(self):
+        """Return the snapshot keys that moved since the last deploy.
+
+        Empty when nothing differs — and also when no snapshot was
+        recorded, which is the case for every instance anchored before
+        this field existed: the hash alone cannot name what changed.
+        """
+        self.ensure_one()
+        stored = self.applied_config_snapshot
+        if not stored:
+            return []
+        return _snapshot_diff.diff_keys(stored, self._render_config_snapshot())
+
+    # Depends: only on the anchor. The snapshot side deliberately has NO
+    # field dependency list (its whole point is covering every deploy
+    # input automatically), so within one env cache the value can go
+    # stale after an edit; every HTTP request gets a fresh cache, which
+    # is the consumer that matters. Tests invalidate explicitly.
+    @api.depends("applied_config_hash")
+    def _compute_config_dirty(self):
+        """Dirty = a hash was recorded by a deploy and it no longer
+        matches. Records that never deployed (empty hash) are not dirty
+        — their whole config is pending by definition and the UI already
+        shows the deploy call-to-action."""
+        for inst in self:
+            applied = inst.applied_config_hash
+            if not applied:
+                inst.config_dirty = False
+                continue
+            try:
+                inst.config_dirty = applied != inst._config_snapshot_hash()
+            except Exception:
+                # A snapshot that cannot render (undecryptable secret,
+                # legacy row) must not break the detail page: treat the
+                # record as untracked, not as dirty.
+                _logger.warning(
+                    "config_dirty: snapshot render failed for instance %s",
+                    inst.id, exc_info=True,
+                )
+                inst.config_dirty = False
+
+    # ── Lifecycle state machine ────────────────────────────────────────────
+
+    # Legal moves between lifecycle states. Everything not listed here
+    # is a bug in the caller, not a case to tolerate: an instance that
+    # jumps straight from 'draft' to 'deleting' (or re-enters
+    # 'deploying' while a deploy is in flight) means two flows are
+    # fighting over the same record.
+    #
+    #   draft     → deploying   deploy() enqueues the job
+    #   draft     → deployed    ONLY importing an already-running instance
+    #   deploying → deployed    deploy (or a layer's build) succeeded
+    #   deploying → draft       deploy failed; status carries the error
+    #   deployed  → deleting    teardown job enqueued
+    #   deleting  → draft       torn down; config kept in the panel
+    #   deleting  → deployed    teardown failed; it is still on the host
+    #
+    # Unlink is not a transition: a record can only be dropped from
+    # 'draft' (see :meth:`unlink`).
+    _STATE_TRANSITIONS = {
+        "draft": ("deploying", "deployed"),
+        "deploying": ("deployed", "draft"),
+        "deployed": ("deleting",),
+        "deleting": ("draft", "deployed"),
+    }
+
+    # States in which the instance still exists on its host. 'deleting'
+    # belongs here: until the teardown job succeeds the stack is still
+    # there, which is exactly what ``deployed`` meant before it became
+    # derived — so search domains, crons and the SPA keep behaving the
+    # same through a teardown.
+    _ON_HOST_STATES = ("deployed", "deleting")
+
+    @api.depends("state")
+    def _compute_deployed(self):
+        for inst in self:
+            inst.deployed = inst.state in self._ON_HOST_STATES
+
+    def _compute_stop_is_expected(self):
+        """Expose :meth:`_stop_is_expected` to the panel and to views."""
+        for inst in self:
+            inst.stop_is_expected = inst._stop_is_expected()
+
+    def _stop_is_expected(self):
+        """Return whether this instance being down is normal, not broken.
+
+        False here, always: base knows of no legitimate reason for a
+        deployed instance to have stopped, so anything down is an
+        incident and is reported as one. A layer that does know of one —
+        one that sleeps an idle instance — overrides this.
+
+        Asking the instance, rather than testing a field base does not
+        have, is what keeps sleeping out of base entirely. Same shape as
+        ``_metric_alerts_suppressed`` and the health probe's
+        ``_odoo_stop_is_expected``, for the same reason.
+
+        :rtype: bool
+        """
+        self.ensure_one()
+        return False
+
+    def _transition(self, to_state):
+        """Move this instance to *to_state*.
+
+        The only supported way to write ``state``: it validates the move
+        against :attr:`_STATE_TRANSITIONS` and refuses anything else, so
+        a wrong call fails where it happens instead of leaving a record
+        in a state no flow can explain.
+
+        :param str to_state: target lifecycle state
+        :raises UserError: if the move is not in the transition map
+        """
+        self.ensure_one()
+        if to_state not in self._STATE_TRANSITIONS.get(self.state, ()):
+            raise UserError(
+                _(
+                    "Cannot move instance '%(name)s' from '%(current)s' to "
+                    "'%(target)s'.",
+                    name=self.name,
+                    current=self.state,
+                    target=to_state,
+                )
+            )
+        # With superuser rights, once the move is valid: ``write`` takes
+        # ``state`` from no one else, whatever their context says.
+        return self.sudo().with_context(cloud_state_transition=True).write(
+            {"state": to_state},
+        )
+
+    def write(self, vals):
+        self._check_guarded_vals(vals)
+        # The lifecycle is a state machine, so ``state`` is written by
+        # _transition() alone. Refusing the direct write here is what
+        # keeps the map from being quietly bypassed later.
+        if "state" in vals and not (
+            self.env.su and self.env.context.get("cloud_state_transition")
+        ):
+            raise UserError(
+                _(
+                    "The lifecycle state of an instance is set by "
+                    "_transition(), not by writing 'state' directly."
+                )
+            )
+        # ``deployed`` is derived from ``state``. Odoo accepts a write to
+        # a stored computed field and then silently discards it on the
+        # next recompute, which would turn a stale caller into an
+        # invisible no-op; refuse it instead.
+        if "deployed" in vals:
+            raise UserError(
+                _(
+                    "'deployed' is derived from the lifecycle state. Use "
+                    "_transition() instead of writing it."
+                )
+            )
+        # Archived, an instance has what waits on it cancelled when its
+        # turn comes (``cloud.job._entry_verdict``): held to what its
+        # delete would be held to for what waits there.
+        if "active" in vals and not vals["active"] and not self.env.su:
+            Job = self.env["cloud.job"]
+            for inst in self.filtered("active"):
+                Job._check_may_end_waiting(
+                    Job._queued_on((inst.id, None)).filtered(
+                        lambda job: not Job._runs_on_archived(job),
+                    ),
+                    inst,
+                )
+        # Drop empty password values so existing stored passwords are preserved
+        for field in self._PASSWORD_FIELDS:
+            if field in vals and not vals[field]:
+                del vals[field]
+        vals = self._relay_server_vals(vals)
+        # A form sends the series back on every save: unchanged, it is
+        # not a choice for ``_check_series_may_be_chosen`` to judge.
+        vals = _odoo_versions.without_unchanged_series(self, vals)
+        changed, old_snap = self._audit_snapshot(vals)
+        relay_moved = self.filtered(lambda inst: any(
+            name in vals and (inst[name] or False) != (vals[name] or False)
+            for name in ("smtp_relay_auth", "smtp_relay_host")
+        ))
+        # A form sends the name back on every save: only a change moves
+        # the computed backup path. So does emptying a path written by
+        # hand: the instance goes back to the computed one. Not one with a
+        # suffix: its path is already its own, and a claim that found the
+        # path without it free would move it there, away from its chain.
+        path_moved = self.filtered(lambda inst: (
+            "name" in vals and inst.name != vals["name"]
+        ) or (
+            "project_id" in vals
+            and inst.project_id.id != (vals["project_id"] or False)
+        ) or (
+            "custom_backup_dst" in vals and inst.custom_backup_dst
+            and not vals["custom_backup_dst"]
+            and not inst.backup_path_suffix
+        ))
+        result = super().write(vals)
+        relay_moved._forget_relay_state()
+        # Odoo checks the record rules on the instance as it was: one moved
+        # to another project is checked again as it is now, so it goes
+        # only to a project its writer is a member of.
+        if "project_id" in vals:
+            self.check_access("write")
+        # The computed backup path moves with the name and the project:
+        # it must not move into one another instance holds.
+        path_moved._claim_own_backup_path()
+        # Auto-generate domain when a host is assigned to an instance
+        # that doesn't have any domains yet (e.g. imported without host).
+        if "host_id" in vals and vals["host_id"]:
+            for inst in self:
+                if inst.domain_ids:
+                    continue
+                host = inst.host_id
+                if not host.wildcard_domain:
+                    continue
+                project = inst.project_id
+                if project and project.remote_folder:
+                    subdomain = f"{project.remote_folder}-{inst.name}"
+                else:
+                    subdomain = inst.name
+                hostname = f"{subdomain}.{host._subdomain_suffix()}"
+                self.env["cloud.instance.domain"].create(
+                    {
+                        "instance_id": inst.id,
+                        "hostname": hostname,
+                    }
+                )
+        self._audit_log_changes(changed, old_snap)
+        return result
+
+    def _audit_target_vals(self):
+        """Point 'Config changed' audit rows at this instance and host."""
+        self.ensure_one()
+        return {
+            "instance_id": self.id,
+            "host_id": self.host_id.id if self.host_id else False,
+        }
+
+    def _check_backup_backend(self):
+        """Raise if this production instance has no effective backup backend."""
+        if self.environment == "production" and not self.effective_backup_backend:
+            raise UserError(
+                _(
+                    "No backup backend configured for this instance. "
+                    "Set one at instance level, project level, or globally "
+                    "in Settings → General → Default Backup Backend."
+                )
+            )
+
+    def _backup_enabled(self):
+        """Whether this instance should run the doodba ``backup`` service.
+
+        Default: any instance with a usable backup backend (one that
+        resolves a ``backup_dst``) is backup-enabled. Modules layered
+        on top (e.g. one that turns backups off for some instances) may
+        override to opt out.
+        """
+        self.ensure_one()
+        bb = self.effective_backup_backend
+        return bool(bb and bb.backup_dst)
+
+    def _backup_retention(self):
+        """Return the retention this instance's backups keep (``7D``, ``3M``).
+
+        Default: the backup destination's, ``3M`` without one or when it
+        is empty. Modules layered on top (e.g. one that keeps a retention
+        of its own per instance) may override; every executor reads it
+        from here, as it reads :meth:`_backup_enabled`.
+
+        :rtype: str
+        """
+        self.ensure_one()
+        bb = self.effective_backup_backend
+        retention = (bb.backup_retention or "").strip() if bb else ""
+        return retention or TEMPLATE_BACKUP_RETENTION
+
+    def _cron_backup_retention(self):
+        """Return the retention the backup container's cleanup applies, or None.
+
+        None while the instance runs no backups, while the bucket's
+        lifecycle or nobody deletes the old ones, and for a retention the
+        container must not run (``valid_backup_retention``), which leaves
+        the template's own ``3M``.
+
+        :rtype: str | None
+        """
+        self.ensure_one()
+        if not self._backup_enabled():
+            return None
+        if self.effective_backup_backend.retention_owner != "cron":
+            return None
+        retention = self._backup_retention()
+        return retention if valid_backup_retention(retention) else None
+
+    def _egress_whitelist(self, template_ref=None):
+        """Hostnames this instance's own egress gateway may reach.
+
+        Empty for production — a production instance is the customer's
+        own deployment and this platform does not filter its traffic.
+
+        A staging whose own list nobody filled in used to fall back to
+        its host's central whitelist: the template joined every staging
+        to the host's shared proxies. Template v10 has no such network,
+        and a staging without an allowlist sits on an internal network
+        with no way out at all. So under v10 an empty list of its own
+        means the host's list (``cloud.host.whitelist``), rendered into
+        the staging's gatekeeper: the same meaning as before, enforced
+        by the staging itself. Under an older template it stays empty,
+        and the host's proxies answer, as they did.
+
+        Order and duplicates are the operator's: the list is rendered
+        into a copier answer that feeds the config-drift hash, so it
+        has to read the same way twice.
+
+        :param str template_ref: the template the stack is, or will be,
+            rendered with; the pinned one by default (what a deploy runs)
+        :return: list of hostnames, possibly empty
+        """
+        self.ensure_one()
+        if self.environment == "production":
+            return []
+        entries = self.whitelist_ids
+        if not entries and self._template_has_gatekeeper(
+            _odoo_versions.pinned_template_ref(self.env)
+            if template_ref is None else template_ref
+        ):
+            # With ``sudo``, as at creation: the deploy runs as whoever
+            # asked for it, and the hostnames only end up in the copier
+            # answer of the staging's own gatekeeper.
+            entries = self.host_id.sudo().whitelist_ids
+        seen = []
+        for entry in entries:
+            host = (entry.hostname or "").strip()
+            if host and host not in seen:
+                seen.append(host)
+        return seen
+
+    #: Compose services a user may open a shell into. Everything else a
+    #: staging renders is infrastructure this platform put there — the
+    #: egress gateway and its sidecar — and infrastructure is not the
+    #: customer's to sit inside.
+    _SHELL_SERVICES = ("odoo", "db", "smtp", "backup")
+
+    def _shell_services(self):
+        """Return the deployed services a terminal session may target.
+
+        Read from ``compose_services`` (what the last deploy actually
+        found on the host) rather than from :meth:`expected_services`,
+        so the list a user is offered is the list that exists — and
+        then narrowed to :attr:`_SHELL_SERVICES`.
+
+        :return: list of service names, in the order they were detected
+        """
+        self.ensure_one()
+        allowed = set(self._SHELL_SERVICES)
+        return [
+            svc
+            for svc in (
+                s.strip()
+                for s in (self.compose_services or "odoo,db").split(",")
+            )
+            if svc and svc in allowed
+        ]
+
+    def _check_template_ref(self, ref):
+        """Refuse to render this instance with a template too old for its series.
+
+        Called by the deploy and the rebuild before anything is uploaded:
+        a series the pinned template cannot render would otherwise fail
+        inside copier, late and with copier's own words. The series' card
+        (``_odoo_versions``) says which template it needs.
+
+        :param ref: the pinned template, as ``_copier_template`` returns it.
+        :raises UserError: when the pin is older than the series needs.
+        """
+        self.ensure_one()
+        if _odoo_versions.template_ref_allows(self.odoo_version, ref):
+            return
+        raise UserError(_(
+            "Odoo %(version)s needs doodba template %(needed)s or newer; "
+            "the panel is pinned to %(pinned)s (Settings → Doodba template "
+            "version, runbook RB-15).",
+            version=self.odoo_version,
+            needed=_odoo_versions.card(self.odoo_version)["template_min"],
+            pinned=ref,
+        ))
+
+    @staticmethod
+    def _template_has_gatekeeper(ref):
+        """Whether doodba template *ref* closes a staging's egress with a gatekeeper.
+
+        Template v10 replaced ``proxy_general`` and ``odoo_net_setup`` by
+        one ``gatekeeper`` service, whose network ``odoo`` uses
+        (``network_mode: service:gatekeeper``) and which carries the
+        staging's Traefik labels.
+
+        :param str ref: a template tag such as ``v10.0.8``; empty or not a
+            version means an older template
+        :rtype: bool
+        """
+        match = re.fullmatch(r"v?(\d+)(?:\.\d+)*", (ref or "").strip())
+        return bool(match) and int(match.group(1)) >= 10
+
+    def expected_services(self, template_ref=None):
+        """Compose services this instance is supposed to render and run.
+
+        Single source of truth consumed by deploy / rebuild (to emit
+        the right ``docker-compose.override.yml``) and by the health
+        probe (to know which containers must be ``running``). The
+        shape matches what the copier template actually renders:
+
+        * staging / dev → ``odoo`` + ``db`` + ``smtp``. The staging
+          ``smtp`` is not a relay: the template wires Odoo to an
+          in-stack mail catcher (``SMTP_SERVER: smtplocal``) so a copy
+          of production never mails real customers. It is there
+          unconditionally, with or without ``smtp_relay_host``, and it
+          used to be missing from this list — which left it unprobed
+          (Odoo fails to send and nothing says so), unlimited, and
+          unreachable by the override that keeps its mailbox off the
+          public internet.
+
+          Plus, when the instance has an egress whitelist of its own,
+          what the template closes it with: ``proxy_general`` and
+          ``odoo_net_setup`` up to template v9, ``gatekeeper`` from v10
+          (*template_ref*, the stack's own by default: one rendered by
+          an older template keeps its sidecars until it is rebuilt). They belong here for
+          the same reason ``smtp`` does — a sidecar nobody expects is
+          a sidecar nobody probes, and ``odoo_net_setup`` is the one
+          container whose silent death takes the whitelist down with
+          it while every other light stays green.
+        * production    → ``odoo`` + ``db``, plus ``backup`` when
+          :meth:`_backup_enabled` is true, plus ``smtp`` when a relay
+          host is configured.
+        """
+        self.ensure_one()
+        if self.environment != "production":
+            svcs = ["odoo", "db", "smtp"]
+            ref = self.stack_template_ref if template_ref is None else template_ref
+            if self._egress_whitelist(template_ref=ref):
+                svcs += (
+                    ["gatekeeper"] if self._template_has_gatekeeper(ref)
+                    else ["proxy_general", "odoo_net_setup"]
+                )
+        else:
+            svcs = ["odoo", "db"]
+            if self._backup_enabled():
+                svcs.append("backup")
+            if self.smtp_relay_host:
+                svcs.append("smtp")
+        svcs += [s for s in self._extra_services() if s not in svcs]
+        return tuple(svcs)
+
+    # ── Extension hooks: what an addon adds to an instance's stack ────────
+    #
+    # Core renders the whole stack inside the deploy executor and its
+    # subclasses. These hooks let an addon add to it without patching
+    # executors: every hook answers "nothing" here, so an instance without
+    # such an addon deploys, rebuilds and deletes exactly as before.
+
+    def _extra_services(self):
+        """Compose services an addon adds to this instance's stack.
+
+        Each one must be defined by :meth:`_compose_override_fragments`
+        (with its ``image``): the copier template does not know it. Being
+        listed here is what gets it the platform's label and log rotation,
+        started with the stack and watched by the health probe.
+
+        :return: service names; none in core
+        :rtype: tuple
+        """
+        self.ensure_one()
+        return ()
+
+    def _compose_override_fragments(self):
+        """Extra ``docker-compose.override.yml`` content, by service.
+
+        Merged into what the platform renders and never over it:
+        mappings (``environment``, ``labels``) gain keys the platform
+        does not set, ``volumes``, ``env_file`` and ``depends_on`` gain
+        entries, and any other key is set only where the platform set
+        none. So a fragment can neither replace Odoo's ``command`` nor a
+        limit.
+
+        :return: ``{service: {key: value}}``; empty in core
+        :rtype: dict
+        """
+        self.ensure_one()
+        return {}
+
+    def _forget_relay_state(self):
+        """Start the relay's state over: its server or sign-in changed.
+
+        What was read about the relay before is about another relay: the
+        state goes back to unknown and its alert is resolved.
+        """
+        for inst in self:
+            self.env["cloud.alert"].resolve_alert(
+                _relay_oauth.ALERT_CODE, instance=inst,
+            )
+        if self:
+            self.sudo().write({
+                "smtp_relay_state": "unknown",
+                "smtp_relay_checked_at": False,
+                "smtp_relay_error": False,
+            })
+
+    def _relay_test_refusal(self):
+        """Say why the relay's test mail cannot be sent now, or nothing.
+
+        The form shows it beside the disabled button, and
+        :meth:`send_relay_test_mail` refuses with it.
+
+        :returns: the reason, translated; empty when the test may run
+        :rtype: str
+        """
+        self.ensure_one()
+        if self.environment != "production":
+            return _(
+                "Only a production's relay sends mail: a staging captures it."
+            )
+        if not self.smtp_relay_host:
+            return _("This instance has no mail relay.")
+        if not self.host_id or not self.deployed:
+            return _("Deploy the instance first.")
+        if not self.running:
+            if self._stop_is_expected():
+                return _("The instance is asleep: wake it first.")
+            return _("Start the instance first: its relay is stopped.")
+        if self.config_dirty:
+            return _(
+                "Apply the changes first: the test would use the relay as "
+                "it was deployed."
+            )
+        return ""
+
+    def send_relay_test_mail(self):
+        """Queue one test mail through this production's relay.
+
+        It goes to the person who asks, at their own address, never to
+        anyone else: the job sends it to its creator's address
+        (``RelayTestMailExecutor``). Everything that holds the test back
+        is checked here, the only way to ask for one: the role, the
+        instance as the caller reads it, the refusal, the address and,
+        last, :data:`RELAY_TEST_MAILS_PER_HOUR`, so a refused test costs
+        none of the hour's; a test the queue refuses (one already waits)
+        has its hit given back. The job type is the manager's
+        (``cloud.job._job_type_min_group``), so the job is queued with
+        superuser rights once all of it passed; its creator stays the
+        caller. Its type lets one wait at most per instance.
+
+        :returns: the ``cloud.job`` id
+        :rtype: int
+        :raises UserError: when the test cannot run now, the person has
+            no address, or the hour's test mails are spent
+        :raises AccessError: when the caller is below a consultant or
+            cannot read the instance
+        """
+        self.ensure_one()
+        self._check_cloud_group("group_cloud_consultant")
+        # ``enqueue`` reads the target as the caller; with ``sudo`` it
+        # does not, so the record rules are applied here.
+        self.check_access("read")
+        refusal = self._relay_test_refusal()
+        if refusal:
+            raise UserError(refusal)
+        if not _relay_oauth.valid_mailbox(self.env.user.email):
+            raise UserError(_(
+                "Your user has no e-mail address to send the test to. Add "
+                "one to your profile."
+            ))
+        bucket = f"relay_test_mail:{self.id}"
+        if not consume_quota(
+            self.env, bucket,
+            max_per_window=RELAY_TEST_MAILS_PER_HOUR, window_seconds=3600,
+        ):
+            raise UserError(_(
+                "This relay sent %(count)s test mails in the last hour. "
+                "Try again later.",
+                count=RELAY_TEST_MAILS_PER_HOUR,
+            ))
+        try:
+            return self.env["cloud.job"].sudo().enqueue(
+                self.host_id.id, self.id, "relay_test_mail",
+            )
+        except Exception:
+            # The hit was committed apart; no mail will leave for it. A
+            # refund that fails must not hide the refusal the asker gets.
+            try:
+                refund_quota(self.env, bucket)
+            except Exception:
+                _logger.exception(
+                    "Could not give back the hit of %s", bucket,
+                )
+            raise
+
+    def _extra_env_files(self):
+        """Files shipped into the instance directory on every build.
+
+        Written by deploy and rebuild after copier, before
+        the stack starts, readable by their owner only — they hold
+        credentials. The content is never logged. A file nobody lists
+        any more stays on the host until whoever listed it removes it.
+
+        Core lists the OAuth2 relay's credentials
+        (``_relay_oauth.CREDENTIALS_FILE``) when the relay renders with
+        OAuth2; deploy and rebuild remove the file otherwise
+        (``DeployInstanceExecutor._relay_oauth_file_step``). An addon
+        adds its own files to what ``super()`` returns.
+
+        :return: ``{relative_path: content}``
+        :rtype: dict
+        """
+        self.ensure_one()
+        files = self._backup_sftp_files()
+        if self._relay_oauth_renders():
+            files[_relay_oauth.CREDENTIALS_FILE] = _relay_oauth.credentials_json(
+                self.smtp_relay_oauth_directory_id or "",
+                self.smtp_relay_oauth_client_id or "",
+                self._relay_oauth_secret(),
+                self.smtp_relay_user or "",
+            )
+        return files
+
+    def _backup_sftp_files(self):
+        """Return the files the ``backup`` service logs in to SFTP with.
+
+        The key, the trusted server key and ``~/.ssh/config``
+        (``sftp_dst.SSH_DIR``); for a destination that logs in with a
+        password, the trusted server key and a config without an identity
+        only, the password travelling in ``backup.env``
+        (``DeployInstanceExecutor._backup_env_content``). Refuses the build
+        first when they cannot protect the copies: no confirmed server key,
+        a key or a password that cannot be read, or a backup path that is
+        not on the destination's server.
+        duplicity's paramiko asks about a server it does not know instead
+        of refusing it, and only finds the key under the server's name as
+        the path writes it: the path and the key must name the same
+        server, user and port (``sftp_dst.check_dst``).
+
+        Deploy and rebuild remove the directory when the instance does not
+        back up to SFTP (``DeployInstanceExecutor._write_extra_env_step``).
+
+        :return: ``{relative_path: content}``, empty without SFTP
+        :rtype: dict
+        :raise UserError: when the build must not go ahead
+        """
+        self.ensure_one()
+        bb = self._backup_sftp_backend()
+        if not bb:
+            return {}
+        if not bb.sftp_host_key_fingerprint or not bb.sftp_known_hosts:
+            raise UserError(_(
+                "Confirm the SFTP server's key on the backup destination "
+                "%(name)s: read it, compare it and trust it, then try again.",
+                name=bb.name,
+            ))
+        if bb.sftp_auth_method == "password":
+            try:
+                password = bb.sftp_password or ""
+            except ValueError:
+                password = ""
+            if not password:
+                raise UserError(_(
+                    "The SFTP password of the backup destination %(name)s "
+                    "cannot be read. Enter it again on the destination and "
+                    "try again.",
+                    name=bb.name,
+                ))
+            key = ""
+        else:
+            try:
+                key = bb.sftp_private_key or ""
+            except ValueError:
+                key = ""
+            if not key:
+                raise UserError(_(
+                    "The SFTP key of the backup destination %(name)s cannot be "
+                    "read. Generate a new one, add it to the server and try again.",
+                    name=bb.name,
+                ))
+        dst = self.instance_backup_dst or ""
+        try:
+            path = sftp_dst.check_dst(
+                bb.sftp_user, bb.sftp_host, bb.sftp_port, dst,
+            )
+        except sftp_dst.DstError as exc:
+            raise UserError(_(
+                "The backup path of %(instance)s (%(path)s) is not on the "
+                "server of its destination %(name)s (%(user)s@%(host)s, port "
+                "%(port)s). A path on another SFTP server is not supported.",
+                instance=self.name, path=dst, name=bb.name,
+                user=bb.sftp_user, host=bb.sftp_host, port=bb.sftp_port,
+            )) from exc
+        if not sftp_dst.instance_path(path):
+            raise UserError(_(
+                "The backup path of %(instance)s (%(path)s) must end in a "
+                "folder of its own: it would be shared with other instances.",
+                instance=self.name, path=dst,
+            ))
+        known_hosts = bb.sftp_known_hosts.strip() + "\n"
+        if not key:
+            return {
+                sftp_dst.SSH_KNOWN_HOSTS_FILE: known_hosts,
+                sftp_dst.SSH_CONFIG_FILE: sftp_dst.SSH_CONFIG_PASSWORD,
+            }
+        return {
+            sftp_dst.SSH_KEY_FILE: key if key.endswith("\n") else key + "\n",
+            sftp_dst.SSH_KNOWN_HOSTS_FILE: known_hosts,
+            sftp_dst.SSH_CONFIG_FILE: sftp_dst.SSH_CONFIG,
+        }
+
+    def _teardown_pre_steps(self, inst_dir, keep_in_panel):
+        """Steps an addon runs before a delete tears the stack down.
+
+        Only on the delete that ends the instance's life on its host,
+        never on a move's cleanup of the copy it left behind: that
+        instance lives on elsewhere. The stack is still up, so a step can
+        use its containers.
+
+        :param str inst_dir: the instance directory on the host
+        :param bool keep_in_panel: the record stays as an archived draft
+        :return: ``(label, command[, opts])`` tuples; none in core
+        :rtype: list
+        """
+        self.ensure_one()
+        return []
+
+    def _teardown_purge_prefixes(self, keep_in_panel):
+        """The prefixes the addon steps of a delete empty (``_teardown_pre_steps``).
+
+        Each is checked before the delete's first step, as the duplicity
+        chain's is (``DeleteInstanceExecutor._refuse_shared_prefix``): a
+        prefix that holds another instance's copies refuses the delete.
+
+        :param bool keep_in_panel: the record stays as an archived draft
+        :return: one ``boto3+s3://`` or ``s3://bucket/path`` per prefix;
+            none in core
+        :rtype: list
+        """
+        self.ensure_one()
+        return []
+
+    def _teardown_pre_steps_left(self, results, job):
+        """What the addon steps of a delete that succeeded left behind.
+
+        Called by the delete, on its durable cursor, once the teardown
+        succeeded and before the record goes: a step of
+        ``_teardown_pre_steps`` that could not do all of its work and must
+        not stop the delete for it (the credentials it needed were not on
+        the host) says so here, so it reaches a person instead of a line
+        of the job's log. An addon raises its alert from its override; an
+        alert on the instance goes with the record, and one on the host
+        with the host, so one that must outlive both is raised on
+        neither. Asked in a savepoint, and an exception is logged rather
+        than failing the delete (``DeleteInstanceExecutor._teardown_left``).
+
+        :param dict results: ``{label: {'stdout', 'exit_status'}}`` of the
+            steps that ran
+        :param job: the delete's ``cloud.job``
+        :return: one message per thing left behind, for the job's log;
+            none in core
+        :rtype: list
+        """
+        self.ensure_one()
+        return []
+
+    def _archived_copy_extra_prefixes(self):
+        """Other prefixes of this archived instance's copy, emptied with it.
+
+        Deleting an archived instance empties its duplicity chain
+        (``custom_backup_dst``) before the record goes
+        (``PurgeArchivedBackupsExecutor``). An addon that keeps part of
+        the instance's copy under a prefix of its own, beside the chain,
+        names it here: the same job empties it in the same way, with the
+        same destination's credentials and the same cutoff
+        (``purge_cutoff_at``), and the record only goes once every one of
+        them is empty.
+
+        Also asked by ``delete_archived`` of an instance with no chain
+        path: one that names a prefix here is deleted by the job, not
+        unlinked outright.
+
+        :return: one ``boto3+s3://`` or ``s3://bucket/path`` DST per
+            prefix, on the instance's backup destination; none in core
+        :rtype: list
+        """
+        self.ensure_one()
+        return []
+
+    def _after_stack_rendered(self):
+        """Called once a deploy or rebuild has shipped the current stack.
+
+        What the addon hooks answered is now on the host, and running: an
+        addon that needs a step after its pieces are in place (switching
+        on what they serve) takes it here rather than rebuilding again.
+        Called on the job's durable cursor, from its success hook. During
+        a move it is the target's deploy, while the instance still lives
+        on its source.
+        """
+        self.ensure_one()
+
+    def _restore_is_followed_by_a_rebuild(self):
+        """Whether the restore that just ended is followed by a rebuild.
+
+        Nothing in core does that: a layer that brings a copy back to current
+        code says so, and whoever would run beside the rebuild waits for it.
+
+        :rtype: bool
+        """
+        self.ensure_one()
+        return False
+
+    def _after_restore_hook(self, kind):
+        """Called once the instance's database has been replaced.
+
+        A restore starts the database from another point in its history,
+        which anything that tracked its history (a continuous archive)
+        must hear of. Called on the job's durable cursor, from the
+        outcome hook of the job that did it.
+
+        :param str kind: ``restore`` (a copy was restored onto it: clone,
+            refresh, the destination of a move), ``backup_restore`` (one
+            of its own backups, a revival included), ``move`` (its
+            cutover onto a new host, after the restore there) or ``pitr``
+            (its own database brought back to a moment by continuous
+            recovery, ``incubacloud_pitr``; also when its files could not
+            be)
+        """
+        self.ensure_one()
+
+    def _job_history_floor(self):
+        """Datetime before which this instance's jobs belong to another life.
+
+        An instance record normally owns its whole job history: it was
+        created for one purpose and kept it, so there is no boundary to
+        draw and this returns ``False``.
+
+        The hook exists for layers that *recycle* an instance record —
+        one that keeps instances built in advance hands one to a new
+        owner who had nothing to do with the months of maintenance
+        already logged against it. Those jobs are still true of the
+        machine and worth keeping, but showing them unannounced makes a
+        brand-new instance look like it has a long and foreign past.
+        Returning a cutoff here makes the job history default to what
+        happened after the handover, with the earlier jobs one click
+        away.
+
+        :return: a ``fields.Datetime`` value, or ``False`` for no cutoff.
+        """
+        self.ensure_one()
+        return False
+
+    def deploy(self):
+        """Enqueue a deploy_instance job for this instance.
+
+        One that waits for an alert is this instance's deploy: it is
+        dispatched again once the alert is closed — an addon conflict is
+        looked for again first, since the repositories may have been
+        fixed in GitHub — and refused while it is not. A deploy that ends
+        blocked at once leaves the instance in 'draft'.
+
+        When the last deploy failed and its ``job_failed`` alert holds the
+        queue, Deploy retries it (``_failed_deploy_to_retry``) instead of
+        queueing a new one that would wait behind the hold: the retry
+        passes it, and its success resolves the alert.
+
+        :return: the id of the ``cloud.job`` that deploys
+        :raises UserError: no host, already deployed, or a deploy waits
+            for an alert that is still open
+        """
+        self.ensure_one()
+        if not self.host_id:
+            raise UserError(_("Instance has no host assigned."))
+        if self.deployed:
+            raise UserError(_("Instance is already deployed. Use Rebuild instead."))
+        self._check_backup_backend()
+        waiting = self.env["cloud.job"].search([
+            ("instance_id", "=", self.id),
+            ("job_type_id.code", "=", "deploy_instance"),
+            ("blocked_alert_id", "!=", False),
+        ], order="id desc", limit=1)
+        if waiting:
+            # One deploy per instance: the one already waiting is the
+            # deploy. Another would wait beside it for the same alert,
+            # and resolving the alert dispatches only one of them.
+            alert = waiting.blocked_alert_id
+            if alert.state == "active" and alert.code == "addon_conflict":
+                # Fixed in GitHub, perhaps, which no save here has seen:
+                # a check that finds none left dispatches the deploy.
+                self._check_addon_conflicts(seconds=ADDON_CHECK_SECONDS)
+                if not waiting.blocked_alert_id:
+                    return waiting.id
+            if waiting.blocked_alert_id.state == "active":
+                raise UserError(_(
+                    "A deploy of '%(name)s' is waiting for an alert to be "
+                    "resolved: %(alert)s. Resolve it in Alerts and the "
+                    "deploy starts by itself.",
+                    name=self.name,
+                    alert=waiting.blocked_alert_id.message,
+                ))
+            waiting.unblock_and_enqueue()
+            return waiting.id
+        failed = self._failed_deploy_to_retry()
+        if failed:
+            # The retry is the deploy: 'deploying' as for a new one, back
+            # to 'draft' if it fails or is cancelled while it waits.
+            self._transition("deploying")
+            job_id = failed.retry_job()
+            # The Deploy pressed is recorded, as ``enqueue`` records one.
+            self.env["cloud.audit.log"].sudo().create({
+                "action": failed.job_type_id.with_context(lang="en_US").name,
+                "instance_id": self.id,
+                "host_id": failed.host_id.id,
+                "job_id": job_id,
+            })
+            return job_id
+        # Enter 'deploying' before enqueuing: the transition map is what
+        # rejects a second deploy while the first is still in flight.
+        self._transition("deploying")
+        job_id = self.env["cloud.job"].enqueue(
+            self.host_id.id,
+            self.id,
+            "deploy_instance",
+        )
+        if self.env["cloud.job"].browse(job_id).blocked_alert_id:
+            # Blocked at enqueue (a dependency conflict): nothing was
+            # dispatched, so nothing is deploying.
+            self._transition("draft")
+        return job_id
+
+    def _failed_deploy_to_retry(self):
+        """The failed deploy a press of Deploy retries, if there is one.
+
+        This instance's last deploy, when it failed and its ``job_failed``
+        alert still holds the instance's queue. A new deploy would only
+        wait behind that hold; retrying is what releases it. Not when the
+        last deploy did not fail, nor when a conflict alert is open on it,
+        beside its ``job_failed`` or in its place: a person has to resolve
+        that first, as for a push's rebuild (``cloud.job._supersedes_hold``).
+        Nor when the instance's pip dependencies hold conflict markers, or
+        an ``addon_conflict`` or ``pip_conflict`` alert is open on the
+        instance: the new deploy ``enqueue`` queues then is the one that
+        checks them and waits for that alert, as any deploy does. A retry
+        would skip those checks.
+
+        :return: the failed ``cloud.job``, or an empty recordset
+        """
+        self.ensure_one()
+        Job = self.env["cloud.job"]
+        last = Job.sudo().search([
+            ("instance_id", "=", self.id),
+            ("job_type_id.code", "=", "deploy_instance"),
+        ], order="id desc", limit=1)
+        if last.state != "failed":
+            return Job
+        if detect_pip_conflicts(self.pip_dependencies) or self.env[
+            "cloud.alert"
+        ].sudo().search_count(
+            [
+                ("instance_id", "=", self.id),
+                ("code", "in", ("addon_conflict", "pip_conflict")),
+                ("state", "=", "active"),
+            ],
+            limit=1,
+        ):
+            return Job
+        on_last = Job._queue_holding_alerts(self.id, self.host_id.id).filtered(
+            lambda alert: alert.job_id == last,
+        )
+        if set(on_last.mapped("code")) == {"job_failed"}:
+            return Job.browse(last.id)
+        return Job
+
+    def _check_addon_conflicts(self, seconds=None, git_budget=None):
+        """Compare this instance's repositories now, not at the next deploy.
+
+        Doodba refuses an addon two repositories define, and the deploy's
+        pre-flight is where that used to surface — hours after the
+        repositories were set, for a customer who imported a project of 86
+        and found 9 such addons when deploying (aitrax, 16-oct-2026).
+        Called where repositories are set (import, instance create and
+        save): conflicts raise the ``addon_conflict`` alert with its
+        Resolve flow; none left closes an open one, and a deploy that was
+        waiting on it goes ahead.
+
+        Never raises, and runs in a savepoint: a GitHub that cannot be
+        read decides nothing — a repository it did not list may be the
+        one that conflicts, so an open alert stays open — and the
+        deploy's pre-flight checks again.
+
+        :param float seconds: at most this long, every GitHub request
+            included; a repository there is no time left for is unread
+        :param GitReadBudget git_budget: the request's GitLab reads, whose
+            ``skipped`` the caller then tells the user of; None: one of
+            its own, of *seconds*. Every caller is a request: the deploy
+            reads in its executor, without it.
+        :return: the conflicts found (empty when none or unknown)
+        :rtype: list
+        """
+        self.ensure_one()
+        # Callers have just written the repository lines.
+        self.invalidate_recordset(["repo_ids"])
+        if not self.repo_ids:
+            return []
+        unread = []
+        budget = None
+        if seconds is not None:
+            budget = HTTPBudget(
+                3 * len(self.repo_ids) + 2, _ADDON_CHECK_MAX_BYTES, seconds,
+            )
+        if git_budget is None:
+            git_budget = GitReadBudget(self.env, seconds=seconds)
+        try:
+            conflicts = asyncio.run(detect_addon_conflicts(
+                self.env, self.repo_ids, unread=unread, budget=budget,
+                git_budget=git_budget,
+            ))
+            with self.env.cr.savepoint():
+                if conflicts:
+                    self._raise_addon_conflict_alert(conflicts)
+                elif not unread:
+                    self._release_addon_conflict()
+        except Exception:
+            _logger.warning(
+                "addon conflict check failed for instance %s", self.id,
+                exc_info=True,
+            )
+            return []
+        return conflicts
+
+    def _release_addon_conflict(self):
+        """Close this instance's ``addon_conflict``; dispatch what waited on it.
+
+        A job left blocked on a closed alert would wait for ever. One
+        that cannot be dispatched right now (another job runs) stays
+        blocked on the closed alert: a deploy that waits is dispatched by
+        the next ``deploy``, the next build of the instance that goes
+        through cancels the rest (``_cancel_stale_waits``), and each can
+        be cancelled from its timeline.
+        """
+        self.ensure_one()
+        alerts = self.env["cloud.alert"].resolve_alert(
+            "addon_conflict", instance=self,
+        )
+        if not alerts:
+            return
+        waiting = self.env["cloud.job"].search([
+            ("blocked_alert_id", "in", alerts.ids),
+        ], order="id desc")
+        for job in waiting:
+            if not job.blocked_alert_id:
+                continue  # cancelled as the twin of one dispatched before
+            try:
+                with self.env.cr.savepoint():
+                    job.unblock_and_enqueue()
+            except UserError as exc:
+                _logger.info(
+                    "job %s stays blocked after its conflict closed: %s",
+                    job.id, exc,
+                )
+
+    def _raise_addon_conflict_alert(self, conflicts, job=None):
+        """Raise, or refresh, this instance's one ``addon_conflict`` alert.
+
+        One alert names every conflict: the panel's Resolve flow picks,
+        addon by addon, which repository keeps it and excludes it from
+        the others. Raised through ``raise_alert``, which files it as the
+        platform and in a savepoint: two saves that find the same
+        conflicts at once end with one alert, not a failed save.
+
+        :param list conflicts: ``[{'addon': str, 'repos': [alias, ...]}]``
+        :param job: the ``cloud.job`` that found them, when one did; its
+            failure is then this alert's news and raises no ``job_failed``
+        :return: the active ``cloud.alert``, or an empty recordset when
+            another transaction filed it and this one cannot see it yet
+        """
+        self.ensure_one()
+        names = ", ".join(c["addon"] for c in conflicts[:3])
+        if len(conflicts) > 3:
+            names += f" (+{len(conflicts) - 3} more)"
+        Alert = self.env["cloud.alert"]
+        alert = Alert.raise_alert(
+            "addon_conflict",
+            f"Addon conflict: {names} defined in multiple repos — "
+            "resolve them in Alerts; a deploy waiting on them then starts "
+            "by itself",
+            level="critical",
+            instance=self,
+            job=job,
+        )
+        if not alert:
+            # Another transaction filed it first; it is the one, if this
+            # transaction can see it — one started earlier cannot.
+            alert = Alert.sudo().search(
+                Alert._dedup_domain("addon_conflict", instance=self), limit=1,
+            )
+        as_platform(alert).write({"conflict_data": conflicts})
+        return alert
+
+    def list_backups(self):
+        """Enqueue a backup_list job for this instance."""
+        self.ensure_one()
+        if not self.host_id:
+            raise UserError(_("Instance has no host assigned."))
+        if self.environment == "production":
+            self._check_backup_backend()
+        return self.env["cloud.job"].enqueue(
+            self.host_id.id,
+            self.id,
+            "backup_list",
+        )
+
+    def create_backup(self, with_filestore=True):
+        """Enqueue backup_create → backup_list chain.
+
+        Returns the trailing backup_list job id so callers polling for
+        completion only see ``done`` once the records have been synced
+        from duplicity.
+
+        ``with_filestore`` is forwarded as the ``backup_create``
+        payload and used by the non-prod executor branch to pick the
+        dump's scope (``all`` or ``db``, ``scripts/lib/common.sh``).
+        Production ignores it (duplicity controls shape).
+        """
+        self.ensure_one()
+        if not self.host_id:
+            raise UserError(_("Instance has no host assigned."))
+        if not self.deployed:
+            raise UserError(_("Instance is not deployed."))
+        if self.environment == "production":
+            self._check_backup_backend()
+        step = {"host_id": self.host_id.id, "instance_id": self.id}
+        # Bool coercion at the service-layer boundary so any truthy
+        # input (a stray string from JSON-RPC, etc.) collapses to True
+        # before reaching the shell command in the executor.
+        create_step = {
+            **step,
+            "job_type_code": "backup_create",
+            "payload": {"with_filestore": bool(with_filestore)},
+        }
+        ids = self.env["cloud.job"].enqueue_chain(
+            [
+                create_step,
+                {**step, "job_type_code": "backup_list"},
+            ]
+        )
+        return ids[-1]
+
+    def download_backup(self, payload):
+        """Enqueue a backup_download job for this instance.
+
+        Prod: pulls the requested timestamp from S3 via duplicity.
+        Non-prod: takes a live dump on demand (only ``time='latest'``
+        is meaningful — no snapshot history exists).
+        """
+        self.ensure_one()
+        if not self.host_id:
+            raise UserError(_("Instance has no host assigned."))
+        if self.environment != "production" and not self.deployed:
+            # Non-prod takes a live dump from inside the running odoo
+            # container; without a deployed stack there is no
+            # docker-compose project to ``run --rm`` against.
+            raise UserError(_("Instance is not deployed."))
+        self._check_backup_backend()
+        return self.env["cloud.job"].enqueue(
+            self.host_id.id,
+            self.id,
+            "backup_download",
+            payload=payload,
+        )
+
+    def download_backup_neutralized(self, payload):
+        """Enqueue a backup_download_neutralized job for this instance.
+
+        Unlike ``download_backup`` (prod-only, driven by duplicity), this
+        works for both prod (``time`` = duplicity timestamp) and non-prod
+        (``time`` = 'live', dumps the current DB on the fly).
+        """
+        self.ensure_one()
+        if not self.host_id:
+            raise UserError(_("Instance has no host assigned."))
+        if not self.deployed:
+            raise UserError(_("Instance is not deployed."))
+        if self.environment == "production":
+            self._check_backup_backend()
+        return self.env["cloud.job"].enqueue(
+            self.host_id.id,
+            self.id,
+            "backup_download_neutralized",
+            payload=payload,
+        )
+
+    def revive(self, host_id=None):
+        """Bring an archived instance back: redeploy, then restore.
+
+        Both halves already exist — deploying an instance and restoring
+        the latest snapshot into it — so this only chains them, which is
+        exactly what the archived record was frozen to make possible.
+
+        The host is a choice, not a given. The original may be gone, or
+        full, or the whole reason for archiving may have been to move
+        off it; defaulting to the stored one when nothing is passed
+        keeps the common case one click.
+
+        Restoring reads ``latest`` from the frozen destination rather
+        than a timestamp: archiving pruned to a single chain, so
+        ``latest`` *is* the archive copy, and asking for a date would
+        mean storing one and keeping it true.
+
+        The copy is re-checked live here. The cron's stamp is good
+        enough to render a list, but this is the moment where being
+        wrong costs something: a deploy that succeeds and a restore that
+        finds nothing leaves an empty instance where the operator
+        expected their data.
+
+        :param host_id: host to redeploy on; defaults to the archived
+            ``host_id``.
+        :return: list of the enqueued job ids.
+        :raises AccessError: below a Developer: reviving restores the
+            copy, and restoring is a Developer's. Checked before anything
+            is written, as the panel offers it.
+        :raises UserError: if the instance is not archived, has no
+            frozen copy, or that copy is not there any more, or if the
+            host is archived.
+        """
+        self.ensure_one()
+        self._check_can_deploy()
+        self._check_can_manage_backups()
+        if self.active:
+            raise UserError(_("This instance is not archived."))
+        if not self.custom_backup_dst:
+            raise UserError(
+                _(
+                    "%(name)s was archived without a backup destination, "
+                    "so there is nothing to restore. Its data was "
+                    "destroyed with the containers.",
+                    name=self.name,
+                )
+            )
+        state, _total = self._probe_archived_copy()
+        if state != "present":
+            raise UserError(
+                _(
+                    "The archived copy of %(name)s is not available at "
+                    "%(path)s (%(state)s), so reviving would leave an "
+                    "empty instance. Check the storage before retrying.",
+                    name=self.name,
+                    path=self.custom_backup_dst,
+                    state=state,
+                )
+            )
+        target_host = (
+            self.env["cloud.host"].browse(host_id) if host_id else self.host_id
+        )
+        if not target_host.exists():
+            raise UserError(_("Pick a host to revive this instance on."))
+        # The host it was archived from may be archived itself by now,
+        # and the dialog offers only live ones. Read here, not left to
+        # ``active_test``: the route browses this record with it off.
+        if not target_host.active:
+            raise UserError(
+                _(
+                    "Host %(host)s is archived. Pick another host to "
+                    "revive this instance on.",
+                    host=target_host.name,
+                )
+            )
+        # Un-archive before enqueuing: the jobs address the instance by
+        # id and every downstream query filters on ``active``, so a
+        # still-archived record would have its own deploy skip it.
+        self.with_context(ic_archive_instance=True).write({
+            "active": True,
+            "host_id": target_host.id,
+            # Cleared with the flag it belongs to: a stamp left behind
+            # would make the next archiving look older than it is.
+            "archived_at": False,
+            # Same reasoning, sharper consequence. A deletion that was
+            # decided, failed and then reverted by this revive must not
+            # bound a *future* purge: the cutoff would predate the chain
+            # written since, and that purge would delete nothing while
+            # reporting success.
+            "purge_cutoff_at": False,
+        })
+        return self.env["cloud.job"].enqueue_chain([
+            {
+                "host_id": target_host.id,
+                "instance_id": self.id,
+                "job_type_code": self._move_deploy_job_type(),
+            },
+            {
+                "host_id": target_host.id,
+                "instance_id": self.id,
+                "job_type_code": "backup_restore",
+                # No safety snapshot ahead of this one, unlike
+                # ``restore_backup``: the instance was just built empty,
+                # so there is nothing to protect and a snapshot of an
+                # empty database would only add a chain to pay for.
+                "payload": {"time": "latest"},
+            },
+        ])
+
+    def restore_backup(self, payload):
+        """Enqueue a backup_restore job for this instance.
+
+        Always prepends a fresh ``backup_create`` — restoring an older
+        duplicity snapshot is destructive, so a safety snapshot of the
+        current state is taken first, unconditionally (no opt-out).
+        Same rationale as ``move_to_host``.
+        """
+        self.ensure_one()
+        if not self.host_id:
+            raise UserError(_("Instance has no host assigned."))
+        self._check_backup_backend()
+        job_ids = self.env["cloud.job"].enqueue_chain(
+            [
+                {
+                    "host_id": self.host_id.id,
+                    "instance_id": self.id,
+                    "job_type_code": "backup_create",
+                },
+                {
+                    "host_id": self.host_id.id,
+                    "instance_id": self.id,
+                    "job_type_code": "backup_restore",
+                    "payload": payload,
+                },
+            ]
+        )
+        return job_ids[0]
+
+    def clone_to_staging(
+        self, staging_name, pr_number=0, pr_repo="", pr_head_branch="",
+        pr_provider_id=False, pr_installation_id="",
+    ):
+        """Create a staging copy of this production instance with its data.
+
+        When *pr_number* is provided the clone is a preview instance: the
+        line of the request's repository has its branch set to
+        *pr_head_branch* so the request's code is deployed instead of the
+        default branch. On GitHub the line is the one whose URL is
+        ``github.com/<pr_repo>``; on GitLab, the one of *pr_provider_id*
+        whose path is *pr_repo*.
+
+        :param int pr_provider_id: the GitLab server of a merge request,
+            or False for a GitHub pull request
+        :param str pr_installation_id: the GitHub App installation the
+            pull request's event came through; the platform's alone to
+            set (``_PLATFORM_FIELDS``), as every field of a preview
+        """
+        self.ensure_one()
+        # Server-side backstop: the method is public and therefore
+        # reachable over RPC (call_kw), where the controller's Developer
+        # gate never runs. su callers — the GitHub webhook's sudo'd PR
+        # previews — bypass inside _check_cloud_group.
+        self.env["cloud.security.mixin"]._check_can_clone_to_staging()
+        if self.environment != "production":
+            raise UserError(_("Only production instances can be cloned."))
+        if not self.deployed:
+            raise UserError(_("Instance must be deployed first."))
+        host = self.host_id
+        # A server never read (``last_probed`` empty) has the field's 0,
+        # which says nothing of its disk: the check of the build
+        # (``_check_build_room``) is the one left to refuse it.
+        if pr_number and host.last_probed \
+                and host.disk_free_gb < MIN_DISK_GB:
+            # A preview goes to its production's server, past the automatic
+            # placement: refused here, its request hears why (and the
+            # request may be public: the server is not named), instead of
+            # a deploy that would fail on a full disk (16-nov-2026). The
+            # Check's figure, under which the server is degraded, not the
+            # placement's higher one (``cloud.host._MIN_DISK_FREE_GB``),
+            # which is the room of a first build on a server that has none
+            # yet: the production's built there already, and the build's
+            # own room check refuses one that does not fit (17-nov-2026).
+            raise UserError(_(
+                "The server has %(free).1f GB of disk free, under the"
+                " %(min)s GB a new instance needs: no preview is created"
+                " on it. Free space on the server or enlarge its disk.",
+                free=host.disk_free_gb, min=MIN_DISK_GB,
+            ))
+
+        vals = {
+            "name": staging_name,
+            "project_id": self.project_id.id,
+            "host_id": self.host_id.id,
+            "environment": "staging",
+            "odoo_version": self.odoo_version,
+            "odoo_commit_sha": self.odoo_commit_sha,
+            "odoo_initial_lang": (
+                self.odoo_initial_lang.id if self.odoo_initial_lang else False
+            ),
+            "odoo_proxy": self.odoo_proxy,
+            "postgres_version": self.postgres_version,
+            "postgres_dbname": "prod",
+            "postgres_username": self.postgres_username,
+            "smtp_relay_host": self.smtp_relay_host,
+            "smtp_relay_port": self.smtp_relay_port,
+            "smtp_relay_security": self.smtp_relay_security,
+            "smtp_relay_user": self.smtp_relay_user,
+            "odoo_conf": self.odoo_conf,
+            "pip_dependencies": self.pip_dependencies,
+            "apt_dependencies": self.apt_dependencies,
+        }
+        if pr_number:
+            vals |= {
+                "pr_number": pr_number,
+                "pr_repo": pr_repo,
+                "pr_head_branch": pr_head_branch,
+                "pr_provider_id": pr_provider_id or False,
+                "pr_installation_id": str(pr_installation_id or "") or False,
+                "pr_state": "open",
+            }
+        staging = self.with_context(
+            skip_project_repos=True,
+        ).create(vals)
+
+        pr_repo_norm = _normalize_url(
+            f"https://github.com/{pr_repo}"
+            if pr_repo and not pr_provider_id else ""
+        )
+        for repo in self.repo_ids:
+            new_repo = repo.copy({"instance_id": staging.id})
+            if not (pr_head_branch and pr_repo):
+                continue
+            if pr_provider_id:
+                follows = (
+                    new_repo.provider_id.id == pr_provider_id
+                    and new_repo.repo_path == pr_repo.lower()
+                )
+            else:
+                follows = bool(pr_repo_norm) and (
+                    _normalize_url(new_repo.url) == pr_repo_norm
+                )
+            if follows:
+                new_repo.write({"branch": pr_head_branch, "commit_sha": False})
+
+        # The clone is deployed by the chain below rather than through
+        # deploy(), so it enters 'deploying' here.
+        staging._transition("deploying")
+
+        job_ids = self.env["cloud.job"].enqueue_chain(
+            [
+                {
+                    "host_id": self.host_id.id,
+                    "instance_id": staging.id,
+                    "job_type_code": "deploy_instance",
+                },
+                {
+                    "host_id": self.host_id.id,
+                    "instance_id": self.id,  # prod
+                    "job_type_code": "backup_download",
+                    "payload": {
+                        # Always an on-demand dump. 'latest' needs a
+                        # backup to exist: a production created the same
+                        # day has none until its first nightly run, and
+                        # the chain then failed on the download and left
+                        # the staging empty (2026-10-03). The dump also
+                        # carries production as it is now, not as it was
+                        # last night.
+                        "time": "live",
+                        "download_type": "all",
+                        "handoff": "host",
+                    },
+                },
+                {
+                    "host_id": self.host_id.id,
+                    "instance_id": staging.id,
+                    "job_type_code": "restore_instance",
+                    "payload": {
+                        "mode": "from_host",
+                        "source_job_id": "__chain_job_1__",
+                        # A clone carries production's data, which means
+                        # production's cron jobs and outgoing mail
+                        # servers. Left live, a staging copy invoices,
+                        # duns and emails real customers. PR previews
+                        # included: the core posts the PR comment itself,
+                        # it never goes through the instance's mail.
+                        "neutralize": True,
+                        "reset_base_url": True,
+                    },
+                },
+            ]
+        )
+        return {"staging_id": staging.id, "job_id": job_ids[0]}
+
+    def refresh_from_production(
+        self, source_instance_id, source="backup", neutralize=True,
+    ):
+        """Overwrite this instance's data with a copy of a production's.
+
+        The staging keeps its own code (repos and branches are untouched)
+        and only its database and filestore are replaced — odoo.sh calls
+        this a staging rebuild, a name already taken here by the real
+        rebuild (``copier update`` + image rebuild).
+
+        No new executor: this is the tail of the ``clone_to_staging``
+        chain without the deploy step, so both jobs already tell their
+        story in the timeline and both instances are already covered by
+        ``enqueue_chain``'s per-instance advisory lock.
+
+        :param int source_instance_id: production instance to copy from
+        :param str source: ``'backup'`` (latest duplicity snapshot, the
+            default) or ``'live'`` (on-demand dump). ``'backup'``
+            degrades to ``'live'`` when the source has no backup backend
+            rather than failing, and the resolved value is returned.
+        :param bool neutralize: disable scheduled actions and outgoing
+            mail in the restored copy and show the test banner
+        :return: ``{'ok': True, 'job_ids': [...], 'source': <resolved>}``
+        :raises UserError: on any validation failure
+        :raises AccessError: below the Developer role (same gate as
+            cloning — this method is reachable over RPC)
+        """
+        self.ensure_one()
+        self.env["cloud.security.mixin"]._check_can_clone_to_staging()
+        if source not in ("backup", "live"):
+            raise UserError(_("Unknown data source: %s", source))
+        if self.environment == "production":
+            raise UserError(
+                _("Production instances cannot be refreshed from production.")
+            )
+        if not self.deployed:
+            raise UserError(_("Instance must be deployed first."))
+        if not self.host_id:
+            raise UserError(_("Instance has no host assigned."))
+
+        prod = self.browse(int(source_instance_id)).exists()
+        if not prod:
+            raise UserError(_("Source instance not found."))
+        if prod.environment != "production":
+            raise UserError(_("The source must be a production instance."))
+        if not prod.deployed:
+            raise UserError(_("The source instance is not deployed."))
+        if not prod.host_id:
+            raise UserError(_("The source instance has no host assigned."))
+        if prod.project_id != self.project_id:
+            raise UserError(
+                _("The source must belong to the same project.")
+            )
+
+        # No backup backend means no duplicity store to restore from; a
+        # live dump is the only thing that can work, so degrade instead
+        # of failing and let the caller tell the user what happened.
+        if source == "backup" and not prod.effective_backup_backend:
+            source = "live"
+
+        # Hosts are per step: production and staging may live on
+        # different machines. The archive travels through the control
+        # plane as an ir.attachment, so cross-host is free.
+        job_ids = self.env["cloud.job"].enqueue_chain(
+            [
+                {
+                    "host_id": prod.host_id.id,
+                    "instance_id": prod.id,
+                    "job_type_code": "backup_download",
+                    "payload": {
+                        "time": "latest" if source == "backup" else "live",
+                        "download_type": "all",
+                        "handoff": "host",
+                    },
+                },
+                {
+                    "host_id": self.host_id.id,
+                    "instance_id": self.id,
+                    "job_type_code": "restore_instance",
+                    "payload": {
+                        "mode": "from_host",
+                        "source_job_id": "__chain_job_0__",
+                        "neutralize": bool(neutralize),
+                        "reset_base_url": True,
+                        # A copy left live reads production's secrets, so
+                        # it needs production's key. A neutralized one has
+                        # them cleared and keeps its own.
+                        "share_secret_key": not neutralize,
+                    },
+                },
+            ]
+        )
+        return {"ok": True, "job_ids": job_ids, "source": source}
+
+    # ── Cross-host move ────────────────────────────────────────────────────
+
+    def _move_deploy_job_type(self):
+        """Job type that (re)builds the stack on the destination host
+        during a move.
+
+        Core deploys the bare instance; a layer that stages modules of
+        its own on the instance overrides this with its own deploy job,
+        so those modules are on the new host (the restored DB references
+        them).
+        """
+        return "deploy_instance"
+
+    def _move_prepare_steps(self, source_host):
+        """Return extra chain steps to run before the instance is checked.
+
+        They run once the destination is built and its Odoo stopped, and
+        before ``move_quiet_check``: what takes time and harms nothing
+        if the move is postponed (letting the destination in somewhere,
+        say) goes here, so that only seconds pass between the check and
+        the source's stop. A postponed move is undone by the layer's
+        rollback hook, which takes back what these did. Core: none.
+
+        :param source_host: the ``cloud.host`` the instance moves from
+        :return: list of chain step dicts, as for :meth:`_move_pre_steps`
+        """
+        return []
+
+    def _move_pre_steps(self, source_host):
+        """Return extra chain steps to run just before the source stops.
+
+        They run once the destination is deployed and stopped and the
+        quiet check found the instance free to stop, right before the
+        source's stop: done earlier, they changed the source for the ten
+        minutes the destination's deploy takes. Core: none. Inheriting
+        layers add host-specific quiescing — e.g. removing the
+        Sablier wake-gate so traffic cannot restart the source and
+        produce writes that the dump (taken right after the source is
+        stopped) would miss.
+        """
+        return []
+
+    def _move_cut_steps(self, target_host):
+        """Return extra chain steps to run as the cut starts.
+
+        They run once the source is stopped, before its data is taken:
+        from then on nothing writes to it, and the destination, deployed
+        and stopped, waits for the data. What takes time and needs
+        neither (re-pointing the name a layer manages, say) can start
+        here and run while the restore does, instead of after it. Core:
+        none.
+
+        :param target_host: the ``cloud.host`` the instance moves to
+        :return: list of chain step dicts, as for :meth:`_move_pre_steps`
+        """
+        return []
+
+    def _move_post_restore_steps(self, target_host):
+        """Return extra chain steps to run on the target after the restore.
+
+        They run once the destination holds the source's data and before
+        the cutover hands it the traffic. Core: none. Inheriting layers
+        re-apply there what the restore brought back from the
+        source in a state that no longer holds, such as settings the
+        panel's database still describes.
+
+        :param target_host: the ``cloud.host`` the instance moves to
+        :return: list of chain step dicts, as for :meth:`_move_pre_steps`
+        """
+        return []
+
+    def _move_freeze_steps(self, origin_host):
+        """Return extra chain steps to run on the old host once it is frozen.
+
+        They run last, after ``move_freeze_source`` stopped the old copy
+        and recorded it as frozen. Core: none. Inheriting layers take
+        away there what still routes to the old copy, such as the
+        proxy's file for the panel.
+
+        :param origin_host: the ``cloud.host`` the instance moved from
+        :return: list of chain step dicts, as for :meth:`_move_pre_steps`
+        """
+        return []
+
+    def _frozen_copy_cleanup_steps(self):
+        """Return extra steps of the removal of the copy a move froze.
+
+        Run by ``move_cleanup_source`` on the old host, after the copy's
+        teardown. Core: none. Inheriting layers take away there what a
+        move's freeze left for that copy, such as the proxy's file for
+        the panel.
+
+        :return: ``(label, command[, opts])`` tuples
+        :rtype: list
+        """
+        self.ensure_one()
+        return []
+
+    def _move_quiet_sql(self):
+        """Return the SQL that counts what is busy inside the instance, or ''.
+
+        Run by ``move_quiet_check`` in the instance's own database, on its
+        source host, right before the move would stop it: a count above
+        zero postpones the move. Core: none — what runs inside a bare
+        instance is not the platform's to read. A layer that knows the
+        application inside counts its jobs.
+
+        :return: one statement answering one integer, or ''
+        :rtype: str
+        """
+        return ""
+
+    def _move_requests_check(self, trigger):
+        """Say whether recent requests postpone a move, or None.
+
+        Asked by ``move_quiet_check`` after the jobs were counted, with
+        what started the move (``move_options['trigger']``). Core: None —
+        it has no reading of an instance's traffic. A layer that has one
+        answers for the triggers that depend on it.
+
+        :param str trigger: ``idle``, ``window``, ``now`` or ``manual``
+        :return: ``(reason, detail)`` to postpone, or None to go on
+        :rtype: tuple | None
+        """
+        return None
+
+    def _move_fingerprint_tables(self):
+        """Return the tables whose rows a move counts on both sides.
+
+        ``move_fingerprint`` counts them on the source once Odoo stopped,
+        and the restore counts them again on the destination before Odoo
+        starts there: any difference fails the move. Small tables only,
+        so the count costs nothing inside the cut. Tables the instance
+        does not have are skipped. Inheriting layers add their own.
+
+        :return: table names
+        :rtype: list
+        """
+        return ["res_users", "ir_config_parameter", "ir_attachment"]
+
+    def _on_move_cutover(self, origin_host, cut_seconds=None, trigger=None):
+        """Hook fired on a successful host-move cutover, after ``host_id``
+        has flipped to the destination.
+
+        Core: no-op (DNS is the operator's concern on a bare core
+        install). A layer that manages the instance's DNS overrides this
+        to re-point its A-record at the new host IP and finish the move
+        on its own records.
+
+        :param origin_host: the ``cloud.host`` the instance moved from
+        :param cut_seconds: how long the instance was unavailable, from
+            the drain of its source to the destination answering
+            healthy (``move_last_cut_seconds``), or None when unknown
+        :param trigger: what started the move (``idle``, ``window``,
+            ``now`` or ``manual``), read from its own chain before the
+            cutover cleared the markers (``_move_trigger``). Optional: a
+            layer whose override does not take it is called without it
+            (``MoveCutoverExecutor``)
+        """
+
+    def _on_move_rolled_back(self, target_host=None, outcome=None):
+        """Hook fired once a move that did not happen is undone.
+
+        By then the move markers are cleared and the instance is running
+        on its source host again. Core: no-op. A layer overrides this to
+        give back the state the move had taken from its own records.
+
+        :param target_host: the ``cloud.host`` the move was going to, read
+            before the markers were cleared (None when unknown)
+        :param outcome: why the move did not happen, read before the
+            markers were cleared (``_move_outcome``): a dict with
+            ``kind`` — ``postponed`` (the instance was busy), ``failed``
+            (a step failed), ``cancelled`` (cancelled while it waited),
+            ``manual`` (an operator rolled it back) or ``stuck`` (the
+            watchdog ended it) — and, when known, ``reason``,
+            ``detail``, ``trigger``, ``job_id``, ``job_type`` and
+            ``message``. None when unknown.
+        """
+
+    def _move_outcome(self, kind, **extra):
+        """Describe why the move under way did not happen, for the hook.
+
+        Read from the move's chain, so before its markers are cleared:
+        the step that failed last, with its type and its last message,
+        travels with the outcome whatever ended the move.
+
+        :param str kind: see :meth:`_on_move_rolled_back`
+        :param extra: further keys (``reason``, ``detail``, ``job_id``)
+        :return: the outcome
+        :rtype: dict
+        """
+        self.ensure_one()
+        outcome = {"kind": kind}
+        failed = self._get_move_chain_jobs().sudo().filtered(
+            lambda job: job.state == "failed",
+        )[-1:]
+        if failed:
+            outcome.update({
+                "job_id": failed.id,
+                "job_type": failed.job_type_id.code,
+                "message": failed._get_last_system_message() or "",
+            })
+        outcome.update(extra)
+        return outcome
+
+    def _move_trigger(self):
+        """Return what started the move under way.
+
+        Its options travel in the payload of the chain's
+        ``move_quiet_check`` (``move_to_host``), the only step every move
+        has before its cut. Read from the chain the markers name, so
+        before they are cleared: never another move's check.
+
+        :return: ``idle``, ``window``, ``now`` or ``manual``, the last
+            when the chain or its option is missing
+        :rtype: str
+        """
+        self.ensure_one()
+        check = self._get_move_chain_jobs().sudo().filtered(
+            lambda job: job.job_type_id.code == "move_quiet_check",
+        )[:1]
+        options = (check.payload or {}).get("move_options") or {}
+        return options.get("trigger") or "manual"
+
+    def move_to_host(self, target_host, move_options=None):
+        """Move this deployed instance to ``target_host``, preserving data.
+
+        Reuses the existing executors in one ``enqueue_chain`` so the
+        whole move is a single sequential pipeline. The source is only
+        stopped after the destination is built and the instance found
+        free to stop, and only frozen after the destination is verified
+        healthy and cut over, so a failure at any earlier step leaves the
+        source recoverable (see ``rollback_move`` /
+        ``cron_recover_stuck_moves``)::
+
+            deploy(target, no database) → stop(target, odoo only) →
+            [prepare steps] → move_quiet_check(source) → [pre-steps] →
+            stop(source, odoo only, the cut starts) → [cut steps] →
+            move_fingerprint(source) → backup_download(source, live) →
+            restore(target, verified against the fingerprint) →
+            [post-restore steps] → move_cutover(target, the cut ends) →
+            move_freeze_source(source) → [freeze steps]
+
+        The whole chain runs when the move is due rather than leaving a
+        destination prepared in advance: one built days before would
+        restore a database that references code newer than its own once
+        a release ships, and would hold capacity on two hosts. The
+        customer does not see the preparation, as the instance keeps
+        serving from its source; what they see is the cut.
+
+        ``move_quiet_check`` postpones the move when the instance is
+        busy (``_postpone_move``): the destination is taken down and the
+        source, never stopped, keeps serving. Only the ``odoo`` service
+        is stopped on the source, so ``db`` stays up for the
+        fingerprint and a live dump (``time='live'``): a database nothing
+        writes to any more, dumped with its filestore by a one-off
+        container and handed over through the panel's disk to the
+        restore. It needs neither the instance's ``backup`` container
+        nor a bucket. The move used to take a duplicity snapshot through
+        that container first, and an instance without one (a module may
+        leave it out to save memory) failed there: on 2026-10-15 a move
+        stopped at "service backup is not running". ``host_id`` flips to
+        ``target_host`` only inside ``move_cutover`` on success.
+
+        The old copy is frozen rather than removed: stopped, its data
+        kept, for ``move_frozen_source_hours``. A copy a previous move
+        froze is removed first, by a job queued ahead of the chain: the
+        new move freezes the copy it leaves, and a copy left on the
+        destination would be in the way of its deploy.
+
+        :param target_host: the ``cloud.host`` to move to
+        :param move_options: what the caller tells the move, kept in the
+            payload of its ``move_quiet_check`` (``_move_trigger``):
+            ``trigger`` (``idle``, ``window``, ``now`` or ``manual``, the
+            last when missing) says what started it
+        :return: ``{'ok': True, 'job_id': <first step of the chain>}``
+        :raises UserError: when the instance cannot move to that host now
+        """
+        self.ensure_one()
+        self.env["cloud.security.mixin"]._check_can_manage_hosts()
+        source = self.host_id
+        if not source:
+            raise UserError(_("Instance has no host assigned."))
+        if not self.deployed:
+            raise UserError(_("Instance must be deployed before it can move."))
+        if not target_host or target_host == source:
+            raise UserError(_("Pick a different target host."))
+        if target_host.status != "compatible" or not target_host.traefik_deployed:
+            raise UserError(
+                _(
+                    "Target host '%(name)s' is not ready (must be compatible "
+                    "and have Traefik deployed).",
+                    name=target_host.name or "?",
+                )
+            )
+        if self.move_origin_host_id:
+            raise UserError(_("A move is already in progress for this instance."))
+        options = dict(move_options or {})
+        options.setdefault("trigger", "manual")
+
+        # Ahead of the chain in the instance's queue. Its failure does not
+        # stop the chain, but the deploy of a destination that still holds
+        # the copy refuses (``DeployInstanceExecutor.pre_run_checks``): it
+        # would start the old copy.
+        if self.move_frozen_source_host_id:
+            self._enqueue_frozen_cleanup(
+                f"a new move of the instance to {target_host.name}",
+            )
+
+        # The platform's markers (``_PLATFORM_FIELDS``), the caller's
+        # role checked above.
+        self.sudo().write({
+            "move_origin_host_id": source.id,
+            "move_target_host_id": target_host.id,
+        })
+
+        def step(host, code, payload=None):
+            """One step of the chain, on *host*, for this instance."""
+            entry = {
+                "host_id": host.id, "instance_id": self.id,
+                "job_type_code": code,
+            }
+            if payload:
+                entry["payload"] = payload
+            return entry
+
+        steps = [
+            # Code, images and every container, but no database: the
+            # restore replaces it minutes later (``_move_skipped_labels``).
+            step(target_host, self._move_deploy_job_type()),
+            # The destination's odoo, which nothing uses yet, stops before
+            # the source does: the restore would stop it otherwise, inside
+            # the window the customer waits through (5 s in QA, 20-oct).
+            step(target_host, "stop_instance", {
+                "services": ["odoo"], "move_target": True,
+            }),
+        ]
+        steps += self._move_prepare_steps(source)
+        steps.append(step(source, "move_quiet_check", {"move_options": options}))
+        steps += self._move_pre_steps(source)
+        steps.append(step(source, "stop_instance", {
+            "services": ["odoo"], "move_cut": True,
+        }))
+        steps += self._move_cut_steps(target_host)
+        # Both references are 0-indexed positions in the final list.
+        fingerprint_idx = len(steps)
+        steps.append(step(source, "move_fingerprint"))
+        download_idx = len(steps)
+        steps.append(step(source, "backup_download", {
+            "time": "live",
+            "download_type": "all",
+            "handoff": "host",
+        }))
+        steps.append(step(target_host, "restore_instance", {
+            "mode": "from_host",
+            "source_job_id": f"__chain_job_{download_idx}__",
+            "verify_job": f"__chain_job_{fingerprint_idx}__",
+            # The same database changing hosts: a copy would regenerate
+            # its secret (the links it signed) and uuid, and point the
+            # base URL at localhost.
+            "as_move": True,
+        }))
+        steps += self._move_post_restore_steps(target_host)
+        steps.append(step(target_host, "move_cutover"))
+        steps.append(step(source, "move_freeze_source"))
+        steps += self._move_freeze_steps(source)
+        job_ids = self.env["cloud.job"].enqueue_chain(steps)
+        self.sudo().move_chain_job_ids = ",".join(str(jid) for jid in job_ids)
+        return {"ok": True, "job_id": job_ids[0]}
+
+    def rollback_move(self):
+        """Recover a move that failed before cutover (user entrypoint).
+
+        Cancels all in-flight move-chain jobs, cleans up the
+        half-built destination copy, and brings the source back up.
+        The markers stay set until the cleanup executor succeeds so
+        the UI reports "rolling back" rather than falsely claiming
+        the instance has recovered.
+        """
+        self.ensure_one()
+        self.env["cloud.security.mixin"]._check_can_manage_hosts()
+        if not self.move_origin_host_id:
+            raise UserError(_("No move in progress to roll back."))
+        if self.move_rollback_in_progress:
+            raise UserError(_("A rollback is already in progress."))
+        origin = self.move_origin_host_id
+        if self.host_id != origin:
+            raise UserError(
+                _(
+                    "Cannot roll back: the move already completed "
+                    "(cutover succeeded). The instance is now live on "
+                    "the target host. Use 'Move to host' to move it "
+                    "back if needed."
+                )
+            )
+        result = self._do_rollback_move(kind="manual")
+        if result is False:
+            return {"ok": False, "error": _("Nothing to roll back.")}
+        if result is None:
+            # The chain was still waiting in the queue: cancelling it
+            # undid the move, nothing on any host to recover.
+            return {"ok": True, "job_id": None}
+        return {"ok": True, "job_id": result}
+
+    def _do_rollback_move(self, kind="manual"):
+        """Core stuck-move recovery, WITHOUT the ACL check.
+
+        Cancels every active move-chain job (cooperatively for started
+        ones, via queue_job for dispatched ones, on the spot for a chain
+        still waiting in the queue), then enqueues cleanup (target) and
+        start (source). Returns the ``move_rollback_cleanup`` job id
+        (the head of the recovery), ``False`` when there is nothing to
+        recover, or ``None`` when cancelling a chain that had not started
+        undid the move by itself (``MoveCutoverExecutor.on_cancelled_queued``
+        cleared the markers): nothing on any host needs recovering.
+
+        Shared by ``rollback_move`` (gated on ACL) and the unattended
+        ``cron_recover_stuck_moves`` watchdog (runs as the cron bot).
+
+        :param str kind: what ends the move, for the outcome the hook
+            receives once the cleanup is done (``_move_outcome``):
+            ``manual``, ``failed`` or ``stuck``. Read from the chain
+            before anything of it is cancelled.
+        """
+        self.ensure_one()
+        origin = self.move_origin_host_id
+        if not origin:
+            return False
+        if self.host_id != origin:
+            return False
+        outcome = self._move_outcome(kind)
+        self._cancel_move_chain()
+        if not self.move_origin_host_id:
+            return None
+        return self._enqueue_rollback_jobs(outcome)
+
+    def _postpone_move(self, job, result):
+        """Give up the move under way, before its cut, because it would disturb.
+
+        Called by ``move_quiet_check`` from its own success, with the
+        source never stopped: what waits of the chain is cancelled, and
+        the destination is taken down by a ``move_rollback_cleanup``
+        marked ``move_postponed``. No ``start_instance`` on the source —
+        it never stopped — and no alert: a busy instance is not a failed
+        move. The cleanup clears the markers and tells the hook, with an
+        outcome of kind ``postponed`` (:meth:`_on_move_rolled_back`).
+
+        While it runs, ``move_rollback_in_progress`` is set, as for any
+        rollback: what the cancellation ends must not take the markers
+        itself (``MoveCutoverExecutor.on_cancelled_queued``), and the
+        watchdog leaves a rollback whose cleanup waits alone.
+
+        What it found travels in the outcome, with what started the move
+        (``trigger``): the job's own row is not written from its hook
+        (``AbstractExecutor._write_own_job``), so the layers read the
+        reason there rather than on the job.
+
+        :param job: the ``move_quiet_check`` job, still running
+        :param dict result: what it found, ``postponed`` and ``detail``
+        :return: the ``move_rollback_cleanup`` job id
+        """
+        self.ensure_one()
+        options = (job.payload or {}).get("move_options") or {}
+        outcome = self._move_outcome(
+            "postponed",
+            reason=result.get("postponed"),
+            detail=result.get("detail") or "",
+            job_id=job.id,
+            trigger=options.get("trigger") or "manual",
+        )
+        self.sudo().move_rollback_in_progress = True
+        self.sudo()._cancel_move_chain(except_job=job)
+        return self._enqueue_rollback_jobs(outcome, postponed=True)
+
+    # ── Private helpers for rollback ───────────────────────────────────
+
+    def _get_move_chain_jobs(self):
+        """Return ``cloud.job`` records of the current move chain, ordered
+        by step (same order as ``move_chain_job_ids``).
+
+        Only this instance's jobs: every step of a move acts on the
+        instance that moves, on either host, and a rollback or the
+        watchdog cancels what this returns — never another instance's job
+        the markers might name.
+        """
+        self.ensure_one()
+        if not self.move_chain_job_ids:
+            return self.env["cloud.job"]
+        ids = []
+        for part in (self.move_chain_job_ids or "").split(","):
+            part = part.strip()
+            if part.isdigit():
+                ids.append(int(part))
+        if not ids:
+            return self.env["cloud.job"]
+        jobs = self.env["cloud.job"].search([
+            ("id", "in", ids), ("instance_id", "=", self.id),
+        ])
+        # Preserve original step order.
+        id_to_pos = {jid: i for i, jid in enumerate(ids)}
+        return jobs.sorted(key=lambda j: id_to_pos.get(j.id, 9999))
+
+    def _cancel_move_chain(self, except_job=None):
+        """Cancel every active job in the current move chain.
+
+        Cancellation is best-effort and tolerant of missing records
+        (a crashed worker may have left queue.job rows without a
+        matching cloud.job, and that's fine — the chain stops when
+        its head fails). Head-to-tail order ensures queue_job cascades
+        ``button_cancelled`` to downstream children in
+        ``wait_dependencies``, reducing the number of jobs that need
+        individual cancellation.
+
+        Which steps are still active is read from the column once, up
+        front; a step that an earlier one's cancellation already took
+        with it refuses (``UserError``), which is ignored. An
+        ``AccessError``, a subclass of it, is a refusal of the caller's
+        role and is raised: the move was not stopped.
+
+        :param except_job: a step of the chain to leave alone — the one
+            that calls, while it runs (``_postpone_move``)
+        """
+        chain_jobs = self._get_move_chain_jobs() - (except_job or self.env["cloud.job"])
+        if not chain_jobs:
+            return
+        active_states = tuple(self.env["cloud.job"]._active_states)
+        self.env.cr.execute(
+            "SELECT id FROM cloud_job WHERE id IN %s AND state IN %s",
+            (tuple(chain_jobs.ids), active_states),
+        )
+        active_ids = {row[0] for row in self.env.cr.fetchall()}
+        active = chain_jobs.filtered(lambda j: j.id in active_ids)
+        for job in active:
+            try:
+                job.cancel_job()
+            except AccessError:
+                # A subclass of ``UserError``, but a refusal: the move
+                # was not stopped.
+                raise
+            except UserError:
+                continue
+
+    def _enqueue_rollback_jobs(self, outcome=None, postponed=False):
+        """Enqueue the two recovery jobs after a cancelled move.
+
+        Runs cleanup on the TARGET host (idempotent: docker compose
+        down -v + rm -rf) and start on the SOURCE host, both with
+        ``bypass_running_check``: they go to the head of the instance's
+        queue, before whatever else waits, and start once the cancelled
+        step has stopped — the start first, then the cleanup. The
+        cleanup executor clears the move markers on success; until then
+        ``move_rollback_in_progress`` is True.
+
+        Both are marked ``move_rollback``: a held queue lets them pass
+        (``cloud.job._queue_held_by``), since the failure that holds it
+        is usually the very step this rolls back. Both that mark and the
+        head of the queue are the platform's to ask for
+        (``cloud.job._check_internal_queue_flags``): they are queued with
+        ``sudo``, whoever rolls back — ``rollback_move`` checks the
+        person's role first, the watchdog is a cron.
+
+        A postponed move (``_postpone_move``) never stopped its source:
+        only the cleanup is queued, marked ``move_postponed``.
+
+        :param outcome: what the hook is told once the cleanup is done
+            (``_move_outcome``), carried in its payload
+        :param bool postponed: the move is postponed, not rolled back
+        :return: the ``move_rollback_cleanup`` job id
+        """
+        target = self.move_target_host_id
+        origin = self.move_origin_host_id
+        self.sudo().move_rollback_in_progress = True
+        Job = self.env["cloud.job"].sudo()
+        if not postponed:
+            Job.enqueue(
+                origin.id,
+                self.id,
+                "start_instance",
+                payload={"move_rollback": True},
+                bypass_running_check=True,
+            )
+        # The chain it rolls back names the rollback: the cleanup tears
+        # down the target only while that rollback is under way
+        # (``MoveRollbackCleanupExecutor._refusal``), not once a later
+        # move to the same host set the markers again.
+        payload = {
+            "move_rollback": True,
+            "move_chain_job_ids": self.move_chain_job_ids or "",
+            "move_outcome": outcome or {"kind": "manual"},
+        }
+        if postponed:
+            payload["move_postponed"] = True
+        return Job.enqueue(
+            target.id,
+            self.id,
+            "move_rollback_cleanup",
+            payload=payload,
+            bypass_running_check=True,
+        )
+
+    def _pr_preview_ready_body(self):
+        """Markdown of the request's comment or note for a preview that is up.
+
+        Lives here and not inline in the restore executor so what the
+        comment promises — a link that opens the preview — can be
+        checked without running a job. It ends with the hidden marker
+        the panel finds it by (:meth:`_pr_note_marker`).
+
+        :return: the comment body as :class:`str`
+        """
+        self.ensure_one()
+        url = (
+            f'https://{self.domain}' if self.domain
+            else '_(no domain configured)_'
+        )
+        request = 'merge request' if self.pr_provider_id else 'PR'
+        return (
+            f'✅ **IncubaCloud Preview** — ready!\n\n'
+            f'| | |\n|---|---|\n'
+            f'| **URL** | {url} |\n'
+            f'| **Branch** | `{self.pr_head_branch}` |\n'
+            f'| **Instance** | `{self.name}` |\n\n'
+            f'_Auto-destroys when the {request} is closed._'
+            f'\n\n{self._pr_note_marker()}'
+        )
+
+    def _pr_preview_update_failed_body(self):
+        """Markdown of the request's comment or note for a preview not updated.
+
+        Its database was restored, but updating its modules to the
+        request's code failed (``pr_update_error``, a sentence safe to
+        publish): Odoo was left stopped. A push to the branch rebuilds
+        it.
+
+        :rtype: str
+        """
+        self.ensure_one()
+        request = 'merge request' if self.pr_provider_id else 'pull request'
+        reason = " ".join((self.pr_update_error or "").replace("`", "").split())
+        if self.pr_update_cut_off:
+            # A push is held until the restore's alert is dismissed: the
+            # update may still be running (``pr_update_cut_off``).
+            then = (
+                f'_The update may still be running on the server: a push to'
+                f' the branch of the {request} rebuilds the preview once its'
+                f' alert is dismissed in the panel._'
+            )
+        else:
+            then = f'_Push a fix to the branch of the {request} to try again._'
+        return (
+            f'⚠️ **IncubaCloud Preview** — could not be updated\n\n'
+            f'| | |\n|---|---|\n'
+            f'| **Branch** | `{self.pr_head_branch}` |\n'
+            f'| **Instance** | `{self.name}` |\n'
+            f'| **Reason** | {reason} |\n\n'
+            f'{then}'
+            f'\n\n{self._pr_note_marker()}'
+        )
+
+    def _pr_preview_rebuild_failed_body(self):
+        """Markdown of the request's comment or note for a failed rebuild.
+
+        The last rebuild of the preview failed
+        (``pr_rebuild_failed_job``): what the request pushed is not in
+        it. The comment links to the rebuild's log, which says why; a
+        panel without ``web.base.url`` gives no link.
+
+        :rtype: str
+        """
+        self.ensure_one()
+        request = 'merge request' if self.pr_provider_id else 'pull request'
+        base = (
+            self.env["ir.config_parameter"].sudo().get_param("web.base.url", "")
+            or ""
+        ).rstrip("/")
+        job = self.env["cloud.job"].sudo().browse(
+            self.pr_rebuild_failed_job,
+        ).exists()
+        log = f'| **Log** | {base}/cloud/log/{job.id} |\n' if base and job else ''
+        return (
+            f'❌ **IncubaCloud Preview** — rebuild failed\n\n'
+            f'| | |\n|---|---|\n'
+            f'| **Branch** | `{self.pr_head_branch}` |\n'
+            f'| **Instance** | `{self.name}` |\n'
+            f'{log}\n'
+            f'_The last push to the branch of the {request} is not in the'
+            f' preview.{" The log says why;" if log else ""} Push a fix to the'
+            f' branch, or rebuild the preview in the panel, to try again._'
+            f'\n\n{self._pr_note_marker()}'
+        )
+
+    def _pr_preview_body(self):
+        """Return what the request's comment or note says of its preview now.
+
+        That its last rebuild failed while ``pr_rebuild_failed_job``
+        says so, that its modules could not be updated while
+        ``pr_update_error`` does, else that it is ready.
+
+        :rtype: str
+        """
+        self.ensure_one()
+        if self.pr_rebuild_failed_job:
+            return self._pr_preview_rebuild_failed_body()
+        if self.pr_update_error:
+            return self._pr_preview_update_failed_body()
+        return self._pr_preview_ready_body()
+
+    def _pr_note_marker(self):
+        """Return the hidden marker the panel finds its comment or note by.
+
+        The merge request note's (``cloud.gitlab.mr.note._marker``), for a
+        pull request's comment too: a comment written by a try whose
+        answer never came is found again instead of written twice.
+
+        :rtype: str
+        """
+        self.ensure_one()
+        return self.env['cloud.gitlab.mr.note']._marker(
+            self.project_id.id, self.pr_number,
+        )
+
+    def _enqueue_preview_note(self):
+        """Queue the job that makes the request's comment or note say the truth.
+
+        A merge request's note (``cloud.gitlab.mr.note._enqueue``) or a
+        pull request's comment (:meth:`_enqueue_pr_comment`), each a job
+        of its own, queued in the caller's transaction.
+
+        :return: the queued job, or None for no preview of a request
+        """
+        self.ensure_one()
+        if not self.pr_number:
+            return None
+        if self.pr_provider_id:
+            return self.env['cloud.gitlab.mr.note']._enqueue(self)
+        return self._enqueue_pr_comment()
+
+    def _preview_rebuilt(self, job):
+        """What a successful rebuild of a pull or merge request preview settles.
+
+        A preview whose restore failed in its update
+        (``pr_update_error``) is updated and up: the restore's
+        ``job_failed``, which held its queue, is resolved by this
+        rebuild, and the request's comment or note says it is ready.
+        A preview whose last rebuild failed (``pr_rebuild_failed_job``)
+        has its comment or note say it is ready again. A preview without
+        its comment or note gets it. A request closed, or anything else,
+        has nothing to settle here. Called on the rebuild's durable
+        cursor; what cannot be queued goes to the log, and the rebuild
+        keeps its outcome.
+
+        :param job: the ``cloud.job`` of the rebuild
+        """
+        self.ensure_one()
+        if not self.pr_number or self.pr_state == "closed":
+            return
+        if not (
+            self.pr_update_error or self.pr_rebuild_failed_job
+            or not self.pr_comment_id
+        ):
+            return
+        try:
+            with self.env.cr.savepoint():
+                if self.pr_rebuild_failed_job:
+                    # The platform's field (``_PLATFORM_FIELDS``).
+                    self.sudo().write({"pr_rebuild_failed_job": 0})
+                if self.pr_update_error:
+                    stale = self.env["cloud.alert"].sudo().search([
+                        ("code", "=", "job_failed"),
+                        ("state", "=", "active"),
+                        ("instance_id", "=", self.id),
+                        ("job_id.job_type_id.code", "=", "restore_instance"),
+                    ])
+                    if stale:
+                        stale.write({
+                            "state": "dismissed",
+                            "resolution": "auto",
+                            "resolved_by_job_id": job.id,
+                        })
+                        for alert in stale:
+                            alert._notify_alert_resolved()
+                    # The platform's fields (``_PLATFORM_FIELDS``).
+                    self.sudo().write({
+                        "pr_update_error": False, "pr_update_cut_off": False,
+                    })
+                self._enqueue_preview_note()
+        except Exception as exc:
+            if is_concurrency_error(exc):
+                raise
+            _logger.exception(
+                "Rebuild of the preview %s: its comment was not queued", self.name,
+            )
+
+    def _preview_rebuild_failed(self, job):
+        """What a failed rebuild of a pull or merge request preview settles.
+
+        The request's comment or note says the rebuild failed, with a
+        link to its log (``pr_rebuild_failed_job``), instead of still
+        saying the preview is ready; the next rebuild that passes says it
+        is ready again (:meth:`_preview_rebuilt`). A request closed has
+        nothing to settle. Called on the rebuild's durable cursor; what
+        cannot be queued goes to the log, and the rebuild keeps its
+        outcome.
+
+        :param job: the ``cloud.job`` of the rebuild
+        """
+        self.ensure_one()
+        if not self.pr_number or self.pr_state == "closed":
+            return
+        try:
+            with self.env.cr.savepoint():
+                # The platform's field (``_PLATFORM_FIELDS``).
+                self.sudo().write({"pr_rebuild_failed_job": job.id})
+                self._enqueue_preview_note()
+        except Exception as exc:
+            if is_concurrency_error(exc):
+                raise
+            _logger.exception(
+                "Failed rebuild of the preview %s: its comment was not queued",
+                self.name,
+            )
+
+    def _pr_github_client(self):
+        """Return a GitHub client of the installation the request came through.
+
+        The panel's App may be installed on more than one account. The
+        token is the one of the installation that sent the pull request's
+        event (``pr_installation_id``), which is the one that may write on
+        its repository, whatever installation the panel uses now; a
+        preview created before it was kept uses the panel's. GitHub
+        issues a token only for an installation of this App: one of
+        another App is refused there.
+
+        :rtype: GitHubAppClient
+        :raises UserError: when the panel has no GitHub App
+        """
+        self.ensure_one()
+        creds = self.env["cloud.github.credential.service"].get_credentials()
+        installation = self.pr_installation_id
+        if installation and installation != creds.installation_id:
+            creds = dataclasses.replace(creds, installation_id=installation)
+        return GitHubAppClient(creds)
+
+    def _find_pr_comment(self, client, account, repo):
+        """Return the id of the panel's comment on the pull request, or 0.
+
+        The one carrying :meth:`_pr_note_marker` and written by this App
+        (``performed_via_github_app``, or its bot as the author): anybody
+        can paste the marker in a comment of their own. The comments are
+        read 100 at a time, up to the merge request note's limit of pages.
+
+        :param GitHubAppClient client: the installation's client
+        :param str account: the account part of ``pr_repo``
+        :param str repo: the repository part of ``pr_repo``
+        :rtype: int
+        """
+        marker = self._pr_note_marker()
+        app = self.env["cloud.github.app"].sudo().search([], limit=1)
+        app_id = str(app.app_id or "")
+        bot = f"{app.slug}[bot]" if app.slug else ""
+
+        def _ours(comment):
+            """Return whether *comment* is the panel's, by marker and author."""
+            via = str((comment.get("performed_via_github_app") or {}).get("id") or "")
+            author = (comment.get("user") or {}).get("login") or ""
+            return marker in (comment.get("body") or "") and (
+                (app_id and via == app_id) or (bot and author == bot)
+            )
+
+        for page in range(1, NOTE_MAX_PAGES + 1):
+            comments = client.get(
+                f"/repos/{account}/{repo}/issues/{self.pr_number}/comments"
+                f"?per_page=100&page={page}",
+            ) or []
+            for comment in comments if isinstance(comments, list) else []:
+                if isinstance(comment, dict) and _ours(comment):
+                    return comment.get("id") or 0
+            if len(comments) < 100:
+                break
+        return 0
+
+    def _post_or_update_pr_comment(self, body):
+        """Post or update the GitHub PR comment for this PR preview instance.
+
+        A comment removed on GitHub is written again. One whose id the
+        panel never stored — the answer to its POST did not come, and
+        the job ran again — is found by its marker
+        (:meth:`_find_pr_comment`) and rewritten, not written twice.
+
+        :param str body: the comment's Markdown
+        :raises GitHubAPIError: when GitHub refuses it
+        :raises UserError: when the panel has no GitHub App
+        """
+        if not self.pr_number or not self.pr_repo:
+            return
+        account, repo = self.pr_repo.split("/", 1)
+        client = self._pr_github_client()
+        if self.pr_comment_id:
+            try:
+                client.patch_issue_comment(account, repo, self.pr_comment_id, body)
+                return
+            except GitHubAPIError as exc:
+                if exc.status_code != 404:
+                    raise
+        found = self._find_pr_comment(client, account, repo)
+        if found:
+            client.patch_issue_comment(account, repo, found, body)
+            comment_id = found
+        else:
+            comment_id = client.post_issue_comment(
+                account, repo, self.pr_number, body,
+            ).get("id")
+        if comment_id and comment_id != self.pr_comment_id:
+            # The platform's field (``_PLATFORM_FIELDS``).
+            self.sudo().write({"pr_comment_id": comment_id})
+
+    def _enqueue_pr_comment(self):
+        """Queue the job that writes the preview's comment on the pull request.
+
+        Not written in the restore that brings the preview up: GitHub may
+        be away then, and a job is tried again (``_job_pr_comment``).
+        Queued twice, it is one job.
+
+        :return: the queued job, or None for no GitHub pull request preview
+        """
+        self.ensure_one()
+        if not self.pr_number or self.pr_provider_id:
+            return None
+        return self.sudo().with_delay(
+            max_retries=len(NOTE_RETRY_SECONDS) + 1,
+            channel="root.bg",
+            description=f"Comment on pull request #{self.pr_number} of {self.pr_repo}",
+            identity_key=f"github-pr-comment:{self.id}",
+        )._job_pr_comment()
+
+    @staticmethod
+    def _github_may_answer_later(exc):
+        """Return whether GitHub may take the comment on a later try.
+
+        No answer, a 5xx, a 429, and a 403 of GitHub's secondary rate
+        limit, which it answers with ``Retry-After``.
+
+        :param Exception exc: what the call raised
+        :rtype: bool
+        """
+        status = getattr(exc, "status_code", None)
+        if status is None or status >= 500 or status == 429:
+            return True
+        return status == 403 and "rate limit" in str(exc).lower()
+
+    def _job_pr_comment(self):
+        """Write the preview's comment on the pull request (queued).
+
+        Nothing for a preview gone, closed or not deployed: the close
+        deletes the comment, and the restore that brings a preview up
+        queues this again. The comment says what is true when it runs:
+        that the preview is ready, or that its modules could not be
+        updated (:meth:`_pr_preview_body`). A 401 is tried once more at
+        once: the client dropped the token it had kept, which GitHub
+        may have revoked. GitHub unreachable, or answering 5xx, 429 or
+        its secondary rate limit: tried again after 60, 300 and 900 s,
+        as a merge request's note. Then, or at once on an answer that
+        will not change or on anything else that went wrong, the alert
+        ``pr_preview_note_failed`` goes on the production the preview
+        was cloned from: the preview works, but nobody on the pull
+        request hears of it.
+
+        First it asks GitHub whether the pull request is still open
+        (:meth:`_pr_closed_on_github`): an open and a close delivered at
+        once leave the close without a preview to close, and this job
+        runs after both. One closed meanwhile gets no comment and loses
+        its preview (:meth:`_close_pr_preview`).
+
+        :raises RetryableJobError: when GitHub may answer on a later try
+        """
+        inst = self.sudo().with_context(active_test=False).exists()
+        if not (inst and inst.active and inst.pr_number
+                and not inst.pr_provider_id and inst.pr_state != "closed"
+                and inst.state == "deployed"):
+            return
+        if inst._pr_closed_on_github():
+            inst._close_pr_preview()
+            return
+        Note = self.env["cloud.gitlab.mr.note"]
+        try:
+            try:
+                inst._post_or_update_pr_comment(inst._pr_preview_body())
+            except GitHubAPIError as exc:
+                if exc.status_code != 401:
+                    raise
+                inst._post_or_update_pr_comment(inst._pr_preview_body())
+        except (GitHubAPIError, OSError) as exc:
+            status = getattr(exc, "status_code", None)
+            if self._github_may_answer_later(exc) and not Note._last_attempt():
+                raise RetryableJobError(
+                    f"GitHub did not take the comment of #{inst.pr_number} "
+                    f"of {inst.pr_repo}: {status or type(exc).__name__}",
+                    seconds=Note._retry_seconds(),
+                ) from exc
+            inst._report_pr_comment_failure(
+                _("GitHub answered %(code)s.", code=status or type(exc).__name__),
+            )
+            return
+        except UserError as exc:
+            inst._report_pr_comment_failure(str(exc))
+            return
+        except Exception as exc:
+            if is_concurrency_error(exc):
+                raise
+            _logger.warning(
+                "The comment of pull request #%s of %s failed",
+                inst.pr_number, inst.pr_repo, exc_info=True,
+            )
+            inst._report_pr_comment_failure(
+                _("The panel failed with %(error)s.", error=type(exc).__name__),
+            )
+            return
+        Alert = self.env["cloud.alert"].sudo()
+        key = inst._pr_comment_alert_key()
+        for target in inst | inst._pr_preview_production():
+            Alert.resolve_alert(PR_PREVIEW_NOTE_FAILED_CODE, instance=target, key=key)
+
+    def _pr_closed_on_github(self):
+        """Return whether GitHub says the pull request is closed (merged included).
+
+        ``GET /repos/{account}/{repo}/pulls/{number}`` with the
+        installation's client. A 401 is tried once more at once, as the
+        comment's write: the client dropped the token it had kept. A read
+        that fails, or an answer that is not a pull request with its
+        ``state``, counts as open: it is logged and costs no retry nor
+        alert, and the comment is written as before. So does a pull
+        request whose repository has no ``account/repo`` form: there is
+        nothing to ask. Only the failures to expect (GitHub's answer, the
+        network, the installation) are logged as information; any other
+        is a warning with its traceback.
+
+        :rtype: bool
+        """
+        self.ensure_one()
+        account, slash, repo = (self.pr_repo or "").partition("/")
+        if not (account and slash and repo):
+            _logger.info(
+                "Pull request #%s has no repository to read before its comment: %r",
+                self.pr_number, self.pr_repo,
+            )
+            return False
+        endpoint = f"/repos/{account}/{repo}/pulls/{self.pr_number}"
+        try:
+            client = self._pr_github_client()
+            try:
+                pull = client.get(endpoint)
+            except GitHubAPIError as exc:
+                if exc.status_code != 401:
+                    raise
+                pull = client.get(endpoint)
+        except Exception as exc:
+            if is_concurrency_error(exc):
+                raise
+            if isinstance(exc, (GitHubAPIError, OSError, UserError)):
+                _logger.info(
+                    "Pull request #%s of %s was not read before its comment: %s",
+                    self.pr_number, self.pr_repo,
+                    getattr(exc, "status_code", None) or type(exc).__name__,
+                )
+            else:
+                _logger.warning(
+                    "Pull request #%s of %s was not read before its comment",
+                    self.pr_number, self.pr_repo, exc_info=True,
+                )
+            return False
+        state = pull.get("state") if isinstance(pull, dict) else None
+        if not state:
+            _logger.info(
+                "Pull request #%s of %s was read without its state before its comment",
+                self.pr_number, self.pr_repo,
+            )
+            return False
+        return state == "closed"
+
+    def _close_pr_preview(self):
+        """Close the preview of a pull request GitHub says is closed.
+
+        As the close's event does, in a fixed order: the preview is
+        marked closed first, outside its delete's savepoint, so a close
+        delivered meanwhile waits on the same row instead of queueing a
+        second delete, and a delete that cannot be queued leaves it known
+        to be closed. Then its comment is deleted, its delete queued
+        (:meth:`_remove_closed_preview`; a lost race is raised for
+        queue_job to retry) and the alert about its comment resolved: a
+        closed pull request has no comment to write.
+        """
+        self.ensure_one()
+        inst = self.sudo()
+        # The platform's field (``_PLATFORM_FIELDS``).
+        inst.write({"pr_state": "closed"})
+        if inst.pr_comment_id:
+            inst._delete_pr_comment()
+        try:
+            with self.env.cr.savepoint():
+                inst._remove_closed_preview()
+        except Exception as exc:
+            if is_concurrency_error(exc):
+                raise
+            _logger.exception("The closed preview %s was not deleted", inst.name)
+        else:
+            _logger.info(
+                "PR preview instance %s queued for deletion (PR #%s closed on GitHub)",
+                inst.name, inst.pr_number,
+            )
+        self.env["cloud.github.event"]._resolve_pr_comment_alerts(
+            inst.pr_repo, inst.pr_number,
+        )
+
+    def _pr_comment_alert_key(self):
+        """Return the key of the alert about this pull request's comment.
+
+        ``github_pr:<repo>:<number>``: two pull requests previewing one
+        production have an alert each, and the close of one resolves its
+        own (``cloud.github.event``).
+
+        :rtype: str
+        """
+        self.ensure_one()
+        return f"github_pr:{self.pr_repo}:{self.pr_number}"
+
+    def _pr_preview_production(self):
+        """Return the production this preview was cloned from, or nothing.
+
+        The project's production that follows the pull request's
+        repository; a preview keeps no link to it.
+
+        :rtype: cloud.instance
+        """
+        self.ensure_one()
+        key = _normalize_url(f"https://github.com/{self.pr_repo or ''}")
+        return self.project_id.instance_ids.filtered(
+            lambda i: i.environment == "production" and any(
+                _normalize_url(r.url) == key for r in i.repo_ids
+            )
+        )[:1]
+
+    def _report_pr_comment_failure(self, reason):
+        """Raise ``pr_preview_note_failed``: the comment could not be written.
+
+        On the production the preview was cloned from, where people look,
+        else on the preview, keyed by the pull request
+        (:meth:`_pr_comment_alert_key`).
+
+        :param str reason: what failed
+        """
+        _logger.warning(
+            "The comment of pull request #%s of %s was not written: %s",
+            self.pr_number, self.pr_repo, reason,
+        )
+        self.env["cloud.alert"].sudo().raise_alert(
+            PR_PREVIEW_NOTE_FAILED_CODE,
+            _(
+                "The panel could not write its comment on pull request "
+                "#%(number)s of %(repo)s for the preview %(preview)s: "
+                "%(reason)s The preview works without it; check that the "
+                "panel's GitHub App is still installed on that repository's "
+                "account and may write on its pull requests.",
+                number=self.pr_number, repo=self.pr_repo,
+                preview=self.name, reason=reason,
+            ),
+            level="warning",
+            instance=self._pr_preview_production() or self,
+            key=self._pr_comment_alert_key(),
+        )
+
+    def _delete_pr_comment(self):
+        """Delete the GitHub PR comment for this PR preview instance.
+
+        With the token of the installation the request came through. A
+        comment that could not be deleted only goes to the log, as a
+        warning — the App uninstalled from the account is the usual
+        reason — as a merge request's note: an alert nobody can resolve
+        helps no one.
+        """
+        if not self.pr_comment_id or not self.pr_repo:
+            return
+        owner, repo = self.pr_repo.split("/", 1)
+        try:
+            self._pr_github_client().delete_issue_comment(
+                owner, repo, self.pr_comment_id,
+            )
+            self.sudo().write({"pr_comment_id": 0})
+        except Exception as exc:
+            if is_concurrency_error(exc):
+                raise
+            _logger.warning(
+                "PR comment delete failed for %s: %s", self.name, exc,
+            )
+
+    def _remove_closed_preview(self):
+        """Delete a preview whose pull or merge request closed, whatever it is doing.
+
+        One never deployed (``draft``) is unlinked now, with what waits
+        on it. Any other has ``delete_instance`` queued, unless one
+        waits or runs already: the delete waits for the job running now
+        — the deploy of a clone still in ``deploying`` included — and
+        cancels what waits, the rest of the clone's chain among it. So a
+        request closed while its preview was being built leaves no
+        preview behind once that job ends.
+
+        :return: ``unlinked``, ``queued`` or ``pending`` (a delete
+            already waits or runs)
+        :rtype: str
+        """
+        self.ensure_one()
+        inst = self.sudo()
+        if inst.state == "draft" and not inst.removal_finalized:
+            inst.unlink()
+            return "unlinked"
+        Job = as_platform(self.env["cloud.job"])
+        if inst.removal_finalized or Job.search_count([
+            ("instance_id", "=", inst.id),
+            ("job_type_id.code", "=", "delete_instance"),
+            ("state", "in", (
+                "queued", "pending", "enqueued", "wait_dependencies", "started",
+            )),
+        ], limit=1):
+            return "pending"
+        Job.enqueue(inst.host_id.id, inst.id, "delete_instance")
+        return "queued"
+
+    archived_at = fields.Datetime(
+        copy=False,
+        readonly=True,
+        help="When this instance was archived. A field of its own and "
+             "not ``write_date``, which the daily copy check rewrites "
+             "on every archived record — the view would then report "
+             "the last verification as the archiving date.",
+    )
+    removal_finalized = fields.Boolean(
+        default=False,
+        copy=False,
+        help="The teardown finished and the record only awaits its "
+             "unlink, which runs once the job's own transaction has "
+             "committed (see AbstractExecutor._unlink_after_job_commit). "
+             "A re-run of the teardown that finds this set has nothing "
+             "left to do on the host.",
+    )
+    archive_copy_state = fields.Selection(
+        selection=[
+            ("present", "Present"),
+            ("missing", "Missing"),
+            ("unreachable", "Unreachable"),
+        ],
+        copy=False,
+        readonly=True,
+        help="What the last verification pass found at the frozen "
+             "backup path. Written by the archive-check cron, never "
+             "measured while rendering a list.",
+    )
+    archive_copy_bytes = fields.Float(
+        copy=False,
+        readonly=True,
+        help="Total size of the archived chain at the last check, so "
+             "what an archived instance costs stays visible.",
+    )
+    archive_copy_checked_at = fields.Datetime(
+        copy=False,
+        readonly=True,
+        help="When the archived copy was last verified. Shown alongside "
+             "the state so a stale reading is visible as stale instead "
+             "of passing for current.",
+    )
+    purge_cutoff_at = fields.Datetime(
+        copy=False,
+        readonly=True,
+        help="The instant this instance's deletion was decided. The "
+             "purge only removes objects older than it, so a retry — "
+             "days or months later, by which time a new instance may "
+             "hold the same name and therefore the same prefix — still "
+             "deletes the old chain and nothing else. Stamped once and "
+             "never refreshed: 'now' on a retry would defeat the point.",
+    )
+
+    # ── Staging autopurge clock ──────────────────────────────────────────
+    # A staging that costs disk, probes and a copy of production data is
+    # only harmless while somebody is using it. These fields answer "when
+    # did a person last use this one", which is a different question from
+    # "when was it last written to": the crons rewrite every row daily, so
+    # ``write_date`` would push the deadline forward forever — the same
+    # trap ``archived_at`` above exists to avoid.
+    last_touched_at = fields.Datetime(
+        copy=False,
+        readonly=True,
+        help="When somebody last acted on this instance from the panel: "
+             "a visible job they started finished, they connected as a "
+             "user, opened a terminal, or pressed Keep. Background "
+             "probes and anything the platform bot starts on its own do "
+             "not count.",
+    )
+    last_login_seen_at = fields.Datetime(
+        copy=False,
+        readonly=True,
+        help="The most recent login read from the staging's own database. "
+             "Complements the panel signal: somebody can use a staging "
+             "for weeks without touching the panel. An unreadable "
+             "instance leaves this alone — no reading means 'unknown', "
+             "never 'nobody logged in'.",
+    )
+    website_info_public = fields.Boolean(
+        string="Allow Odoo's public website info page",
+        default=False,
+        copy=False,
+        help="Odoo lists the installed apps and its version at "
+             "/website/info. The host's proxy refuses it on every "
+             "instance; this lets anyone open it on this one. A rebuild "
+             "applies the change. Not copied: a staging cloned from this "
+             "instance starts blocked.",
+    )
+    autopurge_exempt = fields.Boolean(
+        default=False,
+        copy=False,
+        string="Never Purge Automatically",
+        help="Keep this instance out of the staging autopurge for good. "
+             "For the permanent ones — a QA environment nobody logs "
+             "into for months is still not disposable.",
+    )
+    autopurge_warned_at = fields.Datetime(
+        copy=False,
+        readonly=True,
+        help="When the first expiry warning went out. Cleared the moment "
+             "somebody touches the instance, so a staging that comes "
+             "back to life starts its whole notice period over.",
+    )
+    autopurge_final_warned_at = fields.Datetime(
+        copy=False,
+        readonly=True,
+        help="When the final expiry warning went out. Deletion requires "
+             "this to be set and at least a day old, which is what keeps "
+             "a cron that was down for weeks from warning and deleting "
+             "in the same tick.",
+    )
+
+    def _autopurge_clock(self):
+        """Return the later of the two activity signals, or ``False``.
+
+        Either signal alone is an undercount — somebody can drive a
+        staging entirely from the panel without ever logging into it, or
+        live inside it without opening the panel — so the freshest one
+        wins and a missing one simply does not vote.
+
+        :returns: ``datetime`` of the last known activity, or ``False``
+            when neither signal has ever been recorded.
+        """
+        self.ensure_one()
+        stamps = [
+            stamp for stamp in (self.last_touched_at, self.last_login_seen_at)
+            if stamp
+        ]
+        return max(stamps) if stamps else False
+
+    def _autopurge_days_left(self):
+        """Days until this staging is deleted, or ``False`` if none are.
+
+        Answers only once the first warning has gone out. Before that
+        there is nothing for anyone to act on, and a countdown on every
+        staging from the day it is created would be noise people learn
+        to scroll past — which is exactly the reflex the warning needs
+        them not to have.
+
+        :returns: whole days remaining (``0`` on the last day), or
+            ``False`` when this instance is not on the ladder.
+        """
+        self.ensure_one()
+        if self.environment != "staging" or self.autopurge_exempt:
+            return False
+        if not self.autopurge_warned_at:
+            return False
+        window = self.env["cloud.settings"].sudo()._get().staging_autopurge_days
+        clock = self._autopurge_clock()
+        if not window or not clock:
+            return False
+        deadline = clock + timedelta(days=window)
+        return max(0, (deadline - fields.Datetime.now()).days)
+
+    def _touch_autopurge_clock(self):
+        """Record that somebody just used these instances.
+
+        Resets the whole escalation, not just the clock: the warning
+        stamps are cleared and the alerts resolved, so an instance that
+        comes back to life gets its full notice period again rather than
+        being three days from deletion with no visible warning left.
+
+        Production is skipped rather than refused — the callers are
+        generic (a job finished, a terminal opened) and should not each
+        have to ask what environment they are in.
+
+        :returns: the staging records whose clock was sealed.
+        """
+        stagings = self.filtered(lambda i: i.environment == "staging")
+        if not stagings:
+            return stagings
+        stagings.sudo().write({
+            "last_touched_at": fields.Datetime.now(),
+            "autopurge_warned_at": False,
+            "autopurge_final_warned_at": False,
+        })
+        Alert = self.env["cloud.alert"].sudo()
+        for inst in stagings:
+            Alert.resolve_alert(AUTOPURGE_WARN_ALERT_CODE, instance=inst)
+            Alert.resolve_alert(AUTOPURGE_FINAL_ALERT_CODE, instance=inst)
+        return stagings
+
+    @api.model
+    def _cron_verify_archived_copies(self):
+        """Check that every archived instance still has its copy.
+
+        "The backend answers" is not the same as "the copy is there": a
+        provider lifecycle rule or a manual delete empties the prefix
+        while the credentials and the bucket stay perfectly healthy. The
+        only honest check is to list the frozen prefix and see objects.
+
+        Done on a schedule and stamped on the record, not on render: a
+        list of archived instances would otherwise make one network call
+        per row every time someone opened it. The view reads the stamp,
+        and ``revive`` re-checks live — there the single call is worth
+        it, because that is the moment being wrong actually costs
+        something.
+
+        An archived instance whose copy is gone is a record that lies.
+        Finding out when the operator presses "revive" is too late, so
+        this raises an alert as soon as it happens.
+        """
+        self._resolve_unshared_backup_paths()
+        archived = self.with_context(active_test=False).search([
+            ("active", "=", False),
+            ("custom_backup_dst", "!=", False),
+        ])
+        Alert = self.env["cloud.alert"].sudo()
+        for inst in archived:
+            state, total = inst._probe_archived_copy()
+            inst.sudo().write({
+                "archive_copy_state": state,
+                "archive_copy_bytes": total,
+                "archive_copy_checked_at": fields.Datetime.now(),
+            })
+            if state == "present":
+                Alert.resolve_alert("archive_copy_lost", instance=inst)
+                continue
+            if state == "missing":
+                Alert.raise_alert(
+                    "archive_copy_lost",
+                    _(
+                        "The archived copy of %(name)s is gone from "
+                        "%(path)s. Nothing can be revived from it; the "
+                        "record no longer has anything behind it.",
+                        name=inst.name, path=inst.custom_backup_dst,
+                    ),
+                    level="critical",
+                    instance=inst,
+                )
+        return len(archived)
+
+    @api.model
+    def _resolve_unshared_backup_paths(self):
+        """Resolve each ``backup_path_shared`` whose path one record holds now.
+
+        1.0.232's post-migrate raises it once per path that two records or
+        more hold, keyed by the path. Once fewer than two hold it (one of
+        them purged, or given a path of its own) the alert has nothing
+        left to say. Run with the daily check of archived copies, which
+        is where an archived one's purge ends up seen; compared as the
+        purges read a path (``dst_key``).
+
+        :return: the alerts resolved
+        :rtype: int
+        """
+        Alert = self.env["cloud.alert"].sudo()
+        alerts = Alert.search([
+            ("code", "=", "backup_path_shared"), ("state", "=", "active"),
+            ("instance_id", "=", False), ("dedup_key", "!=", False),
+        ])
+        if not alerts:
+            return 0
+        holders = {}
+        for inst in self.sudo().with_context(active_test=False).search([]):
+            for path in inst._backup_paths_held():
+                key = dst_key(path)
+                if key and key[1]:
+                    holders.setdefault(key, set()).add(inst.id)
+        resolved = 0
+        for alert in alerts:
+            if len(holders.get(dst_key(alert.dedup_key), ())) < 2:
+                resolved += len(
+                    Alert.resolve_alert("backup_path_shared", key=alert.dedup_key),
+                )
+        return resolved
+
+    def _probe_archived_copy(self):
+        """Return ``(state, bytes)`` for this instance's frozen prefix.
+
+        ``unreachable`` is kept apart from ``missing`` on purpose. A
+        provider outage and a deleted chain look the same from a
+        distance and need opposite reactions: one is waited out, the
+        other means the copy is gone for good. Reporting a temporary
+        network failure as "missing" would raise a false alarm about
+        data loss, so anything that is not a clear empty listing stays
+        unreachable.
+        """
+        self.ensure_one()
+        backend = self.effective_backup_backend
+        if not backend:
+            return "unreachable", 0.0
+        try:
+            total, count = backend._measure_prefix(self.custom_backup_dst)
+        except Exception:
+            _logger.warning(
+                "archived copy check failed for %s at %s",
+                self.name, self.custom_backup_dst, exc_info=True,
+            )
+            return "unreachable", 0.0
+        return ("present" if count else "missing"), total
+
+    def delete_archived(self, payload=None):
+        """Delete an archived instance together with its backup chain.
+
+        The record and the chain go together or not at all. An archived
+        instance is the only thing that still knows where its objects
+        are — the path is frozen on it precisely because the computed
+        one stops being true — so unlinking it first would strand the
+        chain permanently, with no instance, no project and no path left
+        to find it by. That is the exact failure this whole feature was
+        built to make impossible.
+
+        The chain is emptied by a job (see
+        ``PurgeArchivedBackupsExecutor``) and the record is unlinked
+        there, on success only. Nothing is redeployed: the purge runs in
+        a container created for that one command.
+
+        Two shortcuts, both safe. An instance archived without a
+        destination has no chain to delete and, when no addon names a
+        further prefix of its copy either
+        (``_archived_copy_extra_prefixes``), it unlinks here; one that
+        names one goes through the job for it. And an instance whose
+        host is gone cannot run a container anywhere, which is a refusal
+        rather than a licence to unlink: the objects would outlive it.
+
+        The first call stamps ``purge_cutoff_at`` and every later one
+        reuses it, so a retry deletes exactly what the original call
+        would have. By then the name — and therefore the prefix — may
+        belong to a new instance, and "everything under the prefix"
+        would take its backups too.
+
+        :param payload: extra job payload, for a caller that needs to
+            chain something onto the purge's success.
+        :return: list of enqueued job ids, empty when it unlinked here.
+        :raises UserError: if the instance is not archived, or has a
+            chain but no host left to purge it from.
+        :raises AccessError: for a caller below Administrator, as the
+            route it serves: public, it is reachable through ``call_kw``,
+            and the branch without a copy unlinks with ``sudo``.
+        """
+        self.ensure_one()
+        self.env["cloud.security.mixin"]._check_cloud_group("group_cloud_manager")
+        if self.active:
+            raise UserError(_("This instance is not archived."))
+        prefixes = [
+            dst for dst in (
+                self.custom_backup_dst, *self._archived_copy_extra_prefixes(),
+            ) if dst
+        ]
+        if not prefixes:
+            # Archived with nothing behind it — the teardown destroyed
+            # its data and no copy was ever taken.
+            self.sudo().unlink()
+            return []
+        if not self.host_id:
+            raise UserError(
+                _(
+                    "%(name)s has an archived copy at %(path)s but no "
+                    "host left to delete it from. Assign a host to the "
+                    "instance and try again — deleting the record alone "
+                    "would leave the copy behind with nothing pointing "
+                    "at it.",
+                    name=self.name, path=prefixes[0],
+                )
+            )
+        if not self.purge_cutoff_at:
+            self.sudo().write({"purge_cutoff_at": fields.Datetime.now()})
+        # A list, so callers and the route see the same shape whether
+        # this enqueued something or unlinked here.
+        return [self.env["cloud.job"].enqueue(
+            self.host_id.id,
+            self.id,
+            "purge_archived_backups",
+            payload=payload or {},
+        )]
+
+    def _freeze_backup_dst(self):
+        """Pin the archived copy's location into ``custom_backup_dst``.
+
+        The computed path is derived from the project's remote folder and
+        the instance name, so it is only true while those stay put. Once
+        the instance is archived it stops being maintained and the
+        derivation can quietly become false — a layer that deletes its
+        own records may detach the project and the computed path falls
+        back to ``.../default/``, which is both wrong and shared with
+        everything else that lost its project.
+
+        Everything that touches the copy afterwards — pruning, expiry,
+        restoring it back — reads the frozen value, never the computed
+        one. Without this the record would eventually point somewhere
+        that is not its own backups, which is worse than pointing
+        nowhere.
+
+        No-op when there is nothing to freeze (no destination resolves)
+        or when an explicit override is already set: an imported instance
+        carries its real location there and must not be overwritten.
+
+        The destination is pinned too (``backup_backend_id``, when the
+        instance had none of its own): the copy is read and deleted with
+        that destination's credentials, and one inherited from the
+        project or the global default would follow a later change of
+        either to a bucket that does not hold it. Pinned, it also counts
+        among what keeps the destination from being deleted
+        (``cloud.backup.backend._deletion_blockers``).
+        """
+        self.ensure_one()
+        vals = {}
+        backend = self.effective_backup_backend
+        if backend and not self.backup_backend_id:
+            vals["backup_backend_id"] = backend.id
+        computed = self.instance_backup_dst
+        outside = False
+        if computed and not self.custom_backup_dst:
+            if dst_is_valid(computed):
+                vals["custom_backup_dst"] = computed
+            else:
+                outside = True
+        if not vals and not outside:
+            return
+        # As the platform: the copy's place is an administrator's field
+        # (``_MANAGER_FIELDS``), frozen here at the end of a teardown that
+        # was authorised when it was asked for.
+        if vals:
+            self.sudo().write(vals)
+        if outside:
+            # Computed from a destination saved before its grammar
+            # (``cloud.backup.backend._check_backup_dst_shape``): frozen as
+            # it is, as the stack is gone by now and the path is the one
+            # thing left that finds the copy. In SQL, past the field's
+            # check (``_check_custom_backup_dst_shape``), which nothing
+            # sent to a write may lift.
+            self.env.cr.execute(SQL(
+                "UPDATE cloud_instance SET custom_backup_dst = %s WHERE id = %s",
+                computed, self.id,
+            ))
+            self.invalidate_recordset(["custom_backup_dst", "instance_backup_dst"])
+            _logger.warning(
+                "instance %s archived: its destination %s computes a backup "
+                "path outside the field's grammar, frozen as it is: correct "
+                "the destination's bucket and path",
+                self.name, backend.name,
+            )
+        _logger.info(
+            "instance %s archived: backup path frozen at %s on %s",
+            self.name, self.custom_backup_dst, backend.name,
+        )
+
+    @api.model
+    def _gc_restore_uploads(self):
+        """Delete browser-uploaded restore archives nobody will consume.
+
+        The executor removes the archive once it has sent it, but no
+        ``finally`` covers the upload whose job never runs at all —
+        cancelled before it started, or enqueued against an instance that
+        was removed since. At up to 2 GiB each those would sit on the
+        data volume until the container is recreated.
+
+        :return: number of files removed.
+        """
+        return purge_stale()
+
+    # ── Large restores: temporary upload key, and fetch-by-URL ────────────
+
+    def grant_restore_upload(self, public_key=None):
+        """Open a one-use SSH door for uploading a restore archive here.
+
+        Returns the private half of a freshly generated key, which is
+        never stored: the panel installs the public half on the host,
+        restricted to one directory in write-only mode and with a
+        deadline OpenSSH enforces by itself. Whoever called this is the
+        only holder, and losing it costs another grant, not access.
+
+        With *public_key*, the door opens for the caller's own key
+        instead, with the same restrictions: no private key is made, and
+        none is returned. An agent asks this way, so that no private key
+        ever passes through it.
+
+        :param str public_key: the caller's ``ssh-ed25519`` public key,
+            never used for another grant; None to have one generated.
+        :return: dict with the key (only when generated), where to send
+            the archive, and the job installing it.
+        """
+        self.ensure_one()
+        self.env["cloud.security.mixin"]._check_can_manage_backups()
+        if not self.host_id:
+            raise UserError(_("Instance has no host assigned."))
+        grant, private_key = self.env["cloud.restore.upload.grant"]._open(
+            self, public_key=public_key,
+        )
+        job_id = self.env["cloud.job"].enqueue(
+            self.host_id.id,
+            self.id,
+            "grant_restore_upload_key",
+            payload={"grant_id": grant.id},
+        )
+        self.env["cloud.audit.log"].sudo().create({
+            "action": "Granted a temporary restore upload key",
+            "instance_id": self.id,
+            "host_id": self.host_id.id,
+            "job_id": job_id,
+            "details": grant.fingerprint or "",
+        })
+        answer = {"private_key": private_key} if private_key else {}
+        return answer | {
+            "grant_id": grant.id,
+            "job_id": job_id,
+            "fingerprint": grant.fingerprint,
+            "expires_at": grant.expires_at,
+            "user": self.host_id.user or "root",
+            "host": self.host_id.ip_address or "",
+            "port": self.host_id.port or 22,
+            "directory": grant._directory(),
+        }
+
+    def verify_restore_upload(self, grant_id):
+        """Ask the host what actually arrived through a grant.
+
+        The answer — name, size and SHA-256, all computed on the host —
+        is what the operator confirms before anything is restored. It is
+        also the only defence that matters if the key leaked inside its
+        window: a file nobody recognises does not get restored.
+
+        :param grant_id: the grant to inspect.
+        :return: id of the job that reports back.
+        """
+        self.ensure_one()
+        self.env["cloud.security.mixin"]._check_can_manage_backups()
+        grant = self.env["cloud.restore.upload.grant"].browse(
+            int(grant_id)
+        ).exists()
+        if not grant or grant.instance_id != self:
+            raise UserError(_("That upload grant does not exist."))
+        return self.env["cloud.job"].enqueue(
+            grant.host_id.id, self.id, "verify_restore_upload",
+            payload={"grant_id": grant.id},
+        )
+
+    def revoke_restore_upload(self, grant_id):
+        """Close a grant early, removing its key and directory."""
+        self.ensure_one()
+        self.env["cloud.security.mixin"]._check_can_manage_backups()
+        grant = self.env["cloud.restore.upload.grant"].browse(
+            int(grant_id)
+        ).exists()
+        if not grant or grant.instance_id != self:
+            raise UserError(_("That upload grant does not exist."))
+        return grant._revoke()
+
+    def restore_from_url(self, url, backup_before_restore=False,
+                         neutralize=False, reset_base_url=False,
+                         from_agent=False):
+        """Have the host download an archive and restore from it.
+
+        The URL is checked here rather than on the host: allowed scheme,
+        a name that resolves to a public address, and no credentials
+        left inside it. The address it resolved to is pinned into the
+        download command, so the name cannot answer differently by the
+        time the host dials it.
+
+        The link itself is kept encrypted on the restore job
+        (``secret_payload``), with its credential: a presigned link's
+        signature, or a share link's token, downloads the archive by
+        itself, and every member of the project reads the job's
+        payload, which holds its ``shown_link`` only.
+
+        :param url: ``https``, ``sftp`` or ``ftp`` source, which may
+            carry ``user:password@``.
+        :param backup_before_restore: take a safety backup first.
+        :param neutralize: restore a neutralized copy (the executor's
+            ``neutralize``).
+        :param reset_base_url: give the restored database this
+            instance's own address (the executor's ``reset_base_url``).
+        :param from_agent: hold the link to an agent's rules as well
+            (``_check_restore_link``), here and where it is fetched.
+        :return: id of the first job queued (the safety backup's, when
+            one is taken).
+        """
+        self.ensure_one()
+        self.env["cloud.security.mixin"]._check_can_manage_backups()
+        clean, username, password = split_credentials(url)
+        if from_agent and (username or password):
+            raise UserError(_(
+                "A link with a user or a password is given in the panel "
+                "(Import, From a link): credentials never pass through an "
+                "agent. Use a presigned or share link instead."
+            ))
+        parts, address, port = self._check_restore_link(clean, from_agent)
+        # curl takes the login and the password as one value, split at
+        # its first colon (``_curl_config``).
+        if ":" in username:
+            raise UserError(_(
+                "That link cannot be used: its user name contains a colon, "
+                "which cannot be sent to the server."
+            ))
+        payload = {
+            "mode": "from_url",
+            "url_display": shown_link(clean),
+            "resolve": curl_resolve_argument(parts, address, port),
+            "backup_before_restore": bool(backup_before_restore),
+            "neutralize": bool(neutralize),
+            "reset_base_url": bool(reset_base_url),
+        }
+        if from_agent:
+            payload["link_policy"] = "agent"
+        job_id = self._restore_db(payload)
+        secret = {"url": clean}
+        if username:
+            secret |= {
+                "machine": parts.hostname,
+                "login": username,
+                "password": password,
+            }
+        # Written after the job exists and outside the payload: the
+        # payload is read back into the UI and notifications, and neither
+        # a password nor a link that downloads by itself belongs there.
+        # On the restore's own job, which is not the first of a chain
+        # that takes a safety backup.
+        self._restore_job_of(job_id).sudo().secret_payload = json.dumps(secret)
+        return job_id
+
+    def _check_restore_link(self, url, from_agent=False):
+        """Check a link a host of this panel may be told to download.
+
+        A public address, a plain name (``restore_source.validate``).
+        An agent's link besides: ``https`` on port 443 only, as every
+        link the panel itself dials (``net.outbound``), and never an
+        address of a server this panel manages, nor of the panel
+        (``cloud.host._panel_own_networks``) — public addresses, which
+        the first check lets through. Pinned to an IPv4 address: the
+        panel knows its servers' IPv4 addresses only, and a name with
+        the IPv6 address of one would pass a check of IPv4 ones.
+
+        :param str url: the link, its credentials split off
+        :param bool from_agent: whether an agent gave it
+        :return: ``(parts, pinned_address, port)``
+        :raises UserError: for a link that cannot be used, saying why
+        """
+        try:
+            if from_agent:
+                if urlsplit(url).scheme != "https":
+                    raise OutboundError("an agent gives an https link only")
+                return validate_restore_url(
+                    url, only_port=443,
+                    refused=self.env["cloud.host"]._panel_own_networks(),
+                    ipv4_only=True,
+                )
+            return validate_restore_url(url)
+        except OutboundError as exc:
+            raise UserError(_("That link cannot be used: %s.", exc)) from exc
+
+    def _restore_job_of(self, job_id):
+        """Return the restore job of what ``_restore_db`` queued.
+
+        The job itself, or, when a safety backup comes first, the
+        ``restore_instance`` step of its chain.
+
+        :param int job_id: what ``_restore_db`` returned
+        :rtype: cloud.job
+        """
+        job = self.env["cloud.job"].sudo().browse(job_id)
+        if job.job_type_id.code == "restore_instance" or not job.queue_chain_key:
+            return job
+        return job.search([
+            ("queue_chain_key", "=", job.queue_chain_key),
+            ("job_type_id.code", "=", "restore_instance"),
+        ], limit=1) or job
+
+    def restore_db(self, payload):
+        """Enqueue a restore_instance job with the given payload.
+
+        Every mode of ``_restore_db`` but ``from_url``: a link is asked
+        for through ``restore_from_url``, which checks it and computes
+        the address the host may dial. A link and a pin written straight
+        into this payload were never checked. Refused whatever the
+        context says, since a caller over JSON-RPC writes that too.
+
+        :param dict payload: the restore's payload
+        :return: id of the first job queued
+        :raise UserError: for a restore from a link
+        """
+        self.ensure_one()
+        self.env["cloud.security.mixin"]._check_can_manage_backups()
+        if (payload or {}).get("mode") == "from_url":
+            raise UserError(_(
+                "A restore from a link must be asked for as such, so that "
+                "the link is checked first."
+            ))
+        return self._restore_db(payload)
+
+    def _restore_db(self, payload):
+        """Enqueue a restore_instance job with the given payload.
+
+        ``payload['mode']`` selects the source of the backup zip:
+
+        * ``browser``  — operator uploaded a zip via /cloud/instance/<id>/restore;
+                         the controller staged it under the data dir (the one
+                         mount this container shares with the job runner) and
+                         passes the resulting path as ``local_path``.
+        * ``from_job`` — the zip is an ir.attachment of a previous cloud.job
+                         (typically a backup_download); the executor pulls it
+                         from the DB.
+        * ``rsync``    — the zip is already on the remote host at the path
+                         the executor expects (operator uploaded it manually).
+        * ``ssh_upload`` — the zip came through an upload key
+                         (``grant_id``); ``expected_sha256`` is the digest
+                         the operator confirmed, and must still be the
+                         grant's.
+
+        ``payload['backup_before_restore']`` requests a safety snapshot
+        (backup_create + backup_download) chained before the restore.
+        On production this is always forced regardless of the flag —
+        same "no opt-out" rule as ``restore_backup``/``move_to_host``.
+        On non-production it stays opt-in, default off.
+
+        * ``from_url`` — the host downloads it; only ``restore_from_url``
+                         asks for it, with the link checked and pinned.
+
+        Its callers are exposed via JSON-RPC, so it gates them too:
+        only Developer+ can trigger a restore. The downstream executor
+        also validates the ``local_path`` prefix, and checks a link
+        again, as a defense-in-depth layer (see
+        RestoreInstanceExecutor.before_execute).
+
+        :param dict payload: the restore's payload
+        :return: id of the first job queued
+        """
+        self.ensure_one()
+        self.env["cloud.security.mixin"]._check_can_manage_backups()
+        if not self.host_id:
+            raise UserError(_("Instance has no host assigned."))
+        # ``as_move`` keeps the archive's uuid and secret; only
+        # ``move_to_host`` may ask for it, and its chain does not come
+        # through here. From a caller over JSON-RPC it would hand a
+        # staging the identity of the production its dump came from.
+        payload = {
+            key: value for key, value in (payload or {}).items()
+            if key != "as_move"
+        }
+        if payload.get("mode") not in (
+            "browser", "from_job", "rsync", "ssh_upload", "from_url",
+        ):
+            raise UserError(_("Invalid restore mode."))
+        if payload.get("mode") == "ssh_upload":
+            grant = self.env["cloud.restore.upload.grant"].browse(
+                int(payload.get("grant_id") or 0)
+            ).exists()
+            if not grant or grant.instance_id != self:
+                raise UserError(_("That upload grant does not exist."))
+            if not grant.received_filename:
+                raise UserError(_(
+                    "Nothing has been uploaded yet, or the upload has not "
+                    "been checked. Check what arrived before restoring it."
+                ))
+            # The digest the dialog showed: another check since then —
+            # anyone holding the key may have sent another file — would
+            # otherwise have this restore take what nobody looked at.
+            if not payload.get("expected_sha256") \
+                    or payload["expected_sha256"] != grant.received_sha256:
+                raise UserError(_(
+                    "What arrived has changed since it was shown to you, or "
+                    "the restore did not say which file it means. Check what "
+                    "arrived again, then restore it."
+                ))
+
+        backup_first = self.environment == "production" or bool(
+            payload.get("backup_before_restore")
+        )
+        if not backup_first:
+            return self.env["cloud.job"].enqueue(
+                self.host_id.id,
+                self.id,
+                "restore_instance",
+                payload=payload,
+            )
+
+        if not self.instance_backup_dst:
+            raise UserError(
+                _(
+                    "This instance has no resolvable backup backend, so a "
+                    "pre-restore safety backup cannot be taken. Configure a "
+                    "backup backend (instance, project or global) first."
+                )
+            )
+        job_ids = self.env["cloud.job"].enqueue_chain(
+            [
+                {
+                    "host_id": self.host_id.id,
+                    "instance_id": self.id,
+                    "job_type_code": "backup_create",
+                },
+                {
+                    "host_id": self.host_id.id,
+                    "instance_id": self.id,
+                    "job_type_code": "backup_download",
+                    "payload": {"time": "latest", "download_type": "all"},
+                },
+                {
+                    "host_id": self.host_id.id,
+                    "instance_id": self.id,
+                    "job_type_code": "restore_instance",
+                    "payload": payload,
+                },
+            ]
+        )
+        return job_ids[0]
+
+    @api.model
+    def _periodic_maintenance_domain(self):
+        """Extra filter every periodic maintenance cron must respect.
+
+        The extension point for layers that deploy instances the daily
+        crons have no business touching. Core deploys none, so it adds
+        nothing; a layer that keeps stopped instances in reserve
+        excludes them here, once, instead of reimplementing each cron.
+
+        That reimplementing is what this exists to stop. A layer that
+        copies a cron body to add one filter owns a copy that stops
+        receiving the guards added to the original — and the copy fails
+        silently, because a cron that queues jobs nobody reads looks
+        exactly like a cron doing its job.
+
+        :return: a search domain, ANDed into each cron's own.
+        """
+        return []
+
+    # Private: ``ir.cron`` runs it as the platform; nothing calls it
+    # through ``call_kw``.
+    @api.private
+    @api.model
+    def cron_refresh_backup_list(self):
+        """Queue a backup_list job for every production instance.
+
+        Skips instances whose compose stack has no ``backup`` service
+        (e.g. those a module on top deploys without it): the executor
+        shells into the backup container via ``docker compose exec -T
+        backup``, which answers ``service "backup" is not running`` with
+        status 1 for a service that is stopped *and* for one the compose
+        file never declared. Either way it is a failed job and an alert,
+        every day, forever — and one that never resolves, since a
+        successful run is what clears it.
+
+        Stopped stacks are skipped for the same reason. Instances built in
+        advance forced that one: they ship stopped by design and hold no
+        data at all.
+        """
+        instances = self.search(
+            [
+                ("deployed", "=", True),
+                ("environment", "=", "production"),
+                ("move_origin_host_id", "=", False),
+                ("running", "=", True),
+            ]
+            + self._periodic_maintenance_domain()
+        )
+        # Here, not at the top: backup_list_executor imports
+        # cloud_backup_backend, which imports this module.
+        from .backup_list_executor import BACKUP_STALE_ALERT_CODE
+
+        Alert = self.env["cloud.alert"].sudo()
+        for inst in instances:
+            services = {
+                s.strip() for s in (inst.compose_services or "").split(",") if s.strip()
+            }
+            if (
+                not inst.host_id
+                or not inst.instance_backup_dst
+                or "backup" not in services
+            ):
+                # No backups scheduled any more: nothing can be stale.
+                Alert.resolve_alert(
+                    BACKUP_STALE_ALERT_CODE,
+                    host=inst.host_id or None, instance=inst,
+                )
+                continue
+            try:
+                inst.list_backups()
+            except Exception:
+                _logger.warning(
+                    "Could not enqueue backup_list for %s",
+                    inst.name,
+                    exc_info=True,
+                )
+
+    _NO_BACKUP_ALERT_CODE = "production_no_backup"
+
+    # Private: ``ir.cron`` runs it as the platform; nothing calls it
+    # through ``call_kw``.
+    @api.private
+    @api.model
+    def cron_check_production_backup(self):
+        """Daily cron: warn on deployed production instances with no
+        resolvable backup backend (instance/project/global all empty).
+
+        Unlike the backend-scoped alerts in cloud.backup.backend, this
+        one has a natural ``instance_id`` target so it's visible to
+        every member of the instance's project, not just managers.
+        """
+        Alert = self.env["cloud.alert"].sudo()
+        instances = self.search(
+            [
+                ("deployed", "=", True),
+                ("environment", "=", "production"),
+            ]
+        )
+        flagged = 0
+        for inst in instances:
+            if inst.effective_backup_backend:
+                Alert.resolve_alert(self._NO_BACKUP_ALERT_CODE, instance=inst)
+                continue
+            flagged += 1
+            Alert.raise_alert(
+                self._NO_BACKUP_ALERT_CODE,
+                f"Production instance '{inst.name}' has no backup "
+                f"backend configured — it is not being backed up.",
+                host=inst.host_id or None,
+                instance=inst,
+            )
+        return {"flagged": flagged}
+
+    # Private: ``ir.cron`` runs it as the platform; nothing calls it
+    # through ``call_kw``.
+    @api.private
+    @api.model
+    def cron_instance_health(self):
+        """Queue an instance_health job for every deployed instance."""
+        instances = self.search(
+            [("deployed", "=", True)] + self._periodic_maintenance_domain()
+        )
+        for inst in instances:
+            if not inst.host_id:
+                continue
+            try:
+                self.env["cloud.job"].enqueue(
+                    inst.host_id.id,
+                    inst.id,
+                    "instance_health",
+                )
+            except Exception as e:
+                _logger.warning(
+                    "Could not enqueue instance_health for %s: %s",
+                    inst.name,
+                    e,
+                )
+
+    def _refresh_state_now(self):
+        """Read now what each of these instances is: running, its services.
+
+        What the panel shows of an instance — running or not, the state of
+        each of its services — is what the probe last read. After
+        something has just acted on it (a job that starts, stops,
+        restores or moves it; a command an agent ran in it or on its
+        server), a state-only probe reads it now instead of at the next
+        turn of ``cron_instance_health``. It grades nothing: the streaks
+        and alerts count that cron's cycles, five minutes apart, and a
+        reading right after a restart or between two commands would
+        raise them early (``InstanceHealthExecutor._state_only``).
+
+        Only the deployed instances on a server that the periodic crons
+        may touch (``_periodic_maintenance_domain``), and not one whose
+        state-only probe still waits to start: that one reads it too.
+        The probe is a hidden job, outside the queues, so asking for it
+        takes no lock and never waits behind the caller's. One that
+        cannot be queued is logged and skipped, never raised: the
+        caller's work is done.
+
+        :return: the probes' job ids
+        :rtype: list[int]
+        """
+        jobs = []
+        Job = self.env["cloud.job"].sudo()
+        instances = self.sudo().exists().filtered_domain(
+            [("deployed", "=", True), ("host_id", "!=", False)]
+            + self._periodic_maintenance_domain()
+        )
+        waiting = Job.search(
+            [
+                ("instance_id", "in", instances.ids),
+                ("job_type_id.code", "=", "instance_health"),
+                ("state", "in", ("pending", "enqueued", "wait_dependencies")),
+            ]
+        ).filtered(lambda job: (job.payload or {}).get("state_only"))
+        for inst in instances - waiting.instance_id:
+            try:
+                with self.env.cr.savepoint():
+                    jobs.append(
+                        Job.enqueue(
+                            inst.host_id.id,
+                            inst.id,
+                            "instance_health",
+                            payload={"state_only": True},
+                        )
+                    )
+            except Exception as e:  # the caller's work stands
+                _logger.warning(
+                    "Could not probe %s now: %s", inst.name, e,
+                )
+        return jobs
+
+    @api.model
+    def _cron_autopurge_stagings(self):
+        """Walk every staging one step along the expiry ladder.
+
+        The ladder has three rungs — first warning, final warning,
+        deletion — and an instance climbs **at most one per tick**, with
+        each rung requiring the one below it to have been reached
+        already. That is the invariant the whole feature rests on: if
+        this cron is down for a month, the tick that brings it back
+        sends a first warning and stops. It cannot warn and delete in
+        the same pass, no matter how far past its deadline something is.
+
+        Deletion additionally requires the final warning to be a day old,
+        so "nobody was warned in time" cannot happen through a fast
+        succession of ticks either.
+
+        Failures are reported and skipped rather than raised: one host
+        that will not answer must not keep every other expired staging
+        alive, the same policy the archived-copy check uses.
+
+        :returns: counts per rung, for the cron log.
+        """
+        window = self.env["cloud.settings"].sudo()._get().staging_autopurge_days
+        if not window:
+            return {"warned": 0, "final_warned": 0, "deleted": 0, "skipped": 0}
+        now = fields.Datetime.now()
+        tally = {"warned": 0, "final_warned": 0, "deleted": 0, "skipped": 0}
+        # ``search`` excludes archived rows by default, which is what we
+        # want: an archived instance has already been dealt with, and its
+        # copy has a retention of its own.
+        candidates = self.search(
+            [
+                ("environment", "=", "staging"),
+                ("autopurge_exempt", "=", False),
+            ]
+            + self._periodic_maintenance_domain()
+        )
+        for inst in candidates:
+            clock = inst._autopurge_clock()
+            if not clock:
+                # No clock is not "never used" — it is "we do not know",
+                # and the migration means it should not happen. Skipping
+                # is the only safe reading.
+                tally["skipped"] += 1
+                continue
+            deadline = clock + timedelta(days=window)
+            try:
+                rung = inst._autopurge_step(now, deadline, window)
+            except Exception:
+                _logger.exception(
+                    "autopurge step failed for instance %s", inst.name,
+                )
+                tally["skipped"] += 1
+                continue
+            if rung:
+                tally[rung] += 1
+        return tally
+
+    def _autopurge_step(self, now, deadline, window):
+        """Take this instance's single step for this tick, if any is due.
+
+        :param now: the tick's instant, shared by every instance so one
+            long pass cannot straddle a boundary.
+        :param deadline: when this instance is due to be deleted.
+        :param int window: the configured window, for the messages.
+        :returns: the rung climbed (``warned``, ``final_warned`` or
+            ``deleted``), or ``False`` when nothing was due.
+        """
+        self.ensure_one()
+        Alert = self.env["cloud.alert"].sudo()
+        if not self.autopurge_warned_at:
+            if now < deadline - timedelta(days=AUTOPURGE_WARN_DAYS):
+                return False
+            Alert.raise_alert(
+                AUTOPURGE_WARN_ALERT_CODE,
+                _(
+                    "Staging '%(name)s' has had no activity for a while "
+                    "and is scheduled for deletion on %(date)s. Open it, "
+                    "or press Keep on it, and the %(window)s-day window "
+                    "starts over. A staging has no backup: once deleted "
+                    "it cannot be brought back.",
+                    name=self.name,
+                    date=fields.Date.to_string(deadline.date()),
+                    window=window,
+                ),
+                instance=self,
+            )
+            self.sudo().write({"autopurge_warned_at": now})
+            return "warned"
+        if not self.autopurge_final_warned_at:
+            if now < deadline - timedelta(days=AUTOPURGE_FINAL_DAYS):
+                return False
+            Alert.raise_alert(
+                AUTOPURGE_FINAL_ALERT_CODE,
+                _(
+                    "Last call: staging '%(name)s' is deleted on "
+                    "%(date)s, with everything in it. Press Keep to "
+                    "stop that, or mark it as never purged if it should "
+                    "stay for good.",
+                    name=self.name,
+                    date=fields.Date.to_string(deadline.date()),
+                ),
+                level="critical",
+                instance=self,
+            )
+            self.sudo().write({"autopurge_final_warned_at": now})
+            return "final_warned"
+        if now < deadline:
+            return False
+        # The final warning has to have been out for a full day. Without
+        # this a cron that had been down could send it and delete on
+        # consecutive ticks minutes apart, which is notice in form only.
+        if now < self.autopurge_final_warned_at + timedelta(days=1):
+            return False
+        return "deleted" if self._autopurge_delete(window) else False
+
+    def _autopurge_delete(self, window):
+        """Delete this expired staging through the ordinary path.
+
+        Reuses what closing a pull request does — enqueue
+        ``delete_instance`` when there is something on a host to tear
+        down, unlink when there is not — rather than a destructor of its
+        own. A second way to delete an instance is a second way to get
+        deletion wrong.
+
+        :param int window: the window that expired, for the audit trail.
+        :returns: ``True`` when the deletion was started or done.
+        """
+        self.ensure_one()
+        name = self.name
+        # The audit row goes *inside* the savepoint, and before the
+        # deletion. Before, because ``instance_id`` is a real foreign key
+        # — after an unlink there is no row left to point at, and
+        # ``ondelete='set null'`` only rescues rows that already exist.
+        # Inside, because a deletion that is then refused must not leave
+        # a trail claiming a purge that never happened: the savepoint
+        # takes the row back with it.
+        #
+        # The savepoint also keeps a database-level failure from
+        # poisoning the cursor the alert below is written on, which would
+        # otherwise swallow the one record of why this did not happen —
+        # the lesson the PR-preview clone taught.
+        try:
+            with self.env.cr.savepoint():
+                self.env["cloud.audit.log"].sudo().create({
+                    "action": "Autopurge",
+                    "details": (
+                        f"'{name}' deleted by autopurge after {window} "
+                        f"days without activity"
+                    ),
+                    **self._audit_target_vals(),
+                })
+                if not (self.deployed and self.host_id):
+                    # ``unlink`` refuses a record a job still owns
+                    # (``deploying``/``deleting``), which is the same
+                    # "busy right now" as a refused enqueue and gets the
+                    # same answer below.
+                    self.sudo().unlink()
+                else:
+                    # The platform is deleting this on its own schedule,
+                    # so the job must not be attributed to whoever the
+                    # cron happens to run as.
+                    as_platform(self.env["cloud.job"]).enqueue(
+                        self.host_id.id, self.id, "delete_instance",
+                    )
+        except Exception as exc:
+            # An operation already running on the instance is the normal
+            # case here, and tomorrow's tick simply tries again. It is
+            # still worth surfacing: an instance that never manages to
+            # start its own deletion would otherwise sit past its
+            # deadline indefinitely with nothing saying so.
+            self.env["cloud.alert"].sudo().raise_alert(
+                "staging_autopurge_stuck",
+                _(
+                    "Staging '%(name)s' is past its autopurge deadline "
+                    "but its deletion could not be started: %(reason)s. "
+                    "It will be retried daily.",
+                    name=name, reason=str(exc),
+                ),
+                instance=self,
+            )
+            return False
+        return True
+
+    # Private: ``ir.cron`` runs it as the platform; nothing calls it
+    # through ``call_kw``.
+    @api.private
+    @api.model
+    def cron_read_staging_logins(self):
+        """Queue a login reading for every staging the autopurge watches.
+
+        Daily rather than on the health probe's five-minute tick: the
+        answer moves at most once per login, and the reading opens the
+        staging's own database, which is not something to do sixty times
+        an hour for a number nobody reads until the deadline approaches.
+
+        Only stagings that are deployed and running are asked. A stopped
+        one cannot answer, and — per the design — being stopped for three
+        months is exactly the disuse this measures, not a gap to paper
+        over. Exempt instances are skipped because their reading could
+        never change an outcome, and everything is skipped while the
+        window is ``0``, which is how the feature is turned off.
+
+        :returns: how many readings were queued.
+        """
+        settings = self.env["cloud.settings"].sudo()._get()
+        if not settings.staging_autopurge_days:
+            return 0
+        instances = self.search(
+            [
+                ("environment", "=", "staging"),
+                ("deployed", "=", True),
+                ("running", "=", True),
+                ("autopurge_exempt", "=", False),
+            ]
+            + self._periodic_maintenance_domain()
+        )
+        queued = 0
+        for inst in instances:
+            if not inst.host_id:
+                continue
+            try:
+                self.env["cloud.job"].enqueue(
+                    inst.host_id.id, inst.id, "read_last_login",
+                )
+                queued += 1
+            except Exception as exc:
+                # One unreachable instance must not cost the fleet its
+                # readings — the same skip-and-carry-on policy the
+                # archived-copy check uses.
+                _logger.warning(
+                    "Could not enqueue read_last_login for %s: %s",
+                    inst.name, exc,
+                )
+        return queued
+
+    # Private: ``ir.cron`` runs it as the platform; nothing calls it
+    # through ``call_kw``.
+    @api.private
+    @api.model
+    def cron_capture_secret_keys(self, limit=200):
+        """Queue a key capture for every deployed instance the panel lacks it for.
+
+        An instance deployed before the panel kept encryption keys, or
+        imported, has its key on its host only (see
+        ``capture_secret_key_executor``). Once read it is kept, so after
+        the first pass this finds nothing: a deploy or rebuild keeps the
+        key of every instance it touches, and new ones are born with it.
+
+        Bounded per run, so the first pass after an upgrade does not
+        flood one host's queue; the rest follow the next day.
+
+        :param int limit: most captures queued in one run
+        :return: how many captures were queued
+        :rtype: int
+        """
+        instances = self.search(
+            [
+                ("deployed", "=", True),
+                ("host_id", "!=", False),
+                ("secret_key", "=", False),
+            ]
+            + self._periodic_maintenance_domain(),
+            limit=limit,
+        )
+        queued = 0
+        for inst in instances:
+            try:
+                self.env["cloud.job"].enqueue(
+                    inst.host_id.id, inst.id, "capture_secret_key",
+                )
+                queued += 1
+            except Exception as exc:
+                # One instance with a job in flight must not cost the
+                # others their capture: it is retried tomorrow.
+                _logger.warning(
+                    "Could not enqueue capture_secret_key for %s: %s",
+                    inst.name, exc,
+                )
+        return queued
+
+    def _rollback_outcome(self):
+        """Return the outcome the rollback under way was queued with.
+
+        Carried by its ``move_rollback_cleanup`` (``_enqueue_rollback_jobs``),
+        which names the chain it rolls back: the latest one naming the
+        current chain. ``stuck`` when none does — a rollback queued by an
+        older release.
+
+        :rtype: dict
+        """
+        self.ensure_one()
+        cleanups = self.env["cloud.job"].sudo().search([
+            ("instance_id", "=", self.id),
+            ("job_type_id.code", "=", "move_rollback_cleanup"),
+        ], order="id desc", limit=5)
+        for cleanup in cleanups:
+            payload = cleanup.payload or {}
+            if payload.get("move_chain_job_ids") == (self.move_chain_job_ids or ""):
+                return dict(payload.get("move_outcome") or {"kind": "stuck"})
+        return {"kind": "stuck"}
+
+    # Private: ``ir.cron`` runs it as the platform; nothing calls it
+    # through ``call_kw``.
+    @api.private
+    @api.model
+    def cron_recover_stuck_moves(self):
+        """Watchdog: recover instances stranded by a failed host move.
+
+        A move stamps ``move_origin_host_id`` before enqueuing its job
+        chain (atomically, same transaction) and clears it only on a
+        successful cutover or a successful rollback cleanup. If the
+        chain dies before cutover, the marker stays set and the source
+        was left with ``odoo`` stopped — the instance is down with no
+        automatic recovery.
+
+        Two states are handled:
+
+        * **Move failed, rollback not started** (``move_rollback_in_progress``
+          False). The move chain is dead; cancel what remains and
+          enqueue cleanup (target) + start (source). Raise a critical
+          ``move_stuck`` alert.
+
+        * **Rollback started but cleanup failed** (``move_rollback_in_progress``
+          True, no active jobs left). The target could not be reached;
+          the source should already be running. Clear the markers and
+          raise a warning ``move_rollback_failed`` alert so an operator
+          can manually reclaim the target later.
+
+        Instances where the move or its rollback is still going on are
+        left alone: a job runs, or one of theirs waits its turn — a step
+        of the move's chain, or a job of the rollback (``move_rollback``
+        in its payload), so a rollback waiting is not asked for twice.
+        Any other job waiting does not count: one asked for after the
+        failure waits behind the hold it left, and would keep the source
+        stopped for as long.
+        """
+        Job = self.env["cloud.job"]
+        hidden = Job._get_hidden_job_types()
+        active_states = Job._active_states
+        Alert = self.env["cloud.alert"].sudo()
+        stuck = self.search([("move_origin_host_id", "!=", False)])
+        for inst in stuck:
+            chain = inst._get_move_chain_jobs()
+            in_flight = Job.search(
+                [
+                    ("instance_id", "=", inst.id),
+                    ("state", "in", active_states),
+                    ("job_type_id.code", "not in", hidden),
+                ]
+            ).filtered(
+                lambda job, chain=chain: job.state != "queued"
+                or job in chain
+                or (job.payload or {}).get("move_rollback")
+            )
+            if in_flight:
+                continue
+            origin = inst.move_origin_host_id
+            if inst.move_rollback_in_progress:
+                target = inst.move_target_host_id
+                # What the rollback was to tell the hook, read before the
+                # markers that name its cleanup are cleared.
+                outcome = inst._rollback_outcome()
+                inst.sudo().write(
+                    {
+                        "move_origin_host_id": False,
+                        "move_target_host_id": False,
+                        "move_chain_job_ids": False,
+                        "move_rollback_in_progress": False,
+                        "move_cut_started_at": False,
+                        "move_cut_parts": False,
+                    }
+                )
+                # The source was restarted: the move is undone even if the
+                # target could not be cleaned.
+                inst._on_move_rolled_back(target_host=target, outcome=outcome)
+                if outcome.get("kind") == "postponed":
+                    message = _(
+                        "Cleanup of the postponed move of '%(name)s' failed "
+                        "on target host '%(target)s'; the instance kept "
+                        "running on '%(origin)s'. Manual cleanup of the "
+                        "target may be needed.",
+                        name=inst.name,
+                        origin=origin.name or "?",
+                        target=target.name or "?",
+                    )
+                else:
+                    message = _(
+                        "Rollback cleanup of '%(name)s' failed on "
+                        "target host '%(target)s'; source host "
+                        "'%(origin)s' was restarted. Manual cleanup "
+                        "of the target may be needed.",
+                        name=inst.name,
+                        origin=origin.name or "?",
+                        # The markers were cleared above: the target is
+                        # the one read before, not the record's.
+                        target=target.name or "?",
+                    )
+                Alert.raise_alert(
+                    "move_rollback_failed",
+                    message,
+                    host=origin or None,
+                    instance=inst,
+                )
+                continue
+            # A chain that died on a failed step failed; one that ended
+            # with none failed (a worker gone, a step cancelled) is stuck.
+            failed = chain.filtered(lambda job: job.state == "failed")
+            try:
+                inst._do_rollback_move(kind="failed" if failed else "stuck")
+            except Exception:  # noqa: BLE001
+                _logger.exception(
+                    "Stuck-move recovery failed for instance %s",
+                    inst.id,
+                )
+                continue
+            Alert.raise_alert(
+                "move_stuck",
+                _(
+                    "Move of '%(name)s' failed before cutover; "
+                    "source host '%(host)s' was restarted "
+                    "automatically.",
+                    name=inst.name,
+                    host=origin.name or "?",
+                ),
+                level="critical",
+                host=origin or None,
+                instance=inst,
+            )
+
+    # ── Resource estimation for auto-assign ───────────────────────────────
+    _RESOURCE_DEFAULTS = {
+        "odoo_cpus": 2.0,
+        "db_cpus": 1.0,
+        "backup_cpus": 0.5,
+        "smtp_cpus": 0.25,
+        "odoo_memory_limit": "2g",
+        "db_memory_limit": "1g",
+        "backup_memory_limit": "512m",
+        "smtp_memory_limit": "256m",
+    }
+
+    @staticmethod
+    def _compute_instance_resources(vals):
+        """Return (total_cpus, total_ram_gb) from creation vals with defaults."""
+        d = CloudInstance._RESOURCE_DEFAULTS
+        cpus = sum(
+            float(vals.get(k, d[k]) or d[k])
+            for k in ("odoo_cpus", "db_cpus", "backup_cpus", "smtp_cpus")
+        )
+        ram = sum(
+            parse_memory_to_gb(vals.get(k, d[k]) or d[k])
+            for k in (
+                "odoo_memory_limit",
+                "db_memory_limit",
+                "backup_memory_limit",
+                "smtp_memory_limit",
+            )
+        )
+        return cpus, ram
+
+    # Fields tracked in the audit log when changed (never passwords)
+    _AUDIT_TRACKED_FIELDS = frozenset(
+        {
+            "name",
+            "host_id",
+            "project_id",
+            "environment",
+            "odoo_version",
+            "smtp_relay_host",
+            "smtp_relay_port",
+            "smtp_relay_security",
+            # Never the client secret, as never a password.
+            "smtp_relay_auth",
+            "smtp_relay_oauth_directory_id",
+            "smtp_relay_oauth_client_id",
+            "odoo_proxy",
+            "postgres_version",
+            "postgres_dbname",
+            "backup_backend_id",
+            "active",
+            "autopurge_exempt",
+            "website_info_public",
+            # Off, a rebuild applies its image untested: who turned it off,
+            # and when (Fable's review of #91, 13-nov-2026).
+            "boot_test",
+        }
+    )
+
+    # Password fields: auto-generated if empty on create, preserved on write
+    _PASSWORD_FIELDS = (
+        "odoo_admin_password",
+        "odoo_admin_user_password",
+        "postgres_password",
+        "smtp_relay_password",
+        "smtp_relay_oauth_client_secret",
+    )
+    # Subset that must always have a value (auto-generated if not provided)
+    _REQUIRED_PASSWORD_FIELDS = (
+        "odoo_admin_password",
+        "odoo_admin_user_password",
+        "postgres_password",
+    )
+
+    def _check_guarded_vals(self, vals):
+        """Refuse what decides a teardown, a purge or a move to whom may not set it.
+
+        A consultant writes their project's instances, production ones
+        included, and some fields are not theirs to choose: what only the
+        platform writes (``_PLATFORM_FIELDS``, and ``_PLATFORM_STAMPS``
+        unless cleared, as a revive does), what only an administrator sets
+        (``_MANAGER_FIELDS``), and the host of an instance past draft,
+        whose stack is there and whose waiting jobs follow it
+        (``move_to_host`` moves both). Where backups are kept is a
+        developer's, as backups are, and creating an instance already past
+        draft — an import — an administrator's.
+
+        Whether an instance is production is chosen when it is created
+        and changed by nobody afterwards, an administrator included: it
+        decides who may delete the instance, whether its egress is
+        filtered and, where a layer counts productions, whether it counts
+        as one — relabelled staging, a production was deleted, or freed
+        its seat while it went on serving as one. Only the platform still
+        may.
+
+        :param dict vals: the values of the create, or of the write of
+            ``self``
+        :raises AccessError: naming the fields, or the instance whose
+            environment would change, or that would move to another host
+        """
+        if self.env.su:
+            return
+        names = sorted(
+            _PLATFORM_FIELDS.intersection(vals)
+            | {name for name in _PLATFORM_STAMPS if vals.get(name)}
+        )
+        if names:
+            raise AccessError(_(
+                "These fields of an instance are set by the panel's own "
+                "actions and cannot be written directly: %(fields)s.",
+                fields=", ".join(names),
+            ))
+        if "environment" in vals and any(
+            inst.environment != vals["environment"] for inst in self
+        ):
+            raise AccessError(_(
+                "The environment of an instance is chosen when it is created "
+                "and cannot be changed. For another staging or production, "
+                "create a new instance.",
+            ))
+        if self._has_cloud_group("group_cloud_manager"):
+            return
+        # Seeding ``state`` at creation is how a running instance is
+        # imported: a new record already deployed, on any host, would skip
+        # every check a deploy makes.
+        if not self and vals.get("state", "draft") != "draft":
+            raise AccessError(_(
+                "Only an Administrator may create an instance already past "
+                "draft, as an import does.",
+            ))
+        if "backup_backend_id" in vals and not self._has_cloud_group(
+            "group_cloud_developer",
+        ):
+            backend = vals["backup_backend_id"] or False
+            if any(inst.backup_backend_id.id != backend for inst in self) or (
+                not self and backend
+            ):
+                raise AccessError(_(
+                    "Only a Developer or an Administrator may choose where "
+                    "backups are kept.",
+                ))
+        names = sorted(_MANAGER_FIELDS.intersection(vals))
+        if names:
+            raise AccessError(_(
+                "Only an Administrator may set these fields of an instance: "
+                "%(fields)s.",
+                fields=", ".join(names),
+            ))
+        if "host_id" in vals:
+            host = vals["host_id"] or False
+            for inst in self:
+                if inst.state != "draft" and inst.host_id.id != host:
+                    raise AccessError(_(
+                        "Only an Administrator may change the host of "
+                        "%(instance)s once it has left draft; to move it, "
+                        "use Move to host.",
+                        instance=inst.name,
+                    ))
+
+    # ── Validation: name + custom_remote_dir fluye a shell en executors ───
+    # Un valor con shell metachars (; | & $ ` " ' space \ etc.) permite
+    # command injection via SSH en el host remoto. El regex estricto es la
+    # defensa principal; los executors pueden seguir usando f-strings.
+
+    @api.constrains("name")
+    def _check_name_shell_safe(self):
+        for inst in self:
+            if not _INSTANCE_NAME_RE.fullmatch(inst.name or ""):
+                raise ValidationError(
+                    _(
+                        "Instance name '%(name)s' is invalid. It must start with "
+                        "a lowercase letter or digit and contain only lowercase "
+                        "letters, digits, hyphens and underscores (max 63 chars).",
+                        name=inst.name,
+                    )
+                )
+
+    @api.constrains("name")
+    def _check_name_not_a_recovery_prefix(self):
+        """Refuse a name that ends in ``-pitr``, on create and on rename.
+
+        An instance's continuous recovery archive is kept beside its
+        backups under its own name and ``-pitr`` (``incubacloud_pitr``):
+        ``x-pitr``'s chain and ``x``'s archive would share one prefix, and
+        emptying either would empty both. Checked here rather than in the
+        module, so it holds for instances created before it is installed;
+        only a name being written is checked, so an existing one goes on
+        working.
+
+        :raise ValidationError: for such a name
+        """
+        for inst in self:
+            if (inst.name or "").endswith("-pitr"):
+                raise ValidationError(
+                    _(
+                        "Instance name '%(name)s' cannot end in '-pitr': "
+                        "an instance's continuous recovery archive is kept "
+                        "under its name with that ending, beside the "
+                        "backups of the instance that has it.",
+                        name=inst.name,
+                    )
+                )
+
+    @api.constrains("custom_remote_dir")
+    def _check_custom_remote_dir_shell_safe(self):
+        for inst in self:
+            v = inst.custom_remote_dir
+            if not v:
+                continue
+            if not _REMOTE_DIR_RE.fullmatch(v) or ".." in v.split("/"):
+                raise ValidationError(
+                    _(
+                        "Custom remote directory '%(path)s' is invalid. Use only "
+                        "letters, digits, dots, hyphens and underscores in each "
+                        "path segment. No '..', spaces or shell metacharacters.",
+                        path=v,
+                    )
+                )
+
+    @api.constrains("custom_backup_dst")
+    def _check_custom_backup_dst_shape(self):
+        """Keep the backup path to the grammar of the panel's destinations.
+
+        The path reaches the host as an argument of a command, as a line
+        of an environment file and inside the compose file: an S3 URL
+        (``boto3+s3://`` or ``s3://``) whose bucket and path hold letters,
+        digits, dots, hyphens and underscores only, or an ``sftp://`` URL
+        of a user, a server and such a path (``_backup_dst.dst_is_valid``). Checked when the path is written,
+        an import's included; a path saved before goes on as it is, as
+        does the one an archive freezes as it was computed
+        (``_freeze_backup_dst``).
+
+        A path written other than the one the destination computes must
+        not overlap a destination's or another instance's
+        (``_backup_prefix_conflict``): a purge of one would empty the
+        other's copies. That of one of the same name, archived included,
+        too: the copies would continue its chain.
+
+        :raises ValidationError: for a path outside it, or one that
+            overlaps
+        """
+        for inst in self:
+            v = inst.custom_backup_dst
+            if v and not dst_is_valid(v):
+                raise ValidationError(
+                    _(
+                        "Custom backup path '%(path)s' is invalid. Use "
+                        "boto3+s3://bucket/path, s3://bucket/path or "
+                        "sftp://user@server/path, with only letters, digits, "
+                        "dots, hyphens and underscores in the bucket and in "
+                        "each part of the path. No '..', spaces or shell "
+                        "metacharacters.",
+                        path=v,
+                    )
+                )
+            if not v or v == inst._computed_backup_dst():
+                continue
+            conflict = inst._backup_prefix_conflict(v, held=True)
+            if conflict is None:
+                continue
+            backend, other = conflict
+            if other:
+                raise ValidationError(_(
+                    "Custom backup path '%(path)s' overlaps the backup path "
+                    "of the instance %(other)s: deleting either would delete "
+                    "the other's copies. Use a path of its own.",
+                    path=v, other=other.name,
+                ))
+            raise ValidationError(_(
+                "Custom backup path '%(path)s' is the path of a backup "
+                "destination or above it, where every instance keeps its "
+                "copies. Use a path of the instance's own under it.",
+                path=v,
+            ))
+
+    @api.constrains("postgres_dbname", "postgres_username")
+    def _check_pg_identifiers_shell_safe(self):
+        for inst in self:
+            for fname, label in (
+                ("postgres_dbname", "PostgreSQL database name"),
+                ("postgres_username", "PostgreSQL user"),
+            ):
+                v = inst[fname]
+                if v and not _PG_IDENT_RE.fullmatch(v):
+                    raise ValidationError(
+                        _(
+                            "%(label)s '%(value)s' is invalid. Use a valid "
+                            "PostgreSQL identifier (1-63 chars, start with a "
+                            "lowercase letter or underscore, then letters, "
+                            "digits and underscores).",
+                            label=label,
+                            value=v,
+                        )
+                    )
+
+    @api.constrains(
+        "smtp_relay_host", "smtp_relay_port", "smtp_relay_user",
+        "odoo_admin_email",
+    )
+    def _check_smtp_relay_fields(self):
+        """Keep the mail relay fields to the grammar of what they hold.
+
+        The template renders the relay host, the relay user and the
+        default sender (the relay user, or else the admin email) inside
+        double-quoted scalars of the compose files: the host is a
+        hostname or an IPv4 address, the port a TCP port (0 is "the
+        default"), and the user and the admin email one line of text
+        without a double quote. The user may hold a backslash, as a
+        Windows ``DOMAIN\\user`` login does: the answers escape it.
+
+        :raises ValidationError: when one of them is outside it.
+        """
+        for inst in self:
+            host = inst.smtp_relay_host
+            if host and (len(host) > 253 or not _SMTP_HOST_RE.fullmatch(host)):
+                raise ValidationError(_(
+                    "SMTP host '%(host)s' is invalid. Use a hostname such as "
+                    "smtp.example.com or an IPv4 address, without a port.",
+                    host=host,
+                ))
+            if not 0 <= (inst.smtp_relay_port or 0) <= 65535:
+                raise ValidationError(_(
+                    "SMTP port %(port)s is invalid. Use a port from 1 to 65535.",
+                    port=inst.smtp_relay_port,
+                ))
+            # Not ``user``: ``_()`` reads a local of that name as the uid.
+            relay_user = inst.smtp_relay_user
+            if relay_user and (
+                len(relay_user) > 254 or _yaml_text_unsafe(relay_user, '"')
+            ):
+                raise ValidationError(_(
+                    "SMTP user is invalid. Use one line of at most 254 "
+                    "characters, without double quotes, tabs or other "
+                    "control characters."
+                ))
+            email = inst.odoo_admin_email
+            if email and (len(email) > 254 or _yaml_text_unsafe(email)):
+                raise ValidationError(_(
+                    "Admin email is invalid. Use one line of at most 254 "
+                    "characters, without double quotes, backslashes, tabs "
+                    "or other control characters."
+                ))
+
+    def _relay_server_vals(self, vals):
+        """Return *vals* with Microsoft's server when the relay is OAuth2.
+
+        An OAuth2 relay always sends through ``smtp.office365.com:587``
+        with STARTTLS (``_relay_oauth.MICROSOFT_SMTP_SERVER``): choosing
+        OAuth2 writes it, and a host, port or security sent for records
+        that all sign in with OAuth2 is replaced by it. Records that would
+        end up with another server (a write to several instances with
+        different authentications) are refused by
+        :meth:`_check_smtp_relay_oauth`.
+
+        :param dict vals: the values of a create, or of a write of ``self``
+        :returns: *vals*, or a copy with the server's three values
+        :rtype: dict
+        """
+        oauth = _relay_oauth.AUTH_OAUTH2_MICROSOFT
+        server = _relay_oauth.MICROSOFT_SMTP_SERVER
+        if "smtp_relay_auth" in vals:
+            if vals["smtp_relay_auth"] != oauth:
+                return vals
+        elif not (server.keys() & vals.keys()) or not self or any(
+            inst.smtp_relay_auth != oauth for inst in self
+        ):
+            return vals
+        return {**vals, **server}
+
+    @api.constrains(
+        "smtp_relay_auth", "smtp_relay_oauth_directory_id",
+        "smtp_relay_oauth_client_id", "smtp_relay_oauth_client_secret",
+        "smtp_relay_user", "smtp_relay_host", "smtp_relay_port",
+        "smtp_relay_security", "environment",
+    )
+    def _check_smtp_relay_oauth(self):
+        """Hold an OAuth2 relay to what Entra ID and the image need.
+
+        Production only: a staging captures its mail and never uses the
+        relay. Microsoft's server; a directory ID, which goes in
+        the token endpoint's URL, as a GUID or a domain; an application
+        (client) ID as a GUID; the sender mailbox as an address; and a
+        client secret saved. The identifiers are checked whenever they are
+        set, whatever the authentication.
+
+        :raises ValidationError: naming what is missing or wrong
+        """
+        oauth = _relay_oauth.AUTH_OAUTH2_MICROSOFT
+        server = _relay_oauth.MICROSOFT_SMTP_SERVER
+        for inst in self:
+            directory = inst.smtp_relay_oauth_directory_id
+            client = inst.smtp_relay_oauth_client_id
+            if directory and not _relay_oauth.valid_directory_id(directory):
+                raise ValidationError(_(
+                    "Directory ID '%(value)s' is invalid. Use the "
+                    "GUID shown in Entra ID, or one of the directory's "
+                    "domains, such as contoso.onmicrosoft.com.",
+                    value=directory,
+                ))
+            if client and not _relay_oauth.valid_client_id(client):
+                raise ValidationError(_(
+                    "Application (client) ID '%(value)s' is invalid. Use the "
+                    "GUID shown on the app registration's overview in "
+                    "Entra ID.",
+                    value=client,
+                ))
+            if inst.smtp_relay_auth != oauth:
+                continue
+            if inst.environment != "production":
+                raise ValidationError(_(
+                    "OAuth2 for the mail relay is for production instances "
+                    "only: a staging captures its mail and never uses the "
+                    "relay."
+                ))
+            if any(inst[name] != value for name, value in server.items()):
+                raise ValidationError(_(
+                    "With OAuth2 – Microsoft 365 the relay sends through "
+                    "smtp.office365.com, port 587, with STARTTLS; the host, "
+                    "port and encryption cannot be changed."
+                ))
+            missing = [
+                label for label, value in (
+                    (_("Directory ID"), directory),
+                    (_("Application (client) ID"), client),
+                    (_("Sender mailbox"), inst.smtp_relay_user),
+                    (_("Client secret"), inst._relay_oauth_secret()),
+                ) if not value
+            ]
+            if missing:
+                raise ValidationError(_(
+                    "OAuth2 – Microsoft 365 needs: %(fields)s.",
+                    fields=", ".join(missing),
+                ))
+            if not _relay_oauth.valid_mailbox(inst.smtp_relay_user):
+                raise ValidationError(_(
+                    "Sender mailbox '%(value)s' is invalid. Use the address "
+                    "of the Microsoft 365 mailbox the relay sends as, such "
+                    "as notifications@example.com.",
+                    value=inst.smtp_relay_user,
+                ))
+
+    @api.constrains("odoo_version")
+    def _check_series_may_be_chosen(self):
+        """A series the panel does not offer is chosen by an administrator only.
+
+        The pickers only show offered series, but the value also arrives
+        by RPC; see ``_odoo_versions.may_choose``. The refusal lists the
+        series the panel offers.
+        """
+        pin = _odoo_versions.pinned_template_ref(self.env)
+        for inst in self:
+            if inst.odoo_version and not _odoo_versions.may_choose(
+                inst.odoo_version, self.env.user, pin,
+            ):
+                offered = _("This panel offers: %s.", ", ".join(
+                    _odoo_versions.offered_versions(pin),
+                ))
+                # Offered, but not by this panel: its pin is too old.
+                if _odoo_versions.card(inst.odoo_version)["offered"]:
+                    raise ValidationError(_(
+                        "Odoo %(version)s is not offered on this panel.",
+                        version=inst.odoo_version,
+                    ) + " " + offered)
+                raise ValidationError(_(
+                    "Odoo %(version)s is not offered yet.",
+                    version=inst.odoo_version,
+                ) + " " + offered)
+
+    @api.constrains("odoo_version", "postgres_version")
+    def _check_postgres_version_for_series(self):
+        """A PostgreSQL the series does not run on is refused when saved.
+
+        The picker only offers the series' range
+        (``_odoo_versions.postgres_versions``), but the value also
+        arrives by RPC and by import; refused here, it never reaches
+        copier, which would fail inside the deploy.
+        """
+        for inst in self:
+            if not inst.odoo_version or not inst.postgres_version:
+                continue
+            allowed = _odoo_versions.postgres_versions(inst.odoo_version)
+            if inst.postgres_version not in allowed:
+                raise ValidationError(_(
+                    "Odoo %(version)s runs on PostgreSQL %(lowest)s to "
+                    "%(highest)s, not %(chosen)s.",
+                    version=inst.odoo_version,
+                    lowest=allowed[0], highest=allowed[-1],
+                    chosen=inst.postgres_version,
+                ))
+
+    @api.constrains("host_id", "project_id", "name", "custom_remote_dir")
+    def _check_remote_dir_unique_per_host(self):
+        """Two instances landing on the same directory of the same host
+        would silently clobber each other's compose files, DB volume and
+        filestore. ``remote_folder`` is only unique within its own
+        project, so a collision is possible across different projects
+        sharing a host — catch it here instead of on the remote disk.
+        """
+        for inst in self:
+            if not inst.host_id:
+                continue
+            target = inst.get_remote_dir()
+            siblings = inst.sudo().search(
+                [
+                    ("host_id", "=", inst.host_id.id),
+                    ("id", "!=", inst.id),
+                ]
+            )
+            for sibling in siblings:
+                if sibling.get_remote_dir() == target:
+                    raise ValidationError(
+                        _(
+                            "Instance '%(name)s' would use remote directory "
+                            "'%(dir)s' on host '%(host)s', already used by "
+                            "instance '%(other)s'.",
+                            name=inst.name,
+                            dir=target,
+                            host=inst.host_id.name,
+                            other=sibling.name,
+                        )
+                    )
+
+    def unlink(self):
+        Job = self.env["cloud.job"]
+        for inst in self:
+            self._check_can_delete_instance(inst)
+            if inst.state == "deployed":
+                raise UserError(
+                    _(
+                        "Instance '%(name)s' is still deployed. Remove it "
+                        "from the host first (use Delete on the instance "
+                        "page).",
+                        name=inst.name,
+                    )
+                )
+            if inst.state != "draft":
+                # 'deploying' / 'deleting': a job owns the record right
+                # now and will land it in a final state on its own.
+                raise UserError(
+                    _(
+                        "Instance '%(name)s' has a job in flight "
+                        "(state: %(state)s). Wait for it to finish before "
+                        "deleting the record.",
+                        name=inst.name,
+                        state=inst.state,
+                    )
+                )
+            # What waits on it is cancelled with the record, below: held
+            # to what its delete would be held to for what waits there.
+            Job._check_may_end_waiting(
+                Job.sudo().search([
+                    ("instance_id", "=", inst.id), ("state", "=", "queued"),
+                ]),
+                inst,
+            )
+            # Its delete queued the copy's removal first (``cloud.job.
+            # enqueue``); one still recorded here was not removed, and
+            # nothing will be able to name it once the record is gone.
+            if inst.move_frozen_source_host_id:
+                inst._forget_frozen_copy("the instance was deleted")
+            self.env["cloud.audit.log"].sudo().create(
+                {
+                    "action": "Instance deleted",
+                    "host_id": inst.host_id.id if inst.host_id else False,
+                    "project_id": inst.project_id.id if inst.project_id else False,
+                    "details": inst.name,
+                }
+            )
+        # What still waited in the queues of these instances would have
+        # run on records that are about to go: cancelled now, with their
+        # executors' undo, rather than found gone at dispatch.
+        waiting = Job.sudo().search([
+            ("instance_id", "in", self.ids), ("state", "=", "queued"),
+        ])
+        if waiting:
+            Job._cancel_queued(
+                waiting, _("Cancelled: the instance is no longer there."),
+            )
+        instance_ids = self.ids
+        result = super().unlink()
+        # Every way an instance stops existing ends here, so this is the
+        # one place its series are let go of. Queued inside this
+        # transaction: a rollback keeps both the record and its series.
+        self.env["cloud.settings"].sudo()._purge_instance_metrics(instance_ids)
+        return result
+
+    def _finalize_removal(self, keep_in_panel, unlink=True):
+        """Apply the outcome of a successful ``delete_instance`` job.
+
+        Called by the executor once the remote host has been torn
+        down. Back to 'draft' either way: with ``keep_in_panel=True``
+        the instance stays visible as a re-deployable draft, otherwise
+        the record is unlinked now that it is a draft again and the
+        :meth:`unlink` guard no longer applies.
+
+        ``unlink=False`` stops one step short and marks the record
+        ``removal_finalized`` instead. The executor uses it: an unlink
+        from a job's success hook cascades onto the job's own row and
+        makes the job's transaction fail to commit, so the executor
+        defers the unlink until after that commit
+        (``AbstractExecutor._unlink_after_job_commit``).
+        """
+        self.ensure_one()
+        self.write({"running": False})
+        if keep_in_panel:
+            self._freeze_backup_dst()
+        if self.state == "deployed":
+            # Normally the teardown job already marked 'deleting' in its
+            # before_execute; step through it here so a caller that
+            # finalises a still-'deployed' record (a rolled-back job
+            # transaction, a direct call) walks the same legal path
+            # instead of hitting the transition map.
+            self._transition("deleting")
+        if self.state != "draft":
+            # Already-'draft' records reach here on a legitimate path: a
+            # deploy that failed rolled the instance back to 'draft'
+            # (deploy_instance_executor.on_failure), and the teardown job
+            # that cleans it up skips its own 'deleting' step for the same
+            # reason. ``draft → draft`` is not in the transition map, so
+            # calling _transition unconditionally raised UserError inside
+            # the hook's cursor: the rollback dropped the unlink() below
+            # and the record was stranded, re-enqueued by the next cron
+            # tick forever. Finalising an already-draft record is a no-op.
+            self._transition("draft")
+        if not keep_in_panel:
+            if unlink:
+                self.unlink()
+            else:
+                self.sudo().write({"removal_finalized": True})
+            return
+        # Archived: out of the daily operation, into the archived view.
+        # Done last so a failure above leaves the record where an
+        # operator can still see it — hiding a half-finalised instance
+        # would be the one outcome nobody could act on.
+        #
+        # ``ic_archive_instance`` says which of the two meanings of
+        # ``active = False`` this is. In core it only ever meant "hidden
+        # from the lists", but a layer on top may read it as "the
+        # instance is gone" and clean up on it: delete its DNS record and
+        # unlink the records that own it. Archiving promises the exact
+        # opposite — the copy is kept and the instance can come back —
+        # so without this flag the new feature would quietly call the
+        # destructive path. Marked here, on the one archive route, rather
+        # than on each of the four removal callers: the fewer places have
+        # to be right, and a forgotten one there would skip a cleanup
+        # silently.
+        #
+        # Its health goes with it: nothing checks an archived instance,
+        # so the last check's services and status would be shown for
+        # ever (11-oct-2026: "db" and "smtp" in green, "error", on an
+        # instance whose containers had been removed).
+        #
+        # As the platform: the delete that ends here was held, when it
+        # was asked for, to what waited then; what was asked for since
+        # waits on an instance being removed
+        # (``cloud.job._check_may_end_waiting``).
+        self.sudo().with_context(ic_archive_instance=True).write({
+            "active": False,
+            "archived_at": fields.Datetime.now(),
+            "service_states": False,
+            "status": "ok",
+        })
+        # Nothing probes an archived instance, so whatever was lit about
+        # it would stay lit for ever (11-oct-2026: an "instance down"
+        # raised while it was being torn down). The unlinked branch
+        # above needs none of this: its alerts go with the record.
+        self.env["cloud.alert"].sudo().resolve_instance_alerts(self)
+
+    @api.model
+    def _check_name_not_held_by_an_archived(self, vals):
+        """Refuse a name an archived instance of the same project holds.
+
+        ``unique (project_id, name)`` already refuses it, and refusing is
+        right: the archived instance's backup chain lives at a path
+        derived from that pair, so a namesake would write into it. What
+        the constraint cannot do is explain itself — it raises a generic
+        integrity error naming a record that is invisible in every list,
+        which reads as a bug in the panel rather than as a decision.
+
+        Checked here rather than in a ``@api.constrains`` so the message
+        arrives before the INSERT: once Postgres raises, the transaction
+        is poisoned and the friendlier text would have to be recovered
+        from the exception.
+        """
+        name = (vals.get("name") or "").strip()
+        project_id = vals.get("project_id")
+        if not name or not project_id:
+            return
+        clash = self.with_context(active_test=False).search(
+            [
+                ("project_id", "=", project_id),
+                ("name", "=", name),
+                ("active", "=", False),
+            ],
+            limit=1,
+        )
+        if clash:
+            raise UserError(
+                _(
+                    "The name %(name)s is reserved by an archived instance "
+                    "of this project. Its backups live at a path built from "
+                    "that name, so reusing it would write into them. Revive "
+                    "that instance, or delete it if you no longer need what "
+                    "it holds.",
+                    name=name,
+                )
+            )
+
+    #: What a repository line of a new instance takes from a creator who
+    #: cannot create lines: what that creator changes on a saved line.
+    _NEW_REPO_LINE_FIELDS = (
+        "sequence", "url", "branch", "addons", "excludes", "commit_sha",
+    )
+
+    def _repo_line_commands_to_vals(self, commands):
+        """Return the values of the lines *commands* create on a new instance.
+
+        For a creator who cannot create lines: ``repo_ids`` in the values
+        of ``create`` is taken out and its lines go through
+        :meth:`_create_repo_lines`. Only commands that create a line are
+        accepted; one that links lines that exist would move them here.
+
+        :param commands: the ``repo_ids`` value of ``create``, or None
+        :return: a list of the lines' values
+        :rtype: list
+        :raises AccessError: for any other command
+        """
+        lines = []
+        for command in commands or ():
+            if (
+                isinstance(command, (list, tuple))
+                and command
+                and command[0] == fields.Command.CREATE
+            ):
+                lines.append(dict(command[2] or {}))
+            else:
+                raise AccessError(
+                    _(
+                        "A new instance takes repositories as new lines; "
+                        "lines that already exist cannot be moved to it."
+                    )
+                )
+        return lines
+
+    def _create_repo_lines(self, lines):
+        """Create the repository lines *lines* on this instance, just created.
+
+        Developer and up create them as any line. Below, the user cannot
+        create lines, so they are created as the system, from what the
+        user may change on a saved line (:attr:`_NEW_REPO_LINE_FIELDS`).
+        Below Project Manager, a line names only a repository of the
+        project's lines, and takes the project's URL for it.
+
+        :param list lines: the values of each line, without ``instance_id``
+        :return: the lines, in the user's environment
+        :rtype: cloud.instance.repo
+        :raises AccessError: below Project Manager, for a repository that
+            is not one of the project's
+        """
+        self.ensure_one()
+        Repo = self.env["cloud.instance.repo"]
+        if not lines:
+            return Repo
+        if Repo.has_access("create"):
+            return Repo.create(
+                [{**line, "instance_id": self.id} for line in lines]
+            )
+        self.check_access("write")
+        may_change_url = self.env["cloud.security.mixin"]._can_change_repo_url()
+        project_urls = {
+            repo_url_key(self.env, repo.url): repo.url
+            for repo in self.project_id.repo_ids
+        }
+        vals_list = []
+        for line in lines:
+            vals = {
+                name: line[name]
+                for name in self._NEW_REPO_LINE_FIELDS
+                if name in line
+            }
+            if not may_change_url:
+                url = project_urls.get(repo_url_key(self.env, vals.get("url")))
+                if not url:
+                    raise AccessError(
+                        _(
+                            "Only a Project Manager or higher can add the "
+                            "repository %s, which is not one of the "
+                            "project's.",
+                        )
+                        % vals.get("url")
+                    )
+                vals["url"] = url
+            vals_list.append({**vals, "instance_id": self.id})
+        records = (
+            Repo.sudo()
+            .with_context(skip_apply_requirements=True)
+            .create(vals_list)
+            .with_env(self.env)
+        )
+        records._apply_requirements()
+        return records
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        self._check_can_create_instance()
+        # The defaults the caller chose are checked as what they send.
+        self = defaults_as_sent(self, vals_list)
+        # Below Developer the lines of ``repo_ids`` are created after the
+        # instance, from what the user may send (``_create_repo_lines``):
+        # the instance itself is created as the system.
+        sent_lines = [[] for _vals in vals_list]
+        if not self.env["cloud.instance.repo"].has_access("create"):
+            sent_lines = [
+                self._repo_line_commands_to_vals(vals.pop("repo_ids", None))
+                for vals in vals_list
+            ]
+        # Created as the system below: what the x2many fields send can
+        # only be the new instance's own rows, and a line's Git provider
+        # and path are written from its URL.
+        creating = self._check_new_record_x2many(
+            vals_list, panel_only={"repo_ids": _DERIVED_FROM_URL},
+        )
+        for vals in vals_list:
+            # Checked as a creation whatever ``create`` was called on: a
+            # clone calls it on its production, whose environment the
+            # check would otherwise read as changed to staging.
+            self.browse()._check_guarded_vals(vals)
+            # The field's default suits the newest series only: 8.0 to 14.0
+            # do not run on it.
+            series = vals.get("odoo_version")
+            if series in _odoo_versions.VERSIONS and not vals.get("postgres_version"):
+                vals["postgres_version"] = _odoo_versions.postgres_default(series)
+            # Seeding ``state`` on create is legal (that is how an
+            # already-running instance is imported), but ``deployed`` is
+            # derived: Odoo would accept it here and then quietly
+            # overwrite it from ``state``, so say so instead.
+            if "deployed" in vals:
+                raise UserError(
+                    _(
+                        "'deployed' is derived from the lifecycle state. "
+                        "Pass 'state' instead."
+                    )
+                )
+            self._check_name_not_held_by_an_archived(vals)
+            # Being born counts as activity. A row that reached the
+            # table with an empty clock is the one shape the autopurge
+            # cron cannot read, and ``copy=False`` produces exactly that
+            # on every duplicate — so the default is applied here rather
+            # than on the field, where a copy would skip it.
+            vals.setdefault("last_touched_at", fields.Datetime.now())
+            vals.update(self.browse()._relay_server_vals(vals))
+            for field in self._REQUIRED_PASSWORD_FIELDS:
+                if not vals.get(field):
+                    vals[field] = generate_password()
+            # A new instance gets its key here, so the panel holds it
+            # before any host does. One born already on a host (an
+            # import) has a key there that nothing must replace: its
+            # first deploy or rebuild, or the daily capture, reads it.
+            if not vals.get("secret_key") and (
+                vals.get("state") not in self._ON_HOST_STATES
+            ):
+                vals["secret_key"] = generate_secret_key()
+            project_id = vals.get("project_id")
+            if project_id:
+                project = self.env["cloud.project"].browse(project_id)
+                # An instance runs its project's series unless it names
+                # one: the field's default is the newest series offered,
+                # and an instance imported from a host into a project of
+                # another series would render that one at its next rebuild.
+                if not vals.get("odoo_version") and project.odoo_version:
+                    vals["odoo_version"] = project.odoo_version
+                # Copy project dependencies to instance if not set
+                if "pip_dependencies" not in vals and project.pip_dependencies:
+                    vals["pip_dependencies"] = project.pip_dependencies
+                    # Provenance travels with the text it describes:
+                    # inheriting the lines without their authors would
+                    # hand every upstream-owned package back to the
+                    # operator and turn the next bump into a conflict.
+                    if "pip_dependency_sources" not in vals:
+                        vals["pip_dependency_sources"] = (
+                            project.pip_dependency_sources or {}
+                        )
+                if "apt_dependencies" not in vals and project.apt_dependencies:
+                    vals["apt_dependencies"] = project.apt_dependencies
+                # Auto-generate domain from wildcard
+                if (
+                    not vals.get("domain_ids")
+                    and vals.get("host_id")
+                    and vals.get("name")
+                ):
+                    host = self.env["cloud.host"].browse(vals["host_id"])
+                    if host.wildcard_domain:
+                        project_folder = project.remote_folder or ""
+                        subdomain = (
+                            f"{project_folder}-{vals['name']}"
+                            if project_folder
+                            else vals["name"]
+                        )
+                        hostname = f"{subdomain}.{host._subdomain_suffix()}"
+                        vals["domain_ids"] = [
+                            (0, 0, {"hostname": hostname}),
+                        ]
+            elif (
+                not vals.get("domain_ids") and vals.get("host_id") and vals.get("name")
+            ):
+                host = self.env["cloud.host"].browse(vals["host_id"])
+                if host.wildcard_domain:
+                    hostname = f"{vals['name']}.{host._subdomain_suffix()}"
+                    vals["domain_ids"] = [
+                        (0, 0, {"hostname": hostname}),
+                    ]
+        # sudo on create: encrypted password fields are restricted to
+        # group_cloud_developer but consultants (lower in the hierarchy)
+        # are allowed to create instances. We auto-generate those passwords
+        # above; writing them requires sudo. We drop back to the caller's
+        # env so the returned recordset respects their normal permissions.
+        records = super(CloudInstance, self.sudo()).create(vals_list).with_env(self.env)
+        # The create above skips the rules Odoo applies to what a create
+        # made: applied here, in the caller's environment, so an instance
+        # is born only in a project its creator is a member of.
+        records.check_access("create")
+        self._check_new_record_rows(records, creating)
+        records._claim_own_backup_path()
+        Whitelist = self.env["cloud.instance.whitelist"]
+        for inst in records:
+            # A staging is born with the egress list its host already
+            # publishes, so the common case — "the same five hostnames
+            # every instance here needs" — costs nobody a decision. A
+            # staging created before its host is chosen falls back to
+            # the platform default, which is that same list of five.
+            #
+            # Production is skipped: its answer is always [] and a row
+            # nobody reads is a row somebody will eventually believe.
+            # The host's list is read with ``sudo``: below Developer the
+            # host's egress entries are not readable, and a consultant's
+            # staging failed to be created. Only the hostnames are taken,
+            # and they become the staging's own list, theirs to read.
+            if inst.environment != "production" and not inst.whitelist_ids:
+                seed = (
+                    inst.host_id.sudo().whitelist_ids.mapped("hostname")
+                    or DEFAULT_WHITELIST.copy()
+                )
+                Whitelist.create([
+                    {"instance_id": inst.id, "hostname": h, "sequence": i * 10}
+                    for i, h in enumerate(seed, 1)
+                ])
+            self.env["cloud.audit.log"].sudo().create(
+                {
+                    "action": "Instance created",
+                    "instance_id": inst.id,
+                    "host_id": inst.host_id.id if inst.host_id else False,
+                    "project_id": inst.project_id.id if inst.project_id else False,
+                }
+            )
+        # skip_apply_requirements: requirements were already merged into the
+        # project's pip_dependencies (and inherited by the instance above).
+        # Re-fetching from GitHub here would just duplicate the work and block
+        # the request with N synchronous HTTP calls.
+        for inst, lines in zip(records, sent_lines):
+            if lines:
+                inst._create_repo_lines(lines)
+        for inst in records.with_context(skip_apply_requirements=True):
+            if self.env.context.get("skip_project_repos"):
+                continue  # caller will create repos explicitly
+            inst._create_repo_lines(
+                [
+                    {
+                        "sequence": repo.sequence,
+                        "url": repo.url,
+                        "branch": repo.branch or "main",
+                        "addons": repo.addons or "",
+                        "excludes": repo.excludes or "",
+                        "commit_sha": repo.commit_sha or "",
+                    }
+                    for repo in inst.project_id.repo_ids
+                ]
+            )
+        return records

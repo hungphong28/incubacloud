@@ -1,0 +1,221 @@
+// ============================================================================
+//  Shared modal chrome — `.ic-modal-overlay`, `.ic-modal`, `.ic-frow`,
+//  `.ic-btn`, `.ic-alert`.
+//  Used by every Relay-styled standalone dialog (import modal, remote file
+//  browser, and the dialogs of modules on top). Styled with the `--rl-*`
+//  tokens: relay.scss defines them on :root precisely so they resolve in
+//  dialogs that mount OUTSIDE `.ic-app`, and both files ship in the same
+//  /cloud bundle — so the chrome follows the active light/dark theme at any
+//  mount point. The overlay scrim and drop shadows stay literal darks on
+//  purpose (same convention as the slide-over scrim: dark in both themes).
+//  Lived in create_project_modal.scss until that dead component was removed.
+// ============================================================================
+
+// ── Overlay + box ───────────────────────────────────────────────────────────
+.ic-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(6, 10, 8, 0.74);
+    backdrop-filter: blur(6px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1050;
+    animation: ic-modal-fade 0.14s ease;
+}
+
+@keyframes ic-modal-fade { from { opacity: 0; } }
+
+.ic-modal {
+    background: var(--rl-surf);
+    border: 1px solid var(--rl-line);
+    border-radius: var(--rl-r);
+    width: 480px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.62);
+    font-family: var(--rl-fb);
+
+    &--m { max-height: 85vh; }
+}
+
+// ── Header ──────────────────────────────────────────────────────────────────
+.ic-modal__header {
+    padding: 15px 18px;
+    border-bottom: 1px solid var(--rl-line);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+
+    h3 {
+        margin: 0;
+        font-family: var(--rl-fd);
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        color: var(--rl-fg);
+    }
+}
+
+.ic-modal__close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--rl-rsm);
+    color: var(--rl-muted);
+    cursor: pointer;
+
+    svg { width: 16px; height: 16px; }
+
+    &:hover { background: var(--rl-surf2); color: var(--rl-fg); }
+}
+
+// ── Body ────────────────────────────────────────────────────────────────────
+.ic-modal__body {
+    padding: 18px;
+    overflow-y: auto;
+
+    &::-webkit-scrollbar { width: 4px; }
+    &::-webkit-scrollbar-thumb { background: var(--rl-line); border-radius: 2px; }
+}
+
+// ── Footer ──────────────────────────────────────────────────────────────────
+.ic-modal__footer {
+    padding: 13px 18px;
+    border-top: 1px solid var(--rl-line);
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+
+    &--between { justify-content: space-between; }
+}
+
+// ── Form rows (Relay rl-frow look) ──────────────────────────────────────────
+.ic-frow {
+    margin-bottom: 16px;
+
+    &:last-child { margin-bottom: 0; }
+
+    // Same reach as `.rl-frow` in relay.scss: the row's own caption and
+    // field, plus class-less controls in a plain wrapper (the import URL
+    // row). A component nested in the row (SearchSelect) keeps its own CSS.
+    > label {
+        display: block;
+        @include rl-field-label;
+        margin-bottom: 6px;
+    }
+
+    > input,
+    > textarea,
+    > select,
+    input:not([class]),
+    textarea:not([class]),
+    select:not([class]) {
+        width: 100%;
+        background: var(--rl-bg);
+        border: 1px solid var(--rl-line2);
+        border-radius: var(--rl-rsm);
+        padding: 9px 12px;
+        color: var(--rl-fg);
+        font-family: var(--rl-fb);
+        font-size: 13.5px;
+        outline: none;
+
+        &::placeholder { color: var(--rl-faint); }
+
+        &:focus {
+            border-color: var(--rl-green);
+            box-shadow: 0 0 0 3px var(--rl-green-soft);
+        }
+    }
+
+    // With the ``:not([class])`` form too, which the field rule above
+    // outweighs a bare ``textarea`` with.
+    textarea,
+    textarea:not([class]) {
+        font-family: var(--rl-fm);
+        resize: vertical;
+        min-height: 76px;
+    }
+}
+
+.ic-req { color: var(--rl-green); }
+
+.ic-fhint {
+    display: block;
+    margin-top: 6px;
+    font-family: var(--rl-fm);
+    font-size: 11px;
+    color: var(--rl-faint);
+}
+
+// ── Buttons (Relay rl-btn look) ─────────────────────────────────────────────
+.ic-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--rl-fb);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 8px 14px;
+    border-radius: var(--rl-rsm);
+    border: 1px solid transparent;
+    white-space: nowrap;
+    cursor: pointer;
+    color: var(--rl-fg);
+    background: transparent;
+
+    svg { width: 15px; height: 15px; }
+
+    &:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    &--primary {
+        background: var(--rl-green-btn);
+        color: var(--rl-green-fg);
+
+        &:hover:not(:disabled), &:active:not(:disabled) { background: var(--rl-green-btn-hover); }
+    }
+
+    &--ghost {
+        background: transparent;
+        color: var(--rl-fg);
+        border-color: var(--rl-line2);
+
+        &:hover:not(:disabled) { background: var(--rl-surf2); }
+    }
+}
+
+// ── Alert ───────────────────────────────────────────────────────────────────
+.ic-alert {
+    display: flex;
+    gap: 9px;
+    align-items: flex-start;
+    margin-top: 14px;
+    padding: 11px 13px;
+    border-radius: 8px;
+    font-size: 12.5px;
+    line-height: 1.45;
+
+    .ic-alert__icon { flex: none; margin-top: 1px; display: flex; }
+    .ic-alert__text { color: var(--rl-fg); }
+
+    svg { width: 15px; height: 15px; }
+
+    &--error {
+        background: var(--rl-red-soft);
+        border: 1px solid rgba(var(--rl-red-rgb), 0.4);
+
+        .ic-alert__icon { color: var(--rl-red); }
+    }
+
+    &--warning {
+        background: var(--rl-amber-soft);
+        border: 1px solid rgba(var(--rl-amber-rgb), 0.35);
+
+        .ic-alert__icon { color: var(--rl-amber); }
+    }
+}

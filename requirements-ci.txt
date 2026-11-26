@@ -1,0 +1,33 @@
+# pip-audit input: every PyPI-resolvable runtime and test dependency
+# shipped with the incubacloud image, pinned to its live version.
+#
+# Mirrors ``odoo/custom/dependencies/pip.txt`` (runtime) plus the
+# test-time pins the CI's test job already installs. The openupgradelib
+# git URL lives in pip.txt only — pip-audit can't resolve git sources.
+#
+# When you bump a version here, bump pip.txt in lockstep (or rebuild
+# the image first and copy the new version back into both files).
+
+# Runtime
+unicodecsv==0.14.1
+unidecode==1.4.0
+asyncssh==2.24.0
+boto3==1.42.91
+hcloud==2.17.1
+bcrypt==5.0.0
+ansible-core==2.21.2
+ansible-runner==2.4.3
+joserfc==1.7.7
+packaging==26.3
+# requirements.txt's: they replace Odoo 19's urllib3 2.0.7 and requests
+# 2.31.0 in every instance built with this repository.
+urllib3==2.8.0
+requests==2.34.2
+# Baked into the same image even though no core addon imports them: the
+# addons layered on top that run on this image do. Listed here so pip-audit covers
+# every runtime pin, not only the ones this repo's own code reaches.
+ovh==1.2.0
+
+# Test-only pins (matched by the CI ``test`` job)
+PyYAML==6.0.3
+cryptography==50.0.1

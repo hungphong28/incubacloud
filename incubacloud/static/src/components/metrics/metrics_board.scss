@@ -1,0 +1,831 @@
+// The panel's own metric charts (metrics_board.js, host_board.js,
+// fleet_board.js, time_series_chart.js, on_demand_panel.js): an
+// instance's Metrics tab as a diagnosis, a server's Metrics tab and
+// Monitoring's fleet.
+
+.ic-mb {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-inline-size: 0;
+}
+
+.ic-mb-section {
+  min-inline-size: 0;
+}
+
+.ic-mb-h {
+  margin-block: 0 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--rl-fg);
+}
+
+.ic-mb-h5 {
+  margin-block: 14px 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--rl-fg2);
+}
+
+.ic-mb-sub {
+  margin-block: 0 10px;
+  color: var(--rl-muted);
+  font-size: 12.5px;
+}
+
+.ic-mb-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px 16px;
+  margin-block-end: 10px;
+
+  .ic-mb-h,
+  .ic-mb-sub {
+    margin-block-end: 2px;
+  }
+}
+
+.ic-mb-legend {
+  margin-inline-start: 8px;
+  white-space: nowrap;
+}
+
+.ic-mb-mk {
+  margin-inline: 6px 2px;
+  font-size: 10px;
+}
+
+.ic-mb-mk-restart {
+  color: var(--rl-cyan);
+}
+
+.ic-mb-mk-oom {
+  color: var(--rl-red);
+}
+
+.ic-mb-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+// Segmented range picker: one control, exclusive values.
+.ic-mb-seg {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--rl-line2);
+  border-radius: var(--rl-rsm);
+  background: var(--rl-surf);
+}
+
+.ic-mb-segbtn {
+  min-inline-size: 44px;
+  min-block-size: 30px;
+  padding-inline: 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--rl-muted);
+  font-family: var(--rl-fm);
+  font-size: 12px;
+  cursor: pointer;
+
+  &:hover {
+    color: var(--rl-fg);
+  }
+
+  &.active {
+    background: var(--rl-surf3);
+    color: var(--rl-fg);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--rl-green);
+    outline-offset: 1px;
+  }
+}
+
+// ── Diagnosis ────────────────────────────────────────────────────────
+.ic-mb-diag {
+  padding: 14px 16px;
+  border-inline-start: 3px solid var(--rl-green);
+
+  &.ic-mb-tone-warn {
+    border-inline-start-color: var(--rl-amber);
+  }
+
+  &.ic-mb-tone-bad {
+    border-inline-start-color: var(--rl-red);
+  }
+}
+
+.ic-mb-diag-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-block-end: 8px;
+  color: var(--rl-fg);
+}
+
+.ic-mb-diag-span {
+  color: var(--rl-faint);
+  font-family: var(--rl-fm);
+  font-size: 11px;
+}
+
+.ic-mb-dot {
+  inline-size: 9px;
+  block-size: 9px;
+  border-radius: 50%;
+  background: var(--rl-green);
+  box-shadow: 0 0 0 3px var(--rl-green-soft);
+}
+
+.ic-mb-dot-warn {
+  background: var(--rl-amber);
+  box-shadow: 0 0 0 3px var(--rl-amber-soft);
+}
+
+.ic-mb-dot-bad {
+  background: var(--rl-red);
+  box-shadow: 0 0 0 3px var(--rl-red-soft);
+}
+
+.ic-mb-findings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.ic-mb-finding {
+  padding-inline-start: 14px;
+  position: relative;
+  color: var(--rl-fg2);
+  font-size: 13px;
+  line-height: 1.45;
+
+  &::before {
+    content: "";
+    position: absolute;
+    inset-inline-start: 0;
+    inset-block-start: 0.55em;
+    inline-size: 6px;
+    block-size: 6px;
+    border-radius: 50%;
+    background: var(--rl-muted);
+  }
+
+  &.ic-mb-tone-warn::before {
+    background: var(--rl-amber);
+  }
+
+  &.ic-mb-tone-bad::before {
+    background: var(--rl-red);
+  }
+
+  &.ic-mb-tone-info::before {
+    background: var(--rl-cyan);
+  }
+
+  &.ic-mb-tone-ok::before {
+    background: var(--rl-green);
+  }
+}
+
+.ic-mb-diag-text {
+  margin-block: 0 12px;
+  color: var(--rl-fg2);
+  font-size: 13px;
+}
+
+.ic-mb-diag-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+// ── Charts ───────────────────────────────────────────────────────────
+.ic-mb-grid {
+  display: grid;
+  // Interpolated: Sass cannot compare % with px at compile time.
+  grid-template-columns: #{"repeat(auto-fit, minmax(min(100%, 420px), 1fr))"};
+  gap: 12px;
+  transition: opacity 0.15s;
+
+  &.is-loading {
+    opacity: 0.6;
+  }
+}
+
+.ic-mb-wide {
+  grid-column: 1 / -1;
+}
+
+// A grid whose rows always fill the board: a row with fewer cards than
+// columns, or the cards beside a wide one, grow into the room a grid
+// would leave empty on a wide screen (17-nov-2026). The same 420px
+// minimum, so the cards wrap where the grid's columns would.
+.ic-mb-fill {
+  display: flex;
+  flex-wrap: wrap;
+
+  > * {
+    flex: 1 1 420px;
+  }
+
+  > .ic-mb-wide {
+    flex-basis: 100%;
+  }
+
+  // Two columns' worth (2 × 420px and their gap): beside one card where
+  // three fit in a row, in line with the columns above; a row of its
+  // own on a narrower board.
+  > .ic-mb-span2 {
+    flex: 2 1 852px;
+  }
+}
+
+// Never more than two cards in a row: four cards make two rows of two
+// where three would fit, instead of three and one.
+.ic-mb-pairs > * {
+  flex-basis: #{"max(420px, 34%)"};
+}
+
+.ic-mb-card {
+  padding-block: 12px 8px;
+  padding-inline: 12px;
+  min-inline-size: 0;
+}
+
+.ic-mb-cardhead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 2px 10px;
+  margin-block-end: 6px;
+}
+
+.ic-mb-hint {
+  color: var(--rl-faint);
+  font-family: var(--rl-fm);
+  font-size: 11px;
+}
+
+// Chart.js needs a sized, positioned parent with maintainAspectRatio off.
+.ic-mb-canvas {
+  position: relative;
+  block-size: 230px;
+
+  canvas {
+    cursor: crosshair;
+    touch-action: pan-y;
+  }
+}
+
+.ic-mb-empty {
+  margin-block: 8px;
+  color: var(--rl-muted);
+  font-size: 12.5px;
+}
+
+.ic-mb-stub {
+  padding-block: 40px;
+}
+
+.ic-mb-panel-error {
+  color: var(--rl-amber-text);
+}
+
+.ic-mb-since {
+  color: var(--rl-muted);
+  font-size: 12.5px;
+}
+
+.ic-mb-meta {
+  margin-block: 0;
+  color: var(--rl-faint);
+  font-family: var(--rl-fm);
+  font-size: 11px;
+}
+
+// ── A server's board ─────────────────────────────────────────────────
+.ic-hb-ingest {
+  margin-block: 10px 0;
+  color: var(--rl-muted);
+  font-family: var(--rl-fm);
+  font-size: 11.5px;
+
+  &.is-late {
+    color: var(--rl-amber-text);
+  }
+}
+
+.ic-hb-link {
+  color: var(--rl-fg);
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-color: var(--rl-line2);
+  text-underline-offset: 3px;
+
+  &:hover,
+  &:focus-visible {
+    text-decoration-color: currentColor;
+  }
+}
+
+// ── The fleet's board ────────────────────────────────────────────────
+.ic-fb-tiles {
+  display: grid;
+  grid-template-columns: #{"repeat(auto-fill, minmax(min(100%, 150px), 1fr))"};
+  gap: 10px;
+}
+
+.ic-fb-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  min-inline-size: 0;
+}
+
+.ic-fb-tile-value {
+  color: var(--rl-fg);
+  font-family: var(--rl-fm);
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.ic-fb-tile-label {
+  color: var(--rl-muted);
+  font-size: 12px;
+}
+
+.ic-fb-tile.is-warn .ic-fb-tile-value {
+  color: var(--rl-amber-text);
+}
+
+.ic-fb-tile.is-bad .ic-fb-tile-value {
+  color: var(--rl-red-text);
+}
+
+.ic-fb-scope {
+  display: inline-block;
+  margin-inline-start: 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--rl-surf2);
+  color: var(--rl-fg2);
+  font-size: 11.5px;
+}
+
+// The ingestion line: one row per host, its window in segments.
+.ic-fb-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ic-fb-tl-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 200px) 1fr;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+}
+
+.ic-fb-tl-name {
+  overflow: hidden;
+  color: var(--rl-fg2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ic-fb-tl-bar {
+  position: relative;
+  block-size: 12px;
+  border-radius: var(--rl-rsm);
+  background: var(--rl-surf2);
+  overflow: hidden;
+}
+
+.ic-fb-tl-seg {
+  position: absolute;
+  inset-block: 0;
+
+  &.is-ok {
+    background: var(--rl-green);
+  }
+
+  &.is-silent {
+    background: var(--rl-red);
+  }
+}
+
+// A colour of the ingestion line with its word: never apart on a wrap.
+.ic-fb-legend {
+  white-space: nowrap;
+}
+
+.ic-fb-legend-ok,
+.ic-fb-legend-silent {
+  display: inline-block;
+  inline-size: 10px;
+  block-size: 10px;
+  margin-inline: 8px 4px;
+  border-radius: 2px;
+  vertical-align: -1px;
+}
+
+.ic-fb-legend-ok {
+  background: var(--rl-green);
+}
+
+.ic-fb-legend-silent {
+  background: var(--rl-red);
+}
+
+@media (max-width: 480px) {
+  .ic-fb-tl-row {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+}
+
+// The fleet's Security block: its chart beside this panel's servers to
+// look at, one column on a narrow screen.
+.ic-fb-sec-grid {
+  display: grid;
+  grid-template-columns: #{"repeat(auto-fit, minmax(min(100%, 420px), 1fr))"};
+  gap: 12px;
+  margin-block-start: 12px;
+}
+
+.ic-fb-sec-off p {
+  margin: 0;
+}
+
+.ic-fb-sec-title {
+  color: var(--rl-fg);
+  font-weight: 600;
+}
+
+.ic-fb-sec-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ic-fb-sec-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding-block: 8px;
+  border-block-start: 1px solid var(--rl-line);
+
+  &:first-child {
+    border-block-start: 0;
+  }
+}
+
+.ic-fb-sec-name {
+  flex: 0 1 180px;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  font-weight: 500;
+}
+
+.ic-fb-sec-flags {
+  display: flex;
+  flex: 1 1 220px;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+}
+
+.ic-fb-sec-flag {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--rl-surf2);
+  color: var(--rl-fg2);
+  font-size: 12px;
+
+  &.is-warn {
+    background: var(--rl-amber-soft);
+    color: var(--rl-amber-text);
+  }
+
+  &.is-bad {
+    background: var(--rl-red-soft);
+    color: var(--rl-red-text);
+  }
+}
+
+// ── Readings on demand ───────────────────────────────────────────────
+.ic-od {
+  margin-block-end: 12px;
+  padding: 12px 14px;
+  min-inline-size: 0;
+}
+
+.ic-od-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+.ic-od-titles {
+  flex: 1 1 260px;
+  min-inline-size: 0;
+}
+
+.ic-od-title {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--rl-fg);
+}
+
+.ic-od-hint {
+  margin-block: 2px 0;
+  color: var(--rl-muted);
+  font-size: 12px;
+}
+
+.ic-od-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.ic-od-ago {
+  color: var(--rl-faint);
+  font-family: var(--rl-fm);
+  font-size: 11px;
+}
+
+.ic-od-error {
+  margin-block: 10px 0;
+  color: var(--rl-red-text);
+  font-size: 12.5px;
+}
+
+.ic-mb-select {
+  min-block-size: 30px;
+  padding-inline: 8px;
+  border: 1px solid var(--rl-line2);
+  border-radius: var(--rl-rsm);
+  background: var(--rl-surf);
+  color: var(--rl-fg);
+  font-family: var(--rl-fm);
+  font-size: 12px;
+}
+
+.ic-mb-dbline {
+  margin-block: 12px 8px;
+  color: var(--rl-fg2);
+  font-family: var(--rl-fm);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+// Tables scroll inside their box on a phone instead of widening the page.
+.ic-mb-tablebox {
+  margin-block-start: 8px;
+  overflow-x: auto;
+  max-inline-size: 100%;
+}
+
+.ic-mb-table {
+  min-inline-size: 560px;
+
+  td,
+  th {
+    vertical-align: top;
+  }
+}
+
+// A cell's label, shown only where the table becomes cards (phones),
+// whose rows lose their column headers.
+.ic-mb-k {
+  display: none;
+}
+
+.ic-mb-num {
+  text-align: end;
+  font-family: var(--rl-fm);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.ic-mb-mono {
+  font-family: var(--rl-fm);
+  font-size: 12px;
+}
+
+.ic-mb-query {
+  max-inline-size: 420px;
+}
+
+.ic-mb-blocked td {
+  background: var(--rl-amber-soft);
+}
+
+.ic-mb-kill {
+  margin-block: 6px;
+  color: var(--rl-fg2);
+  font-size: 12.5px;
+
+  summary {
+    cursor: pointer;
+  }
+}
+
+.ic-mb-trace {
+  margin-block: 6px 0;
+  padding: 8px 10px;
+  border-radius: var(--rl-rsm);
+  background: var(--rl-logs-bg);
+  color: var(--rl-logs-fg);
+  font-family: var(--rl-fm);
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+// A server's Metrics tab: Performance | Security above its board.
+.ic-host-metrics-view {
+  margin-block-end: 14px;
+}
+
+// The Security view (host_security_board.js): the defence as a list of
+// findings, the web logins' figures, the filter and the lines read.
+.ic-sb-defense {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 6px 18px;
+  margin: 0;
+  padding: 12px 14px;
+  list-style: none;
+}
+
+.ic-sb-figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 22px;
+  margin: 6px 0 10px;
+  padding: 0;
+  list-style: none;
+  color: var(--rl-fg2);
+  font-size: 12.5px;
+
+  strong {
+    color: var(--rl-fg);
+    font-family: var(--rl-fm);
+  }
+}
+
+.ic-sb-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-block: 4px 6px;
+
+  label {
+    color: var(--rl-muted);
+    font-size: 12.5px;
+  }
+}
+
+.ic-sb-select {
+  max-inline-size: 260px;
+}
+
+.ic-sb-lines {
+  margin-inline-start: auto;
+}
+
+.ic-sb-user {
+  margin-inline-start: 8px;
+  white-space: nowrap;
+}
+
+.ic-sb-sample {
+  margin-block: 6px 0;
+}
+
+.ic-sb-pre {
+  max-block-size: 420px;
+  overflow: auto;
+}
+
+// The known keys' card: the form that adds one, its buttons and the
+// removed keys under the list.
+.ic-sb-keyform {
+  display: grid;
+  gap: 10px;
+  max-inline-size: 640px;
+  margin-block: 6px 12px;
+
+  input,
+  textarea {
+    inline-size: 100%;
+  }
+}
+
+.ic-sb-addkey {
+  margin-inline-start: auto;
+}
+
+.ic-sb-keyactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ic-sb-removed {
+  margin-block-start: 10px;
+  color: var(--rl-fg2);
+  font-size: 12.5px;
+
+  summary {
+    cursor: pointer;
+  }
+}
+
+.ic-sb-removedlist {
+  margin: 6px 0 0;
+  padding-inline-start: 18px;
+  overflow-wrap: anywhere;
+}
+
+// On a phone every table of the app becomes cards (app.scss, "Lists
+// become cards"): here a card is the row's name on a line of its own,
+// then each figure with its label, wrapping as the width allows.
+@media (max-width: 768px) {
+  .ic-mb-table {
+    min-inline-size: 0;
+  }
+
+  .ic-app .rl-table.ic-mb-table {
+    tr {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 4px 14px;
+    }
+
+    td {
+      overflow: visible;
+      white-space: normal;
+      text-align: start;
+    }
+
+    .ic-mb-cardtitle,
+    .ic-mb-query {
+      flex-basis: 100%;
+      max-inline-size: none;
+      overflow-wrap: anywhere;
+    }
+
+    // The whole card is tinted, not each cell.
+    .ic-mb-blocked {
+      background: var(--rl-amber-soft);
+
+      td {
+        background: transparent;
+      }
+    }
+
+    .ic-mb-k {
+      display: inline;
+      margin-inline-end: 5px;
+      color: var(--rl-muted);
+      font-family: var(--rl-fb);
+      font-size: 11.5px;
+    }
+  }
+}
+
+@media (max-width: 480px) {
+  .ic-mb-canvas {
+    block-size: 190px;
+  }
+
+  .ic-mb-legend {
+    display: block;
+    margin-inline-start: 0;
+  }
+}

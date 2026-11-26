@@ -1,0 +1,43 @@
+services:
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.102.0
+    restart: unless-stopped
+    command:
+      - '-retentionPeriod=90d'
+      - '-storageDataPath=/vmdata'
+      - '-httpListenAddr=:8428'
+      # Bound to the compose network only — see the header.
+    volumes:
+      - vmdata:/vmdata
+
+  loki:
+    image: grafana/loki:2.9.8
+    restart: unless-stopped
+    command: ['-config.file=/etc/loki/local-config.yaml']
+    volumes:
+      - /root/observability-central/loki.yaml:/etc/loki/local-config.yaml:ro
+      - lokidata:/loki
+    # No host port, same as VictoriaMetrics: the account
+    # boundary is imposed by vmauth, and anything able to reach
+    # Loki directly would bypass it.
+
+  vmauth:
+    image: victoriametrics/vmauth:v1.102.0
+    restart: unless-stopped
+    # Listen on 8428 (not vmauth's 8427 default) so every
+    # address of this stack — the panel's, the health check,
+    # the agents' URLs — speaks one port.
+    command:
+      - '-auth.config=/etc/vmauth/auth.yml'
+      - '-httpListenAddr=:8428'
+    volumes:
+      - /root/observability-central/vmauth/auth.yml:/etc/vmauth/auth.yml:ro
+    ports:
+      - "172.17.0.1:8428:8428"
+    depends_on:
+      - victoriametrics
+      - loki
+
+volumes:
+  vmdata:
+  lokidata:

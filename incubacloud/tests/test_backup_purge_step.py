@@ -1,0 +1,548 @@
+"""Deleting an instance clears its backups first, or does not happen.
+
+The invariant: never leave objects belonging to an instance that no
+longer exists. Nothing prunes them afterwards — the retention job runs
+inside the very container the teardown destroys — and on a managed
+destination they keep consuming a paid quota the customer cannot reach.
+
+That forces the order. The only thing that can talk to the bucket is the
+instance's own ``backup`` container, so the purge runs *before* the
+teardown and, if it fails, aborts it. Tearing down first would strand the
+objects with nothing left able to delete them, which is why there is no
+"delete anyway".
+
+What these pin, in order of how badly each would hurt:
+
+  * the step never reaches a teardown that is not a deletion — the move
+    cleanups reuse these very commands against a host the instance has
+    left, while it is alive and using those backups elsewhere;
+  * it runs before the teardown, and stops it on failure;
+  * instances without that service are excluded by the same gate that decides whether the
+    container is deployed at all, not by a branch naming them;
+  * each exit code produces the alert that names its own fix, and a
+    clean run clears them.
+"""
+import asyncio
+import shlex
+from unittest.mock import MagicMock, patch
+
+from odoo.tests.common import TransactionCase
+
+from ..models.delete_instance_executor import (
+    ARCHIVE_ALERT_BY_EXIT,
+    ARCHIVE_LABEL,
+    PURGE_ALERT_BY_EXIT,
+    PURGE_EXIT_ALREADY_EMPTY,
+    PURGE_LABEL,
+    DeleteInstanceExecutor,
+)
+from ..models.move_cutover_executor import MoveCleanupSourceExecutor
+from ..models.move_rollback_cleanup_executor import (
+    MoveRollbackCleanupExecutor,
+)
+from ..models.transport import CommandResult, SSHTransport
+
+_TEARDOWN_FIRST_STEP = "Stop and remove containers"
+_TEARDOWN_STEPS = (
+    "Stop and remove containers",
+    "Remove log rotation config",
+    "Remove instance directory",
+)
+
+
+def run_delete_steps(ex, exits):
+    """Run *ex*'s real steps through the executor's own step loop.
+
+    The host is a ``SSHTransport`` mock that answers each command with
+    the exit code *exits* gives its label (0 when absent), so what runs,
+    in what order and what gets cut off is decided by production code,
+    not by results a test made up.
+
+    :param ex: executor built with ``_PurgeBase._executor``.
+    :param dict exits: ``{label: exit_status}`` for the non-zero steps.
+    :return: ``(results, skipped)`` exactly as ``_run_steps`` returns them.
+    """
+    commands = list(ex.get_commands())
+    exit_by_command = {
+        step[1]: exits.get(step[0], 0) for step in commands
+    }
+    transport = MagicMock(spec=SSHTransport)
+    transport.execute.side_effect = (
+        lambda command, *_handlers: CommandResult("", exit_by_command[command])
+    )
+    return asyncio.run(ex._run_steps(transport, commands))
+
+
+class _PurgeBase(TransactionCase):
+
+    def setUp(self):
+        # Executors write alerts on their own cursor; without test mode
+        # that connection cannot see this transaction's records and the
+        # INSERT dies on the instance/host foreign key.
+        self.registry_enter_test_mode()
+        super().setUp()
+        self.project = self.env["cloud.project"].create({"name": "pg-proj"})
+        self.host = self.env["cloud.host"].create({
+            "name": "pg-host", "ip_address": "10.0.8.1", "port": 22,
+            "user": "root", "login_type": "ssh_key",
+            "wildcard_domain": "pg.example.com",
+            "status": "compatible", "traefik_deployed": True,
+        })
+        self.backend = self.env["cloud.backup.backend"].create({
+            "name": "pg-backend",
+            "backend_type": "s3",
+            "s3_bucket": "pg-bucket",
+            "s3_path": "backups",
+            "s3_access_key_id": "AKIAPG",
+            "s3_secret_access_key": "shh",
+        })
+        self.instance = self.env["cloud.instance"].create({
+            "name": "pg-inst", "project_id": self.project.id,
+            "environment": "production", "host_id": self.host.id,
+            "state": "deployed",
+            "backup_backend_id": self.backend.id,
+        })
+
+    def _job(self, code="delete_instance", payload=None, instance=None):
+        job_type = self.env["cloud.job.type"].search(
+            [("code", "=", code)], limit=1,
+        )
+        job = self.env["cloud.job"].create({
+            "host_id": self.host.id,
+            "instance_id": (instance or self.instance).id,
+            "job_type_id": job_type.id,
+            "name": f"{code} purge test",
+        })
+        job.payload = payload or {}
+        return job
+
+    def _executor(self, job, cls=DeleteInstanceExecutor):
+        ex = object.__new__(cls)
+        ex.job = job
+        ex.env = job.env
+        ex._log_buffer = []
+        ex._scripts_requested = False
+        ex._scripts_uploaded = False
+        ex._script_overlay_cache = None
+        return ex
+
+    def _labels(self, ex):
+        return [step[0] for step in ex.get_commands()]
+
+
+class TestPurgeStepPlacement(_PurgeBase):
+
+    def test_the_purge_runs_before_the_teardown(self):
+        """After the teardown there is no container left to reach the
+        bucket, so this order is the whole design."""
+        labels = self._labels(self._executor(self._job()))
+        self.assertIn(PURGE_LABEL, labels)
+        self.assertLess(
+            labels.index(PURGE_LABEL), labels.index(_TEARDOWN_FIRST_STEP),
+        )
+
+    def test_the_directory_removed_is_one_quoted_argument(self):
+        """The instance directory reaches ``rm -rf`` as a single argument,
+        whatever it holds, and a path under the home still resolves to
+        the account's home."""
+        for path, expected in (
+            ("~/pg-proj/pg-inst", "$HOME/pg-proj/pg-inst"),
+            ("~/pg-proj\nx/pg-inst", "$HOME/pg-proj\nx/pg-inst"),
+            ("/srv/pg inst", "/srv/pg inst"),
+        ):
+            with self.subTest(path=path), patch.object(
+                DeleteInstanceExecutor, "_inst_dir",
+                autospec=True, return_value=path,
+            ):
+                steps = self._executor(self._job()).get_commands()
+                command = next(
+                    s[1] for s in steps if s[0] == "Remove instance directory"
+                )
+                self.assertEqual(shlex.split(command), ["rm", "-rf", expected])
+
+    def test_a_failed_purge_aborts_the_teardown(self):
+        """Without this the objects are stranded: the teardown destroys
+        the only thing that could still delete them."""
+        steps = self._executor(self._job()).get_commands()
+        purge = next(s for s in steps if s[0] == PURGE_LABEL)
+        self.assertEqual(len(purge), 3, "purge step carries no options")
+        self.assertTrue(purge[2].get("stop_on_failure"))
+
+    def test_an_empty_prefix_does_not_stop_the_run(self):
+        """"Already empty" is the purge saying there was nothing to do.
+        Forgiving it only after the run had stopped left the instance on
+        the host while the panel reported it removed."""
+        steps = self._executor(self._job()).get_commands()
+        purge = next(s for s in steps if s[0] == PURGE_LABEL)
+        self.assertEqual(
+            purge[2].get("continue_on"), (PURGE_EXIT_ALREADY_EMPTY,),
+        )
+
+    def test_keeping_the_record_does_not_purge(self):
+        """Keeping the record is not a deletion — those backups still
+        have an instance they belong to."""
+        job = self._job(payload={"keep_in_panel": True})
+        self.assertNotIn(PURGE_LABEL, self._labels(self._executor(job)))
+
+    def test_an_instance_without_backups_has_no_purge_step(self):
+        """No destination anywhere in the chain — the honest "nothing to
+        purge" case.
+
+        Clearing the instance's own field is not enough: the effective
+        backend falls back to the project's and then to the global
+        default, and a deployment that has one would still resolve a
+        destination. All three have to be gone.
+        """
+        self.instance.backup_backend_id = False
+        self.project.backup_backend_id = False
+        self.env["ir.config_parameter"].sudo().set_param(
+            "incubacloud.backup_backend_id", "0",
+        )
+        self.instance.invalidate_recordset()
+        self.assertNotIn("backup", self.instance.expected_services())
+        self.assertNotIn(
+            PURGE_LABEL, self._labels(self._executor(self._job())),
+        )
+
+    def test_a_staging_instance_is_never_purged(self):
+        """Only production renders the backup container.
+
+        ``_backup_enabled()`` is true for staging as soon as a global
+        default destination exists, so gating on that flag alone would
+        send the purge after a container that was never deployed — the
+        script would answer "service missing" and no staging instance
+        could ever be deleted.
+        """
+        self.instance.environment = "staging"
+        self.assertTrue(
+            self.instance._backup_enabled(),
+            "fixture is wrong: the flag must be true for this to prove "
+            "anything",
+        )
+        self.assertNotIn("backup", self.instance.expected_services())
+        self.assertNotIn(
+            PURGE_LABEL, self._labels(self._executor(self._job())),
+        )
+
+    def test_the_gate_is_the_panel_not_the_host_s_answer(self):
+        """``docker compose exec`` says `service "backup" is not running`
+        both when it is stopped and when it does not exist, so the host
+        can never tell "nothing to purge" from "could not reach it".
+        The decision has to come from the panel."""
+        with patch.object(
+            type(self.instance), "expected_services",
+            return_value=("odoo", "db"),
+        ):
+            self.assertNotIn(
+                PURGE_LABEL, self._labels(self._executor(self._job())),
+            )
+
+
+class TestPurgeNeverTouchesALiveInstance(_PurgeBase):
+    """The move cleanups reuse these teardown commands.
+
+    Both run against a host the instance has left — the abandoned source
+    copy after a move, or the half-built target of a rolled-back one —
+    while the instance is alive somewhere else and those backups are
+    still its own. Purging there would destroy the backups of a running
+    instance, which is the worst thing this feature could do.
+    """
+
+    def test_move_cleanup_source_does_not_purge(self):
+        job = self._job(code="move_cleanup_source")
+        ex = self._executor(job, cls=MoveCleanupSourceExecutor)
+        self.assertFalse(ex._owns_instance_lifecycle)
+        self.assertNotIn(PURGE_LABEL, self._labels(ex))
+
+    def test_move_rollback_cleanup_does_not_purge(self):
+        job = self._job(code="move_rollback_cleanup")
+        ex = self._executor(job, cls=MoveRollbackCleanupExecutor)
+        self.assertFalse(ex._owns_instance_lifecycle)
+        self.assertNotIn(PURGE_LABEL, self._labels(ex))
+
+    def test_the_gate_is_the_lifecycle_flag(self):
+        """Pinned explicitly: a future teardown-reusing executor that
+        forgets to set the flag would inherit the purge."""
+        ex = self._executor(self._job())
+        self.assertTrue(ex._owns_instance_lifecycle)
+        self.assertIn(PURGE_LABEL, self._labels(ex))
+
+
+class TestPurgeOutcomes(_PurgeBase):
+
+    def _results(self, purge_exit, teardown_exit=0):
+        return {
+            PURGE_LABEL: {"stdout": "", "exit_status": purge_exit},
+            _TEARDOWN_FIRST_STEP: {
+                "stdout": "", "exit_status": teardown_exit,
+            },
+        }
+
+    def test_an_already_empty_prefix_is_not_a_failure(self):
+        """The invariant already holds. Refusing to continue would make
+        an instance whose bucket someone emptied by hand impossible to
+        delete."""
+        ex = self._executor(self._job())
+        self.assertFalse(
+            ex.parse_results(self._results(PURGE_EXIT_ALREADY_EMPTY)),
+        )
+
+    def test_every_other_non_zero_exit_fails_the_job(self):
+        ex = self._executor(self._job())
+        for code in PURGE_ALERT_BY_EXIT:
+            with self.subTest(exit=code):
+                self.assertTrue(ex.parse_results(self._results(code)))
+
+    def test_a_failing_teardown_still_fails(self):
+        """The tolerance is scoped to the purge label alone."""
+        ex = self._executor(self._job())
+        self.assertTrue(
+            ex.parse_results(
+                self._results(PURGE_EXIT_ALREADY_EMPTY, teardown_exit=1),
+            ),
+        )
+
+
+class TestPurgeThroughTheRealLoop(_PurgeBase):
+    """The same outcomes, with the steps run by the executor's own loop.
+
+    ``TestPurgeOutcomes`` hands ``parse_results`` a purge at 10 *and* a
+    teardown that ran — a run the loop never produced, because the purge
+    stopped it first. Production, 2026-09-29: nine deletes ended "done"
+    with "removed from host" and left every stack running.
+    """
+
+    def test_an_empty_prefix_still_tears_the_instance_down(self):
+        ex = self._executor(self._job())
+        results, skipped = run_delete_steps(
+            ex, {PURGE_LABEL: PURGE_EXIT_ALREADY_EMPTY},
+        )
+        self.assertEqual(skipped, [])
+        for label in _TEARDOWN_STEPS:
+            self.assertIn(label, results, f"'{label}' never ran")
+        self.assertEqual(ex._outcome_errors(results, skipped), [])
+
+    def test_a_failed_purge_still_spares_the_teardown(self):
+        """The protection the purge exists for is untouched: a real
+        failure keeps the container that can still reach the bucket."""
+        ex = self._executor(self._job())
+        results, skipped = run_delete_steps(ex, {PURGE_LABEL: 22})
+        for label in _TEARDOWN_STEPS:
+            self.assertNotIn(label, results)
+            self.assertIn(label, skipped)
+        self.assertTrue(ex._outcome_errors(results, skipped))
+
+
+class TestPurgeAlerts(_PurgeBase):
+
+    def _active(self, code):
+        return self.env["cloud.alert"].sudo().search([
+            ("code", "=", code),
+            ("instance_id", "=", self.instance.id),
+            ("state", "=", "active"),
+        ])
+
+    def test_each_exit_code_raises_its_own_alert(self):
+        """One shared "delete failed" would send the operator to the job
+        log every time; each of these has a different fix."""
+        for code, (alert_code, _msg) in PURGE_ALERT_BY_EXIT.items():
+            with self.subTest(exit=code):
+                ex = self._executor(self._job())
+                ex._alert_on_purge_failure(
+                    {PURGE_LABEL: {"stdout": "", "exit_status": code}},
+                    self.instance,
+                )
+                alert = self._active(alert_code)
+                self.assertTrue(alert, f"exit {code} raised no alert")
+                self.assertIn(self.instance.name, alert.message)
+
+    def test_a_teardown_failure_raises_no_purge_alert(self):
+        """The purge is not what failed, so it must not be blamed."""
+        ex = self._executor(self._job())
+        ex._alert_on_purge_failure(
+            {_TEARDOWN_FIRST_STEP: {"stdout": "", "exit_status": 1}},
+            self.instance,
+        )
+        for alert_code, _msg in PURGE_ALERT_BY_EXIT.values():
+            self.assertFalse(self._active(alert_code))
+
+    def test_an_unreadable_compose_is_not_reported_as_drift(self):
+        """Production, 2026-09-19: the read died and the operator was
+        told the compose "does not declare" a backup service and to
+        rebuild the instance. A failed read says nothing about what the
+        compose declares, so it gets its own alert and its own advice —
+        and never the drift one."""
+        ex = self._executor(self._job())
+        ex._alert_on_purge_failure(
+            {PURGE_LABEL: {"stdout": "", "exit_status": 23}},
+            self.instance,
+        )
+        alert = self._active("backup_purge_compose_unreadable")
+        self.assertTrue(alert)
+        self.assertIn("delete again", alert.message)
+        self.assertNotIn("Rebuild", alert.message)
+        self.assertFalse(self._active("backup_purge_service_missing"))
+
+    def test_the_alert_names_the_instance_and_carries_the_job(self):
+        job = self._job()
+        ex = self._executor(job)
+        ex._alert_on_purge_failure(
+            {PURGE_LABEL: {"stdout": "", "exit_status": 21}},
+            self.instance,
+        )
+        alert = self._active("backup_purge_unauthorized")
+        self.assertEqual(alert.job_id, job)
+        self.assertEqual(alert.host_id, self.host)
+
+    def _closes_on_success(self, label, table, payload):
+        """Raise *label*'s first alert, then run a clean delete; assert it closed."""
+        exit_code, (alert_code, _msg) = next(iter(table.items()))
+        self._executor(self._job(payload=payload))._alert_on_purge_failure(
+            {label: {"stdout": "", "exit_status": exit_code}}, self.instance,
+        )
+        self.assertTrue(self._active(alert_code), "fixture raised nothing")
+        ex = self._executor(self._job(payload=payload))
+        with patch.object(
+            type(self.host), "refresh_observability_labels", autospec=True,
+        ):
+            asyncio.run(ex.on_success({}))
+        self.assertFalse(self._active(alert_code))
+
+    def test_a_clean_delete_closes_the_purge_alert(self):
+        """Raised with the host, so closed with it: an alert's identity
+        includes the host, and a close without it never found one."""
+        self._closes_on_success(PURGE_LABEL, PURGE_ALERT_BY_EXIT, {})
+
+    def test_a_clean_archive_closes_the_archive_alert(self):
+        """Production, 11-oct-2026: a deleted instance's archive alert
+        stayed lit after the retry archived it."""
+        self._closes_on_success(
+            ARCHIVE_LABEL, ARCHIVE_ALERT_BY_EXIT, {"keep_in_panel": True},
+        )
+
+
+class TestArchiveStep(_PurgeBase):
+    """Keeping the record takes a copy instead of destroying them.
+
+    The two paths are mirror images and share every gate: one leaves
+    exactly one chain behind, the other leaves none, and neither ever
+    leaves a chain without an instance that owns it.
+    """
+
+    def _archive_job(self):
+        return self._job(payload={"keep_in_panel": True})
+
+    def test_keeping_the_record_takes_the_archive_copy(self):
+        labels = self._labels(self._executor(self._archive_job()))
+        self.assertIn(ARCHIVE_LABEL, labels)
+        self.assertNotIn(PURGE_LABEL, labels)
+
+    def test_deleting_purges_and_does_not_archive(self):
+        labels = self._labels(self._executor(self._job()))
+        self.assertIn(PURGE_LABEL, labels)
+        self.assertNotIn(ARCHIVE_LABEL, labels)
+
+    def test_the_archive_runs_before_the_teardown(self):
+        """``compose down -v`` destroys the container that holds
+        duplicity, the credentials and the passphrase."""
+        labels = self._labels(self._executor(self._archive_job()))
+        self.assertLess(
+            labels.index(ARCHIVE_LABEL), labels.index(_TEARDOWN_FIRST_STEP),
+        )
+
+    def test_a_failed_archive_aborts_the_teardown(self):
+        """An archive that silently kept nothing is worse than one that
+        refused: the record would advertise a copy that is not there."""
+        steps = self._executor(self._archive_job()).get_commands()
+        archive = next(s for s in steps if s[0] == ARCHIVE_LABEL)
+        self.assertEqual(len(archive), 3)
+        self.assertTrue(archive[2].get("stop_on_failure"))
+
+    def test_a_staging_instance_is_never_archived(self):
+        self.instance.environment = "staging"
+        self.assertNotIn(
+            ARCHIVE_LABEL, self._labels(self._executor(self._archive_job())),
+        )
+
+    def test_the_move_cleanups_never_archive(self):
+        """Same gate as the purge: their instance is alive elsewhere."""
+        job = self._job(code="move_cleanup_source",
+                        payload={"keep_in_panel": True})
+        ex = self._executor(job, cls=MoveCleanupSourceExecutor)
+        self.assertNotIn(ARCHIVE_LABEL, self._labels(ex))
+
+    def test_each_archive_exit_code_raises_its_own_alert(self):
+        for code, (alert_code, _msg) in ARCHIVE_ALERT_BY_EXIT.items():
+            with self.subTest(exit=code):
+                ex = self._executor(self._archive_job())
+                ex._alert_on_purge_failure(
+                    {ARCHIVE_LABEL: {"stdout": "", "exit_status": code}},
+                    self.instance,
+                )
+                alert = self.env["cloud.alert"].sudo().search([
+                    ("code", "=", alert_code),
+                    ("instance_id", "=", self.instance.id),
+                    ("state", "=", "active"),
+                ])
+                self.assertTrue(alert, f"exit {code} raised no alert")
+
+
+class TestFrozenBackupPath(_PurgeBase):
+    """Archiving pins where the copy lives.
+
+    The computed path derives from the project's remote folder and the
+    instance name; once archived, that derivation can quietly become
+    false — deleting a customer account may detach its project and the computed path
+    falls back to a shared ``.../default/`` prefix. Everything that
+    touches the copy afterwards must read the frozen value.
+    """
+
+    def test_archiving_freezes_the_computed_path(self):
+        computed = self.instance.instance_backup_dst
+        self.assertTrue(computed)
+        self.instance._finalize_removal(keep_in_panel=True)
+        self.assertEqual(self.instance.custom_backup_dst, computed)
+
+    def test_the_frozen_path_survives_losing_the_project(self):
+        """The exact drift this defends against."""
+        self.instance._finalize_removal(keep_in_panel=True)
+        frozen = self.instance.custom_backup_dst
+        self.instance.project_id = False
+        self.instance.invalidate_recordset()
+        self.assertEqual(self.instance.instance_backup_dst, frozen)
+        self.assertNotIn("/default/", self.instance.instance_backup_dst)
+
+    def test_an_existing_override_is_never_overwritten(self):
+        """An imported instance carries its real location there."""
+        self.instance.custom_backup_dst = "boto3+s3://imported/elsewhere"
+        self.instance._finalize_removal(keep_in_panel=True)
+        self.assertEqual(
+            self.instance.custom_backup_dst, "boto3+s3://imported/elsewhere",
+        )
+
+    def test_archiving_pins_the_destination_it_inherited(self):
+        """The copy is read and deleted with that destination's
+        credentials: a later change of the project's would point it at a
+        bucket that does not hold it."""
+        self.instance.backup_backend_id = False
+        self.project.backup_backend_id = self.backend
+        self.instance.invalidate_recordset()
+        self.instance._finalize_removal(keep_in_panel=True)
+        self.assertEqual(self.instance.backup_backend_id, self.backend)
+        other = self.env["cloud.backup.backend"].create({
+            "name": "pg-backend-2", "backend_type": "s3",
+            "s3_bucket": "pg-bucket-2", "s3_access_key_id": "AKIAPG2",
+            "s3_secret_access_key": "shh2",
+        })
+        self.project.backup_backend_id = other
+        self.instance.invalidate_recordset()
+        self.assertEqual(self.instance.effective_backup_backend, self.backend)
+
+    def test_an_instance_s_own_destination_is_kept(self):
+        self.instance._finalize_removal(keep_in_panel=True)
+        self.assertEqual(self.instance.backup_backend_id, self.backend)
+
+    def test_deleting_does_not_freeze_anything(self):
+        """There is nothing left to point at."""
+        self.instance._finalize_removal(keep_in_panel=False)
+        self.assertFalse(self.instance.exists())

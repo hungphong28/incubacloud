@@ -1,0 +1,95 @@
+version: "3.8"
+
+services:
+  proxy:
+    image: traefik:v2.11
+    networks:
+      shared:
+        # A fixed, locally administered address: the host's guard on this
+        # network (shared_guard.sh) lets only this address open
+        # connections to the instances. Without it Docker draws a new one
+        # at every restart and recreate of the proxy.
+        mac_address: "02:69:63:00:00:01"
+      private:
+      public:
+    ports:
+      - "80:80"
+      - "443:443"
+      # Prometheus metrics, on the host's loopback only. vmagent scrapes
+      # the proxy over its ``public`` network instead (traefik.yml).
+      - "127.0.0.1:8082:8082"
+    depends_on:
+      - dockersocket
+    restart: unless-stopped
+    tty: true
+    volumes:
+      # The access log, in its own file the host rotates (30 days).
+      - /var/log/traefik:/var/log/traefik
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./config.yml:/etc/traefik/config.yml:ro
+      # Every dynamic document, config.yml's copy included: this is
+      # what traefik.yml's file provider reads.
+      - ./dynamic:/etc/traefik/dynamic:ro
+      - ./certs:/etc/certs:rw,Z
+      - acme:/etc/traefik/acme:rw,Z
+    #
+    # Note: when used in docker-compose.yml all dollar signs in the hash need to be doubled for escaping.
+    # To create user:password pair, it's possible to use this command:
+    # echo $(htpasswd -nB traefik-admin) | sed -e s/\\$/\\$\\$/g
+    #
+    # Also note that dollar signs should NOT be doubled when they not evaluated (e.g. Ansible docker_container module).
+    labels:
+      # Never swept by the nightly prune (host_maintenance.yml), even
+      # stopped: a stopped proxy is one to start again, and without it
+      # no instance on the host answers.
+      - "incubacloud.protect=1"
+      - "traefik.enable=true"
+      - "traefik.docker.network=shared"
+      - "traefik.http.routers.api.rule=Host(`traefik.mycustomdomain.com`)"
+      # Deny-by-default placeholder. `full_setup_executor._build_inverseproxy`
+      # rewrites this line at provision time using bcrypt cost=12 against
+      # the host's `traefik_panel_password`. If the substitution is ever
+      # skipped (empty `panel_password`), this malformed bcrypt string
+      # matches no password → 401 guaranteed instead of leaving a
+      # crackable real hash committed in the repo.
+      - "traefik.http.middlewares.auth.basicauth.users=traefik-admin:$$2y$$12$$panel-disabled-set-traefik-panel-password-on-host"
+      - "traefik.http.routers.api.tls.certResolver=letsencrypt"
+      - "traefik.http.routers.api.entrypoints=https"
+      - "traefik.http.routers.api.service=api@internal"
+      - "traefik.http.routers.api.middlewares=auth"
+
+  dockersocket:
+    image: tecnativa/docker-socket-proxy
+    networks:
+      private:
+    volumes:
+      # Read-only by default: the endpoints below only serve Traefik's
+      # discovery. Hosts that run Sablier get POST added by full_setup
+      # so it can stop and start idle instances — the primary host,
+      # which has no Sablier, keeps this surface read-only.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: 1
+      NETWORKS: 1
+      SERVICES: 1
+      # Standalone Docker (provider: docker, not swarm) — keep Swarm
+      # endpoints disabled to shrink the daemon API surface.
+      SWARM: 0
+      TASKS: 0
+    restart: unless-stopped
+
+networks:
+  shared:
+    internal: true
+    driver_opts:
+      encrypted: 1
+
+  private:
+    internal: true
+    driver_opts:
+      encrypted: 1
+
+  public:
+
+volumes:
+  acme:

@@ -1,0 +1,20 @@
+<templates>
+    <t t-name="incubacloud.ToastContainer">
+        <!-- Each toast is its own live region: an error interrupts as an
+             alert, everything else is announced politely as a status. -->
+        <div class="ic-toast-container">
+            <t t-foreach="toasts" t-as="t" t-key="t.id">
+                <div t-att-class="'ic-toast ic-toast--' + t.type + (t.dismissing ? ' ic-toast--out' : '')"
+                     t-att-role="t.type === 'error' ? 'alert' : 'status'">
+                    <i t-att-class="'fa ' + t.icon" aria-hidden="true"/>
+                    <span class="ic-toast-msg" t-esc="t.message"/>
+                    <button t-if="t.action" type="button" class="ic-toast-action"
+                            t-on-click="() => this.runAction(t)"
+                            t-esc="t.action.label"/>
+                    <button type="button" class="ic-toast-close" t-on-click="() => this.dismiss(t.id)"
+                            aria-label="Dismiss notification">&#x2715;</button>
+                </div>
+            </t>
+        </div>
+    </t>
+</templates>

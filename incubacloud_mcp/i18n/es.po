@@ -1,0 +1,3506 @@
+# Translation of Odoo Server.
+# This file contains the translation of the following modules:
+# 	* incubacloud_mcp
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: Odoo Server 19.0\n"
+"Report-Msgid-Bugs-To: \n"
+"Last-Translator: \n"
+"Language-Team: \n"
+"Language: es\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: \n"
+"Plural-Forms: nplurals=2; plural=n != 1;\n"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid " and %s more"
+msgstr " y %s más"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "#%(id)s %(type)s (%(target)s)"
+msgstr "n.º %(id)s %(type)s (%(target)s)"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "%(action)s on the instance %(name)s (project %(project)s). %(warning)s"
+msgstr ""
+"%(action)s en la instancia %(name)s (proyecto %(project)s). %(warning)s"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_operate.py:0
+msgid "%(repo)s, branch %(branch)s"
+msgstr "%(repo)s, rama %(branch)s"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_operate.py:0
+msgid "%(repo)s, branch %(branch)s, commit %(sha)s"
+msgstr "%(repo)s, rama %(branch)s, commit %(sha)s"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"%s is not a GitHub repository address (https://github.com/<owner>/<name>)."
+msgstr ""
+"%s no es una dirección de repositorio de GitHub "
+"(https://github.com/<propietario>/<nombre>)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"%s is not a repository of a project or an instance you can see in the panel."
+" Connect it to a project first (project_connect_repo)."
+msgstr ""
+"%s no es un repositorio de un proyecto ni de una instancia que usted vea en "
+"el panel. Conéctelo primero a un proyecto (project_connect_repo)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"%s is not a repository of a project you can see in the panel: the assistant "
+"writes only there. Connect it to the project first (project_connect_repo)."
+msgstr ""
+"%s no es un repositorio de un proyecto que usted vea en el panel: el "
+"asistente solo escribe ahí. Conéctelo primero al proyecto "
+"(project_connect_repo)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "%s is not a valid branch name."
+msgstr "%s no es un nombre de rama válido."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "%s is not the name of a GitHub account or organization."
+msgstr "%s no es el nombre de una cuenta u organización de GitHub."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "(Security, API Keys) and put it where the commands say"
+msgstr "(Seguridad, Claves API) y póngala donde los comandos dicen"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+", or in the environment variable\n"
+"                        they name. Treat it like a password."
+msgstr ""
+", o en la variable de entorno que indican. Trátela como una contraseña."
+
+#. module: incubacloud_mcp
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid ", with the tool"
+msgstr ", con la herramienta"
+
+#. module: incubacloud_mcp
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid ""
+". The request expires ten minutes after it\n"
+"                was made. Approve only what you asked your agent to do."
+msgstr ""
+". La petición caduca diez minutos después de hacerse. Apruebe solo lo que "
+"haya pedido a su agente."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ": set it before you start Codex."
+msgstr ": defínala antes de abrir Codex."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ": set it before you start Cursor."
+msgstr ": defínala antes de abrir Cursor."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+";\n"
+"                                then choose Continue and Add."
+msgstr "; después, elija Continuar y Añadir."
+
+#. module: incubacloud_mcp
+#: model:ir.model.constraint,message:incubacloud_mcp.constraint_incubacloud_mcp_agent_branch_user_repository_branch
+msgid "A branch is remembered once per user."
+msgstr "Una rama se recuerda una sola vez por usuario."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"A repository with that name already exists there: connect it with "
+"project_connect_repo, or pick another name."
+msgstr ""
+"Ya existe ahí un repositorio con ese nombre: conéctelo con "
+"project_connect_repo, o elija otro nombre."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"A repository's name holds letters, digits, dots, hyphens and underscores "
+"only."
+msgstr ""
+"El nombre de un repositorio solo admite letras, dígitos, puntos, guiones y "
+"guiones bajos."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+"AI agents such as Claude Code, Claude, Cursor, VS Code or Codex can work\n"
+"                    on this panel for you, with your role and your projects' access.\n"
+"                    Destructive actions wait for your approval, and secrets never reach them."
+msgstr ""
+"Los agentes de IA como Claude Code, Claude, Cursor, VS Code o Codex pueden "
+"trabajar en este panel por usted, con su rol y el acceso de sus proyectos. "
+"Las acciones destructivas esperan a su aprobación, y los secretos nunca les "
+"llegan."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"Add %(url)s (branch %(branch)s) to the repositories of project %(project)s. "
+"Instances created from the project afterwards clone it; existing instances "
+"keep theirs."
+msgstr ""
+"Añadir %(url)s (rama %(branch)s) a los repositorios del proyecto "
+"%(project)s. Las instancias que se creen después desde el proyecto lo "
+"clonan; las existentes conservan los suyos."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Add a remote MCP server of type HTTP with this panel's MCP address."
+msgstr ""
+"Añada un servidor MCP remoto de tipo HTTP con la dirección MCP de este "
+"panel."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Add this to ~/.codex/config.toml:"
+msgstr "Añada esto a ~/.codex/config.toml:"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Add this to ~/.cursor/mcp.json:"
+msgstr "Añada esto a ~/.cursor/mcp.json:"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Add to Cursor"
+msgstr "Añadir a Cursor"
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_incubacloud_mcp_approval
+msgid "Agent action awaiting a person's approval"
+msgstr "Acción de un agente pendiente de aprobación"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_rates_section.xml:0
+msgid "Agent calls (per user, all their agents)"
+msgstr "Llamadas de agentes (por usuario, todos sus agentes)"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_settings__rate_limit_mcp_user_per_min
+msgid "Agent calls per user and minute"
+msgstr "Llamadas de agentes por usuario y minuto"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_rates_section.xml:0
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_settings_tab.xml:0
+msgid "Agents (MCP)"
+msgstr "Agentes (MCP)"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auth.py:0
+msgid "Agents act for the panel's internal users only."
+msgstr "Los agentes solo actúan en nombre de usuarios internos del panel."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+"Agents cannot connect to this panel yet: its sign-in for agents is\n"
+"                        not configured. Contact support."
+msgstr ""
+"Los agentes aún no pueden conectarse a este panel: su inicio de sesión para "
+"agentes no está configurado. Contacte con soporte."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_settings_tab.xml:0
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_settings__mcp_oauth_issuer
+msgid "Agents' OAuth issuer"
+msgstr "Emisor OAuth de los agentes"
+
+#. module: incubacloud_mcp
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid "An agent connected to this panel with your account asks to:"
+msgstr "Un agente conectado a este panel con su cuenta pide:"
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_incubacloud_mcp_confirm
+msgid "Approval of agents' sensitive actions"
+msgstr "Aprobación de las acciones sensibles de los agentes"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_confirm.py:0
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid "Approve"
+msgstr "Aprobar"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/controllers/approve.py:0
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid "Approve an agent's action"
+msgstr "Aprobar la acción de un agente"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_approval__state__approved
+msgid "Approved"
+msgstr "Aprobada"
+
+#. module: incubacloud_mcp
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid "Approved. Go back to your agent and ask it to try again: it runs once."
+msgstr ""
+"Aprobada. Vuelva a su agente y pídale que lo intente de nuevo: se ejecutará "
+"una sola vez."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__args_hash
+msgid "Args Hash"
+msgstr "Huella de los argumentos"
+
+#. module: incubacloud_mcp
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid "Asked through"
+msgstr "Solicitada a través de"
+
+#. module: incubacloud_mcp
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid "Asked with the tool"
+msgstr "Solicitada con la herramienta"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__attachment_id
+msgid "Attachment"
+msgstr "Archivo adjunto"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auth.py:0
+msgid "Authentication required."
+msgstr "Se requiere autenticación."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_cloud_settings__mcp_oauth_issuer
+msgid ""
+"Authorization server whose tokens agents may use here (its issuer URL). "
+"Empty: agents connect with API keys only."
+msgstr ""
+"Servidor de autorización cuyos tokens pueden usar aquí los agentes (la URL "
+"de su emisor). Vacío: los agentes se conectan solo con claves API."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid "Backend not found"
+msgstr "Backend no encontrado"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid "Backup restore only supported for production."
+msgstr "La restauración de backup solo es compatible con producción."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_agent_branch__branch
+msgid "Branch"
+msgstr "Rama"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"Branch %s already exists: pick another name, or write to it (the user "
+"approves it first)."
+msgstr ""
+"La rama %s ya existe: elija otro nombre, o escriba en ella (el usuario la "
+"aprueba antes)."
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_incubacloud_mcp_agent_branch
+msgid "Branch an agent created for a user"
+msgstr "Rama que un agente creó para un usuario"
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_incubacloud_mcp_dispatch
+msgid "Calls panel routes for MCP tools"
+msgstr "Llama a las rutas del panel para las herramientas MCP"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid "Cancel"
+msgstr "Cancelar"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "Cancel the job %(job)s."
+msgstr "Cancelar la tarea %(job)s."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_approval__state__cancelled
+msgid "Cancelled"
+msgstr "Cancelada"
+
+#. module: incubacloud_mcp
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid "Cancelled. The agent will not do it."
+msgstr "Cancelada. El agente no lo hará."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_operate.py:0
+msgid ""
+"Change the code production %(name)s deploys from. It reaches production at its next rebuild, or at once when it rebuilds on every push. New in it:\n"
+"%(lines)s"
+msgstr ""
+"Cambiar el código desde el que se despliega la producción %(name)s. Llega a producción en su próxima reconstrucción, o de inmediato si se reconstruye con cada push. Lo nuevo:\n"
+"%(lines)s"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_settings.py:0
+msgid ""
+"Change these security settings of the panel:\n"
+"%(changes)s"
+msgstr ""
+"Cambiar estos ajustes de seguridad del panel:\n"
+"%(changes)s"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_manager.py:0
+msgid ""
+"Change which proxies the server trusts for client addresses:\n"
+"- trusted_proxy_ranges: %(old)r → %(new)r"
+msgstr ""
+"Cambiar en qué proxies confía el servidor para las direcciones de los clientes:\n"
+"- trusted_proxy_ranges: %(old)r → %(new)r"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__channel
+msgid "Channel"
+msgstr "Canal"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Claude Code"
+msgstr "Claude Code"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Claude and Claude Desktop"
+msgstr "Claude y Claude Desktop"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+"Claude connects from Anthropic's servers, not from your computer: this\n"
+"                            panel must be reachable from the internet."
+msgstr ""
+"Claude se conecta desde los servidores de Anthropic, no desde su ordenador: "
+"este panel tiene que ser accesible desde internet."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Clients"
+msgstr "Clientes"
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_cloud_audit_log
+msgid "Cloud Audit Log"
+msgstr "Log de auditoría de Cloud"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Codex"
+msgstr "Codex"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Codex and others"
+msgstr "Codex y otros"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Codex reads the key from the environment variable"
+msgstr "Codex lee la clave de la variable de entorno"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+#: code:addons/incubacloud_mcp/static/src/mcp_templates.xml:0
+msgid "Connect an agent"
+msgstr "Conectar un agente"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Connected agents"
+msgstr "Agentes conectados"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Copied"
+msgstr "Copiado"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Copy"
+msgstr "Copiar"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Copy Codex's configuration"
+msgstr "Copiar la configuración de Codex"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Copy Codex's sign-in command"
+msgstr "Copiar el comando de inicio de sesión de Codex"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Copy Cursor's configuration"
+msgstr "Copiar la configuración de Cursor"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Copy the Claude Code command"
+msgstr "Copiar el comando de Claude Code"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Copy the VS Code command"
+msgstr "Copiar el comando de VS Code"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Copy this panel's MCP address"
+msgstr "Copiar la dirección MCP de este panel"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_command.py:0
+msgid "Could not connect to the server in time."
+msgstr "No se ha podido conectar con el servidor a tiempo."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.js:0
+msgid "Could not copy. Select the text and copy it by hand."
+msgstr "No se ha podido copiar. Seleccione el texto y cópielo a mano."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.js:0
+msgid "Could not load how to connect an agent."
+msgstr "No se ha podido cargar cómo conectar un agente."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"Create branch %(branch)s in %(repo)s, a public repository: anyone can see it"
+" and what is written to it."
+msgstr ""
+"Crear la rama %(branch)s en %(repo)s, un repositorio público: cualquiera "
+"puede verla y ver lo que se escribe en ella."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"Create the %(visibility)s repository %(name)s on GitHub, in %(owner)s, with "
+"the panel's personal access token, and add it to the repositories of project"
+" %(project)s (branch main)."
+msgstr ""
+"Crear el repositorio %(visibility)s %(name)s en GitHub, en %(owner)s, con el"
+" token de acceso personal del panel, y añadirlo a los repositorios del "
+"proyecto %(project)s (rama main)."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_agent_branch__create_uid
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__create_uid
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__create_uid
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_credential__create_uid
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__create_uid
+msgid "Created by"
+msgstr "Creado por"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_agent_branch__create_date
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__create_date
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__create_date
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_credential__create_date
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__create_date
+msgid "Created on"
+msgstr "Creado el"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__credential
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__credential
+msgid "Credential"
+msgstr "Credencial"
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_incubacloud_mcp_auth
+msgid "Credentials of agents on the MCP endpoint"
+msgstr "Credenciales de los agentes en el endpoint MCP"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Cursor"
+msgstr "Cursor"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Cursor and VS Code"
+msgstr "Cursor y VS Code"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Cursor reads the key from the environment variable"
+msgstr "Cursor lee la clave de la variable de entorno"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Delete the archived instance %(name)s and the backup copy it still keeps. "
+"This cannot be undone."
+msgstr ""
+"Borrar la instancia archivada %(name)s y la copia de seguridad que aún "
+"conserva. No se puede deshacer."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid ""
+"Delete the audit log entries older than %(days)s days. This cannot be "
+"undone."
+msgstr ""
+"Borrar las entradas del log de auditoría con más de %(days)s días. No se "
+"puede deshacer."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid "Delete the backup destination %(name)s. This cannot be undone."
+msgstr "Borrar el destino de backups %(name)s. No se puede deshacer."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Delete the instance %(name)s (project %(project)s). This cannot be undone."
+msgstr ""
+"Borrar la instancia %(name)s (proyecto %(project)s). No se puede deshacer."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Delete the panel's GitHub App credentials: every repository has to be "
+"connected again."
+msgstr ""
+"Borrar las credenciales de la aplicación de GitHub del panel: habrá que "
+"volver a conectar todos los repositorios."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Delete the production instance %(name)s (project %(project)s). This cannot "
+"be undone."
+msgstr ""
+"Borrar la instancia de producción %(name)s (proyecto %(project)s). No se "
+"puede deshacer."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid "Delete the project %(name)s. This cannot be undone."
+msgstr "Borrar el proyecto %(name)s. No se puede deshacer."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_auth_oauth_provider__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_audit_log__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_job__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_settings__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_agent_branch__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auth__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_catalog__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_confirm__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_credential__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_dispatch__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_secrets__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_server__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_tools__display_name
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_res_users__display_name
+msgid "Display Name"
+msgstr "Nombre para mostrar"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__expires_at
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__expires_at
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__expires_at
+msgid "Expires At"
+msgstr "Caduca el"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_rates_section.js:0
+msgid "Failed to load the agents' limit."
+msgstr "No se ha podido cargar el límite de los agentes."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_settings_tab.js:0
+msgid "Failed to load the agents' settings."
+msgstr "No se han podido cargar los ajustes de los agentes."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "File %s has no content."
+msgstr "El archivo %s no tiene contenido."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"File %s holds a secret of the panel: it is never written to a repository."
+msgstr ""
+"El archivo %s contiene un secreto del panel: nunca se escribe en un "
+"repositorio."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_approval__channel__mrtr_form
+msgid "Form in the agent's client"
+msgstr "Formulario en el cliente del agente"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid ""
+"Get a single-use link, valid 15 minutes, to download %(file)s of the "
+"instance %(instance)s."
+msgstr ""
+"Obtener un enlace de un solo uso, válido 15 minutos, para descargar %(file)s"
+" de la instancia %(instance)s."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"GitHub did not find this repository or branch with the panel's access. Check"
+" the address and the branch; to write, the panel needs a personal access "
+"token that can write to it, in Settings → GitHub."
+msgstr ""
+"GitHub no encontró este repositorio o esta rama con el acceso del panel. "
+"Compruebe la dirección y la rama; para escribir, el panel necesita un token "
+"de acceso personal que pueda escribir en él, en Configuración → GitHub."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"GitHub did not let the panel read this. Check the address and the branch, "
+"and that the panel's GitHub App or token reaches the repository."
+msgstr ""
+"GitHub no dejó que el panel lo leyera. Compruebe la dirección y la rama, y "
+"que la GitHub App o el token del panel llegue al repositorio."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"GitHub refused the commit (%s). If the branch moved meanwhile, read it again"
+" and write once more."
+msgstr ""
+"GitHub rechazó el commit (%s). Si la rama se movió entretanto, léala de "
+"nuevo y escriba otra vez."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "GitHub refused the pull request (%s)."
+msgstr "GitHub rechazó el pull request (%s)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "GitHub refused to create the branch (%s)."
+msgstr "GitHub rechazó crear la rama (%s)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_operate.py:0
+msgid "Give alert_id, or all=true."
+msgstr "Indique alert_id, o all=true."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_operate.py:0
+msgid "Give at least one repository."
+msgstr "Indique al menos un repositorio."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_read.py:0
+msgid "Give either offset or page."
+msgstr "Indique offset o page, solo uno de los dos."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_read.py:0
+msgid "Give either project_id or host_id."
+msgstr "Indique project_id o host_id, solo uno de los dos."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_read.py:0
+msgid "Give instance_id or job_id."
+msgstr "Indique instance_id o job_id."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid "Give instance_id, or the job_id of a finished download."
+msgstr "Indique instance_id, o el job_id de una descarga terminada."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_settings.py:0
+msgid "Give the backup destination (backend_id)."
+msgstr "Indique el destino de backups (backend_id)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid "Give the backup's time (list_backups lists them)."
+msgstr "Indique la hora del backup (list_backups las muestra)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_operate.py:0
+msgid "Give the new tag's name."
+msgstr "Indique el nombre de la etiqueta nueva."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_manager.py:0
+msgid "Give the server (host_id)."
+msgstr "Indique el servidor (host_id)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_manager.py:0
+msgid "Give the server's fields (vals)."
+msgstr "Indique los campos del servidor (vals)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_logs.py:0
+msgid "Give the term to search for."
+msgstr "Indique el término que quiere buscar."
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_incubacloud_mcp_tools
+msgid "Handlers of the MCP tools"
+msgstr "Manejadores de las herramientas MCP"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_command.py:0
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "Host not found"
+msgstr "Host no encontrado"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "How agents work with the panel"
+msgstr "Cómo trabajan los agentes con el panel"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_auth_oauth_provider__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_audit_log__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_job__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_settings__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_agent_branch__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auth__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_catalog__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_confirm__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_credential__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_dispatch__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_secrets__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_server__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_tools__id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_res_users__id
+msgid "ID"
+msgstr "ID"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+"In Claude, open Customize, then Connectors, and choose + Add, then Add "
+"custom connector."
+msgstr ""
+"En Claude, abra Personalizar, luego Conectores, y elija + Añadir y después "
+"Añadir conector personalizado."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+"In the sign-in settings, choose No sign in and, under Request headers,\n"
+"                                add the header"
+msgstr ""
+"En los ajustes de inicio de sesión, elija Sin iniciar sesión y, en "
+"Encabezados de solicitud, añada el encabezado"
+
+#. module: incubacloud_mcp
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid "IncubaCloud"
+msgstr "IncubaCloud"
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_cloud_settings
+msgid "IncubaCloud Settings"
+msgstr "Ajustes de IncubaCloud"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_command.py:0
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "Instance has no host"
+msgstr "La instancia no tiene host"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_command.py:0
+msgid "Instance is not running"
+msgstr "La instancia no está en ejecución"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid "Instance not found"
+msgstr "Instancia no encontrada"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_auth_oauth_provider__issuer
+msgid "Issuer"
+msgstr "Emisor"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_auth_oauth_provider__issuer
+msgid ""
+"Issuer (``iss``) of the tokens this provider signs. The MCP endpoint finds "
+"the provider of an agent's token by it, then the user by the token's "
+"``sub``; a panel entered through single sign-on may also check its id_token "
+"against it."
+msgstr ""
+"Emisor (``iss``) de los tokens que firma este proveedor. El endpoint MCP "
+"encuentra con él el proveedor del token de un agente, y luego el usuario por"
+" el ``sub`` del token; un panel al que se entra con inicio de sesión único "
+"también puede comprobar con él su id_token."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "It also ends: %(jobs)s."
+msgstr "También termina: %(jobs)s."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "It is a public repository too: anyone can read what is written."
+msgstr ""
+"Es también un repositorio público: cualquiera puede leer lo que se escribe."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "It is running: what it has done so far stays as it is."
+msgstr "Está en curso: lo que ya ha hecho se queda como está."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__job_id
+msgid "Job"
+msgstr "Tarea"
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_cloud_job
+msgid "Job executed remotely on a host"
+msgstr "Trabajo ejecutado remotamente en un host"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+#: code:addons/incubacloud_mcp/models/mcp_tools_read.py:0
+msgid "Job not found"
+msgstr "Tarea no encontrada"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+"Keep the sign-in settings Claude detects, choose Continue, then Add,\n"
+"                                and sign in."
+msgstr ""
+"Deje los ajustes de inicio de sesión que detecta Claude, elija Continuar y "
+"después Añadir, e inicie sesión."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_agent_branch__write_uid
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__write_uid
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__write_uid
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_credential__write_uid
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__write_uid
+msgid "Last Updated by"
+msgstr "Última actualización por"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_agent_branch__write_date
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__write_date
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__write_date
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_credential__write_date
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__write_date
+msgid "Last Updated on"
+msgstr "Última actualización el"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_approval__channel__url_error
+msgid "Link (earlier clients)"
+msgstr "Enlace (clientes anteriores)"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_approval__channel__text
+msgid "Link in the agent's answer"
+msgstr "Enlace en la respuesta del agente"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_approval__channel__mrtr_url
+msgid "Link in the agent's client"
+msgstr "Enlace en el cliente del agente"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_settings_tab.xml:0
+msgid "Loading…"
+msgstr "Cargando…"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_settings_tab.xml:0
+msgid "MCP address"
+msgstr "Dirección MCP"
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_incubacloud_mcp_server
+msgid "MCP methods of the panel"
+msgstr "Métodos MCP del panel"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__message
+msgid "Message"
+msgstr "Mensaje"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Move the instance %(name)s to the server %(host)s. It is unavailable while "
+"it moves."
+msgstr ""
+"Mover la instancia %(name)s al servidor %(host)s. No estará disponible "
+"durante el traslado."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Move the production instance %(name)s to the server %(host)s. It is "
+"unavailable while it moves."
+msgstr ""
+"Mover la instancia de producción %(name)s al servidor %(host)s. No estará "
+"disponible durante el traslado."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid ""
+"Mute every project you see: no job notification reaches you for any of them."
+msgstr ""
+"Silenciar todos los proyectos que usted ve: no le llegará ninguna "
+"notificación de trabajos de ninguno de ellos."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+"Name it, for example IncubaCloud, paste this panel's MCP address and choose "
+"Continue."
+msgstr ""
+"Póngale un nombre, por ejemplo IncubaCloud, pegue la dirección MCP de este "
+"panel y elija Continuar."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_logs.py:0
+msgid "Name the archive to read."
+msgstr "Indique el archivo que quiere leer."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_read.py:0
+msgid "Name the branch."
+msgstr "Indique la rama."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "No such action: %(action)s."
+msgstr "No existe la acción %(action)s."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "Not muted, as you cannot see them: projects %s."
+msgstr "No se han silenciado, porque usted no puede verlos: proyectos %s."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools.py:0
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+#: code:addons/incubacloud_mcp/models/mcp_tools_settings.py:0
+msgid "Nothing changed: every value given was already set."
+msgstr "No ha cambiado nada: cada valor indicado ya estaba así."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "Nothing to change: give the preferences to change."
+msgstr "Nada que cambiar: indique las preferencias que cambian."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools.py:0
+msgid "Nothing to change: vals is empty."
+msgstr "Nada que cambiar: vals está vacío."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_settings.py:0
+msgid "Nothing to change: values is empty."
+msgstr "Nada que cambiar: values está vacío."
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_auth_oauth_provider
+msgid "OAuth2 provider"
+msgstr "Proveedor OAuth2"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Ask whoever manages this panel."
+msgstr "Consulte a quien gestiona este panel."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+"On a Team or Enterprise plan, an Owner or Primary Owner adds it once in\n"
+"                            Organization settings, Connectors (Add, Custom, Web); then each member\n"
+"                            finds it in Customize, Connectors, and chooses Connect."
+msgstr ""
+"En un plan Team o Enterprise, un Propietario o Propietario principal lo "
+"añade una vez en Configuración de la organización, Conectores (Añadir, "
+"Personalizado, Web); después, cada miembro lo encuentra en Personalizar, "
+"Conectores, y elige Conectar."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auth.py:0
+msgid "On this panel agents connect with OAuth."
+msgstr "En este panel los agentes se conectan con OAuth."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/controllers/settings.py:0
+msgid ""
+"On this panel the agents' issuer and the MCP URL are set by the platform."
+msgstr ""
+"En este panel el emisor de los agentes y la URL del MCP los fija la "
+"plataforma."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_settings_tab.xml:0
+msgid "On this panel the platform sets both."
+msgstr "En este panel los dos los fija la plataforma."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "One commit writes at most %s characters: split it in several."
+msgstr "Un commit escribe como máximo %s caracteres: divídalo en varios."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "One commit writes from 1 to %s files."
+msgstr "Un commit escribe de 1 a %s archivos."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "Only active jobs can be cancelled."
+msgstr "Solo se pueden cancelar las tareas activas."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "Only failed jobs can be retried."
+msgstr "Solo se pueden reintentar las tareas fallidas."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+"Only on an individual plan: a connector an Owner or Primary Owner adds\n"
+"                            in Organization settings is shared by every member, and so would your\n"
+"                            key be."
+msgstr ""
+"Solo en un plan individual: un conector que un Propietario o Propietario "
+"principal añade en Configuración de la organización lo comparten todos los "
+"miembros, y también compartirían su clave."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/cloud_job.py:0
+msgid "Only the platform marks a job as queued by an agent."
+msgstr "Solo la plataforma marca una tarea como encolada por un agente."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"Open a pull request from branch %(branch)s in %(repo)s, a public repository:"
+" anyone can read it."
+msgstr ""
+"Abrir un pull request desde la rama %(branch)s en %(repo)s, un repositorio "
+"público: cualquiera puede leerlo."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"Open a pull request from branch %(branch)s in %(repo)s. The panel then "
+"creates a preview staging of a production instance, one you may not see in "
+"the panel, with a copy of its data."
+msgstr ""
+"Abrir un pull request desde la rama %(branch)s en %(repo)s. El panel crea "
+"entonces un staging de previsualización de una instancia de producción, una "
+"que quizá usted no vea en el panel, con una copia de sus datos."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"Open a pull request from branch %(branch)s in %(repo)s. The panel then "
+"creates a preview staging of production %(names)s, with a copy of its data."
+msgstr ""
+"Abrir un pull request desde la rama %(branch)s en %(repo)s. El panel crea "
+"entonces un staging de previsualización de la producción %(names)s, con una "
+"copia de sus datos."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_confirm.py:0
+msgid "Operation cancelled."
+msgstr "Operación cancelada."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Other clients"
+msgstr "Otros clientes"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_approval__state__pending
+msgid "Pending"
+msgstr "Pendiente"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid "Production instances cannot be refreshed from production."
+msgstr "Las instancias de producción no se pueden refrescar desde producción."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid "Project not found"
+msgstr "Proyecto no encontrado"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid ""
+"Remove the frozen copy of the instance %(name)s from its old server "
+"%(host)s. Its move can then no longer be undone by going back to that copy."
+msgstr ""
+"Borrar la copia congelada de la instancia %(name)s de su servidor anterior "
+"%(host)s. Su traslado ya no se podrá deshacer volviendo a esa copia."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Remove the server %(name)s (%(ip)s) from the panel and take the panel's "
+"services off it. This cannot be undone."
+msgstr ""
+"Quitar el servidor %(name)s (%(ip)s) del panel y retirar de él los servicios"
+" del panel. No se puede deshacer."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Replace the staging %(staging)s with a copy of %(origin)s (%(how)s, "
+"%(neutralized)s). Everything in the staging is lost."
+msgstr ""
+"Sustituir el staging %(staging)s por una copia de %(origin)s (%(how)s, "
+"%(neutralized)s). Se pierde todo lo que hay en el staging."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_agent_branch__repository
+msgid "Repository"
+msgstr "Repositorio"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+"Request headers is in beta in Claude: if you do not see it, use\n"
+"                            Claude Code or another client."
+msgstr ""
+"Encabezados de solicitud está en beta en Claude: si no lo ve, use Claude "
+"Code u otro cliente."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid ""
+"Restart the production instance %(name)s (project %(project)s). It is "
+"unavailable while it restarts."
+msgstr ""
+"Reiniciar la instancia de producción %(name)s (proyecto %(project)s). No "
+"estará disponible mientras se reinicia."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Restore the production instance %(name)s from its backup of %(time)s. What "
+"changed after it is lost."
+msgstr ""
+"Restaurar la instancia de producción %(name)s desde su backup de %(time)s. "
+"Se pierde lo que cambió después."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_rates_section.xml:0
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_settings_tab.xml:0
+msgid "Retry"
+msgstr "Reintentar"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "Retry the failed job %(job)s: it does again what it was doing."
+msgstr ""
+"Reintentar la tarea fallida %(job)s: vuelve a hacer lo que estaba haciendo."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "Run %(action)s on the server %(name)s (%(ip)s)."
+msgstr "Ejecutar %(action)s en el servidor %(name)s (%(ip)s)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid ""
+"Run the full setup of the server %(name)s (%(ip)s): it checks the system, "
+"reinstalls the panel's tooling and redeploys its proxy. Every instance on it"
+" may be unreachable for a while."
+msgstr ""
+"Ejecutar la configuración completa del servidor %(name)s (%(ip)s): comprueba"
+" el sistema, reinstala las herramientas del panel y vuelve a desplegar su "
+"proxy. Todas sus instancias pueden quedar inaccesibles durante un rato."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools.py:0
+msgid "Run the tool %s with these arguments."
+msgstr "Ejecutar la herramienta %s con estos argumentos."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_command.py:0
+msgid "Run this command in the production instance %(name)s:"
+msgstr "Ejecutar este comando en la instancia de producción %(name)s:"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_command.py:0
+msgid "Run this command on the server %(name)s (%(ip)s):"
+msgstr "Ejecutar este comando en el servidor %(name)s (%(ip)s):"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Run this in a terminal:"
+msgstr "Ejecute esto en una terminal:"
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_incubacloud_mcp_secrets
+msgid "Secrets agents never see"
+msgstr "Secretos que los agentes nunca ven"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_secrets.py:0
+msgid "Secrets are changed in the panel (%s)."
+msgstr "Los secretos se cambian en el panel (%s)."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "See and revoke the agents you connected in"
+msgstr "Vea y revoque los agentes que conectó en"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Send your API key in the header"
+msgstr "Envíe su clave API en el encabezado"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid ""
+"Send your Telegram notifications to the chat %(chat)s (now %(current)s)."
+msgstr ""
+"Enviar sus notificaciones de Telegram al chat %(chat)s (ahora %(current)s)."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_cloud_audit_log__via_client
+msgid ""
+"Set when the action came through the MCP endpoint: the verified client id of"
+" the token, or 'API key <name>', then between brackets the name the client "
+"declares (not verified)."
+msgstr ""
+"Se rellena cuando la acción llegó por el endpoint MCP: el client id "
+"verificado del token, o 'API key <name>', y luego entre paréntesis el nombre"
+" que declara el cliente (sin verificar)."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_cloud_job__via_client
+msgid ""
+"Set when the job was queued through the MCP endpoint, as in the audit log."
+msgstr ""
+"Se rellena cuando la tarea se encoló por el endpoint MCP, como en el log de "
+"auditoría."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid ""
+"Sign in to the instance %(name)s as its user %(user)s (login %(login)s, id "
+"%(id)s)."
+msgstr ""
+"Entrar en la instancia %(name)s como su usuario %(user)s (login %(login)s, "
+"id %(id)s)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auth.py:0
+msgid ""
+"Sign in to the panel once to create your user, then connect the agent again."
+msgstr ""
+"Entre una vez en el panel para crear su usuario y vuelva a conectar el "
+"agente."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid ""
+"Sign in to the production instance %(name)s as its user %(user)s (login "
+"%(login)s, id %(id)s)."
+msgstr ""
+"Entrar en la instancia de producción %(name)s como su usuario %(user)s "
+"(login %(login)s, id %(id)s)."
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_incubacloud_mcp_download
+msgid "Single-use backup download link for an agent"
+msgstr "Enlace de descarga de backup de un solo uso para un agente"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__state
+msgid "State"
+msgstr "Estado"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid ""
+"Stop the production instance %(name)s (project %(project)s). It is "
+"unavailable until it is started again."
+msgstr ""
+"Detener la instancia de producción %(name)s (proyecto %(project)s). No "
+"estará disponible hasta que se vuelva a arrancar."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "Stop your notification emails."
+msgstr "Dejar de enviarle las notificaciones por correo electrónico."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Take the instance %(name)s (project %(project)s) off its server, with its "
+"database and files there. It stays in the panel as a draft that can be "
+"deployed again."
+msgstr ""
+"Retirar la instancia %(name)s (proyecto %(project)s) de su servidor, con su "
+"base de datos y sus ficheros allí. Se queda en el panel como borrador que se"
+" puede volver a desplegar."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Take the production instance %(name)s (project %(project)s) off its server, "
+"with its database and files there. It stays in the panel as a draft that can"
+" be deployed again."
+msgstr ""
+"Retirar la instancia de producción %(name)s (proyecto %(project)s) de su "
+"servidor, con su base de datos y sus ficheros allí. Se queda en el panel "
+"como borrador que se puede volver a desplegar."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auth.py:0
+msgid "The API key is not valid, has expired or was revoked."
+msgstr "La clave API no es válida, ha caducado o se ha revocado."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/controllers/settings.py:0
+msgid ""
+"The MCP URL must be an absolute http or https URL, with no credentials, "
+"query or fragment. Its host may hold only letters a to z, digits, dots, "
+"hyphens and underscores, or be an IPv6 address in brackets; its path may "
+"also hold tildes, percent signs and slashes."
+msgstr ""
+"La URL del MCP tiene que ser una URL http o https absoluta, sin "
+"credenciales, consulta ni fragmento. Su host solo puede tener letras de la a"
+" a la z, dígitos, puntos, guiones y guiones bajos, o ser una dirección IPv6 "
+"entre corchetes; su ruta puede tener además virgulillas (~), signos de "
+"porcentaje y barras."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auth.py:0
+msgid "The access token is not valid for this panel."
+msgstr "El token de acceso no es válido para este panel."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "The action %s changes no preference: give it without them."
+msgstr "La acción %s no cambia ninguna preferencia: indíquela sin ellas."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_settings.py:0
+msgid "The action %s changes no setting: give it without values."
+msgstr "La acción %s no cambia ningún ajuste: indíquela sin values."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/cloud_settings.py:0
+msgid ""
+"The agents' issuer must be an https URL, such as https://login.example.com."
+msgstr ""
+"El emisor de los agentes tiene que ser una URL https, como "
+"https://login.example.com."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/controllers/settings.py:0
+msgid "The agents' limit must be a number."
+msgstr "El límite de los agentes tiene que ser un número."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_command.py:0
+msgid "The command could not be run on the server."
+msgstr "No se ha podido ejecutar el comando en el servidor."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid "The download is not ready yet. Ask again when its job is done."
+msgstr ""
+"La descarga aún no está lista. Vuelva a pedirla cuando termine su tarea."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid "The download's file changed since it was approved. Ask again."
+msgstr ""
+"El archivo de la descarga ha cambiado desde que se aprobó. Vuelva a pedirla."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid "The instance could not be read."
+msgstr "No se ha podido leer la instancia."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid "The instance has no active internal user with id %(id)s."
+msgstr "La instancia no tiene ningún usuario interno activo con id %(id)s."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_server.py:0
+msgid "The panel could not complete this action."
+msgstr "El panel no ha podido completar esta acción."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_server.py:0
+msgid "The panel could not prepare this action."
+msgstr "El panel no ha podido preparar esta acción."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_dispatch.py:0
+msgid "The panel has no route %s."
+msgstr "El panel no tiene la ruta %s."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_server.py:0
+msgid "The panel refused this action."
+msgstr "El panel ha rechazado esta acción."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"The panel's GitHub access cannot write to this repository. Save a personal "
+"access token that can write to it in Settings → GitHub: the panel's GitHub "
+"App only reads code."
+msgstr ""
+"El acceso del panel a GitHub no puede escribir en este repositorio. Guarde "
+"en Configuración → GitHub un token de acceso personal que pueda escribir en "
+"él: la GitHub App del panel solo lee código."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_settings.py:0
+msgid "The section %(section)s has no action %(action)s."
+msgstr "La sección %(section)s no tiene la acción %(action)s."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "The server %(name)s does not offer %(action)s."
+msgstr "El servidor %(name)s no ofrece %(action)s."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid "The server presented no SSH key."
+msgstr "El servidor no ha presentado ninguna clave SSH."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auth.py:0
+msgid "The sign-in service cannot be reached. Try again shortly."
+msgstr ""
+"No se puede contactar con el servicio de inicio de sesión. Inténtelo de "
+"nuevo en unos momentos."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_incubacloud_mcp_approval__credential
+msgid ""
+"The verified credential of the agent that asked — the token's client, or the"
+" API key itself, not its name: only it uses the approval."
+msgstr ""
+"La credencial verificada del agente que la pidió (el cliente del token, o la"
+" propia clave API, no su nombre): solo ella usa la aprobación."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Then run"
+msgstr "Después, ejecute"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Then run this to sign in:"
+msgstr "Después, ejecute esto para iniciar sesión:"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_confirm.py:0
+msgid "This action needs your approval."
+msgstr "Esta acción necesita su aprobación."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_confirm.py:0
+msgid "This action needs your approval: open %(link)s and ask for it again."
+msgstr "Esta acción necesita su aprobación: abra %(link)s y vuelva a pedirla."
+
+#. module: incubacloud_mcp
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid "This approval link is not valid."
+msgstr "Este enlace de aprobación no es válido."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_confirm.py:0
+msgid ""
+"This confirmation has already been used or has expired. Ask for the action "
+"again."
+msgstr ""
+"Esta confirmación ya se ha usado o ha caducado. Vuelva a pedir la acción."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_confirm.py:0
+msgid "This confirmation has expired. Ask for the action again."
+msgstr "Esta confirmación ha caducado. Vuelva a pedir la acción."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_confirm.py:0
+msgid "This confirmation is not valid. Ask for the action again."
+msgstr "Esta confirmación no es válida. Vuelva a pedir la acción."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_confirm.py:0
+msgid ""
+"This confirmation was given for another action. Ask for the action again."
+msgstr "Esta confirmación se dio para otra acción. Vuelva a pedir la acción."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "This instance has no frozen copy to clean."
+msgstr "Esta instancia no tiene ninguna copia congelada que limpiar."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"This instance was never deployed: there is nothing to take off its server. "
+"Delete it without keep_in_panel."
+msgstr ""
+"Esta instancia nunca se ha desplegado: no hay nada que retirar de su "
+"servidor. Bórrela sin keep_in_panel."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid "This job did not prepare a backup download nor an export."
+msgstr ""
+"Esta tarea no ha preparado ninguna descarga de backup ni ninguna "
+"exportación."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid ""
+"This job waits for an alert and starts by itself once it is resolved. "
+"Resolve it in Alerts."
+msgstr ""
+"Esta tarea espera a una alerta y arranca sola en cuanto se resuelve. "
+"Resuélvala en Alertas."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_read.py:0
+msgid "This log has %(pages)s pages: ask for one from 1 to %(pages)s."
+msgstr "Este log tiene %(pages)s páginas: pida una entre la 1 y la %(pages)s."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "This page could not be loaded. Reload it to try again."
+msgstr ""
+"No se ha podido cargar esta página. Recárguela para volver a intentarlo."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "This panel accepts API keys only. Create one in your"
+msgstr "Este panel solo acepta claves API. Cree una en sus"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"This panel's GitHub access cannot create repositories. On GitHub, use New "
+"repository (private, with a README), then ask me to connect it to the "
+"project."
+msgstr ""
+"El acceso de este panel a GitHub no puede crear repositorios. En GitHub, use"
+" New repository (privado, con un README) y pídame después que lo conecte al "
+"proyecto."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "This panel's MCP address"
+msgstr "Dirección MCP de este panel"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+"This panel's MCP address is not a plain web address, so no command\n"
+"                        is shown for it."
+msgstr ""
+"La dirección MCP de este panel no es una dirección web sencilla, así que no "
+"se muestra ningún comando con ella."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid ""
+"This panel's MCP address is not configured yet, so no agent can\n"
+"                        connect."
+msgstr ""
+"La dirección MCP de este panel aún no está configurada, así que ningún "
+"agente puede conectarse."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auth.py:0
+msgid "This panel's sign-in is not completely configured."
+msgstr "El inicio de sesión de este panel no está configurado del todo."
+
+#. module: incubacloud_mcp
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid ""
+"This request belongs to another user of the panel. Sign in as that user to "
+"answer it."
+msgstr ""
+"Esta petición es de otro usuario del panel. Entre como ese usuario para "
+"responderla."
+
+#. module: incubacloud_mcp
+#: model_terms:ir.ui.view,arch_db:incubacloud_mcp.approval_page_html
+msgid ""
+"This request has expired or was already answered. Ask your agent to request "
+"it again."
+msgstr ""
+"Esta petición ha caducado o ya se ha respondido. Pida a su agente que la "
+"vuelva a solicitar."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid "This user is an administrator of the instance."
+msgstr "Este usuario es administrador de la instancia."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__token_hash
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__token_hash
+msgid "Token Hash"
+msgstr "Hash del token"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_command.py:0
+msgid "Too many commands recently. Try again in a minute."
+msgstr ""
+"Demasiados comandos en poco tiempo. Vuelva a intentarlo dentro de un minuto."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/controllers/mcp.py:0
+msgid "Too many failed authentications from this address."
+msgstr "Demasiadas autenticaciones fallidas desde esta dirección."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__tool
+msgid "Tool"
+msgstr "Herramienta"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_cloud_settings__rate_limit_mcp_user_per_min
+msgid ""
+"Tool calls one user's agents may make per minute, all of them together. Zero"
+" or less falls back to the default (120)."
+msgstr ""
+"Llamadas a herramientas que pueden hacer por minuto los agentes de un "
+"usuario, todos juntos. Cero o menos vuelve al valor por defecto (120)."
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_incubacloud_mcp_catalog
+msgid "Tools agents may call, and the routes they may not"
+msgstr "Herramientas que pueden llamar los agentes, y rutas que no"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid ""
+"Trust the SSH key the server %(name)s (%(ip)s) presents now: %(new)s. Key "
+"trusted until now: %(old)s. Compare them before approving."
+msgstr ""
+"Confiar en la clave SSH que presenta ahora el servidor %(name)s (%(ip)s): "
+"%(new)s. Clave de confianza hasta ahora: %(old)s. Compárelas antes de "
+"aprobar."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Undo the move of the instance %(name)s and bring it back to its previous "
+"server."
+msgstr ""
+"Deshacer el traslado de la instancia %(name)s y devolverla a su servidor "
+"anterior."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid ""
+"Undo the move of the production instance %(name)s and bring it back to its "
+"previous server."
+msgstr ""
+"Deshacer el traslado de la instancia de producción %(name)s y devolverla a "
+"su servidor anterior."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_manager.py:0
+msgid "Unknown server field(s): %(keys)s. Accepted: %(accepted)s."
+msgstr "Campos del servidor desconocidos: %(keys)s. Se aceptan: %(accepted)s."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_command.py:0
+msgid "Unknown service"
+msgstr "Servicio desconocido"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_settings.py:0
+msgid "Unknown setting(s) for %(section)s: %(keys)s"
+msgstr "Ajustes desconocidos en %(section)s: %(keys)s"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/controllers/settings.py:0
+msgid "Unknown setting(s): %s"
+msgstr "Ajustes desconocidos: %s"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_approval__state__used
+msgid "Used"
+msgstr "Usada"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__used_at
+msgid "Used At"
+msgstr "Usado el"
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_res_users
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_agent_branch__user_id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__user_id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__user_id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_credential__user_id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__user_id
+msgid "User"
+msgstr "Usuario"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "VS Code"
+msgstr "VS Code"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_audit_log__via_client
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_job__via_client
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_agent_branch__via_client
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_approval__via_client
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_download__via_client
+msgid "Via Client"
+msgstr "Vía agente"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"Write %(count)s file(s) to branch %(branch)s of %(repo)s in one commit "
+"(%(paths)s). %(repo)s is a public repository: anyone can read what is "
+"written."
+msgstr ""
+"Escribir %(count)s archivo(s) en la rama %(branch)s de %(repo)s en un solo "
+"commit (%(paths)s). %(repo)s es un repositorio público: cualquiera puede "
+"leer lo que se escribe."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"Write %(count)s file(s) to branch %(branch)s of %(repo)s in one commit "
+"(%(paths)s). A production instance, one you may not see in the panel, "
+"deploys from this branch: this reaches production, at once when it rebuilds "
+"on every push, otherwise at its next rebuild."
+msgstr ""
+"Escribir %(count)s archivo(s) en la rama %(branch)s de %(repo)s en un solo "
+"commit (%(paths)s). Una instancia de producción, una que quizá usted no vea "
+"en el panel, se despliega desde esta rama: esto llega a producción, de "
+"inmediato si se reconstruye con cada push, y si no en su próxima "
+"reconstrucción."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"Write %(count)s file(s) to branch %(branch)s of %(repo)s in one commit "
+"(%(paths)s). Production %(names)s deploys from this branch: this reaches "
+"production, at once when it rebuilds on every push, otherwise at its next "
+"rebuild."
+msgstr ""
+"Escribir %(count)s archivo(s) en la rama %(branch)s de %(repo)s en un solo "
+"commit (%(paths)s). La producción %(names)s se despliega desde esta rama: "
+"esto llega a producción, de inmediato si se reconstruye con cada push, y si "
+"no en su próxima reconstrucción."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"Write %(count)s file(s) to the existing branch %(branch)s of %(repo)s in one"
+" commit (%(paths)s)."
+msgstr ""
+"Escribir %(count)s archivo(s) en la rama existente %(branch)s de %(repo)s en"
+" un solo commit (%(paths)s)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_server.py:0
+msgid ""
+"Your agents made too many calls in the last minute. Wait a moment and try "
+"again."
+msgstr ""
+"Sus agentes han hecho demasiadas llamadas en el último minuto. Espere un "
+"momento y vuelva a intentarlo."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auth.py:0
+msgid "Your user has no role on this panel."
+msgstr "Su usuario no tiene ningún rol en este panel."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auth.py:0
+msgid "Your user on this panel is inactive."
+msgstr "Su usuario en este panel está inactivo."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid "a dump taken now"
+msgstr "un volcado hecho ahora"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_settings.py:0
+msgid "backend_id is for the backup_backend section, not %s."
+msgstr "backend_id es de la sección backup_backend, no de %s."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "in Claude Code to sign in."
+msgstr "en Claude Code para iniciar sesión."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "instance %(name)s"
+msgstr "instancia %(name)s"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+msgid "its last backup"
+msgstr "su último backup"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "neutralized"
+msgstr "neutralizada"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_guarded.py:0
+msgid "none"
+msgstr "ninguna"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_destructive.py:0
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "not neutralized"
+msgstr "sin neutralizar"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_incubacloud_mcp_agent_branch__repository
+msgid "owner/name, in lower case."
+msgstr "propietario/nombre, en minúsculas."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "preferences"
+msgstr "preferencias"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "private"
+msgstr "privado"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "public"
+msgstr "público"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid "server %(name)s"
+msgstr "servidor %(name)s"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "the token's own account"
+msgstr "la cuenta propia del token"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "with the value"
+msgstr "con el valor"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/mcp_templates.xml:0
+msgid "· via agent"
+msgstr "· vía agente"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid ""
+"A link with a user or a password is given in the panel (Import, From a "
+"link): credentials never pass through an agent. Use a presigned or share "
+"link instead."
+msgstr ""
+"Un enlace con usuario o contraseña se indica en el panel (Importar, Desde un"
+" enlace): las credenciales nunca pasan por un agente. Use en su lugar un "
+"enlace prefirmado o compartido."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid ""
+"An agent gives an https link only: sftp and ftp links are given in the panel"
+" (Import, From a link)."
+msgstr ""
+"Un agente solo puede indicar enlaces https: los enlaces sftp y ftp se "
+"indican en el panel (Importar, Desde un enlace)."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "Instance has no host assigned."
+msgstr "La instancia no tiene host asignado."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid ""
+"Let the key %(key)s upload an archive for the instance %(name)s to the "
+"server %(host)s: into one directory, write only, for %(hours)s hours or "
+"until a restore takes it."
+msgstr ""
+"Permitir que la clave %(key)s suba un archivo para la instancia %(name)s al "
+"servidor %(host)s: a un único directorio, solo escritura, durante %(hours)s "
+"horas o hasta que una restauración lo tome."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid ""
+"Nothing that can be restored has been found through this door yet: send the "
+"archive as restore.zip, then call check_restore_upload and wait for its job."
+msgstr ""
+"Todavía no se ha encontrado nada restaurable en esta puerta: envíe el "
+"archivo como restore.zip, llame a check_restore_upload y espere a que "
+"termine su trabajo."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid ""
+"Replace the database and files of %(target)s with %(origin)s (%(how)s). "
+"Everything the instance holds now is lost."
+msgstr ""
+"Sustituir la base de datos y los archivos de %(target)s por %(origin)s "
+"(%(how)s). Se pierde todo lo que la instancia contiene ahora."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "That upload grant does not exist."
+msgstr "Esa concesión de subida no existe."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid ""
+"This instance has no resolvable backup backend, so a pre-restore safety "
+"backup cannot be taken. Configure a backup backend (instance, project or "
+"global) first."
+msgstr ""
+"Esta instancia no tiene un backend de backup resoluble, por lo que no se "
+"puede tomar un backup de seguridad antes de restaurar. Configure un backend "
+"de backup (de instancia, proyecto o global) primero."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid ""
+"What arrived has changed since it was shown to you, or the restore did not "
+"say which file it means. Check what arrived again, then restore it."
+msgstr ""
+"Lo recibido ha cambiado desde que se le mostró, o la restauración no indicó "
+"a qué archivo se refiere. Compruebe de nuevo lo recibido y restáurelo "
+"después."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "after a safety backup"
+msgstr "tras un backup de seguridad"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "expected_sha256 is not a SHA-256."
+msgstr "expected_sha256 no es un SHA-256."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "given the instance's own address"
+msgstr "con la dirección propia de la instancia"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "keeping the address it has"
+msgstr "conservando la dirección que trae"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "the archive at %(path)s on the server %(host)s"
+msgstr "el archivo %(path)s del servidor %(host)s"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "the archive its server downloads from %s"
+msgstr "el archivo que su servidor descarga de %s"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid ""
+"the file %(file)s uploaded through the door (%(bytes)s bytes, SHA-256 "
+"%(sha)s)"
+msgstr ""
+"el archivo %(file)s subido por la puerta (%(bytes)s bytes, SHA-256 %(sha)s)"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "the instance %(name)s (project %(project)s)"
+msgstr "la instancia %(name)s (proyecto %(project)s)"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "the production instance %(name)s (project %(project)s)"
+msgstr "la instancia de producción %(name)s (proyecto %(project)s)"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "without a safety backup"
+msgstr "sin backup de seguridad"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_restore.py:0
+msgid "That door is closed already: nothing to do."
+msgstr "Esa puerta ya está cerrada: no hay nada que hacer."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid ""
+"Stop every notification: no job notification reaches you at the level none."
+msgstr ""
+"Dejar de enviarle todas las notificaciones: ninguna notificación de tareas "
+"le llegará con el nivel «ninguna»."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_jobs.py:0
+msgid ""
+"Stop your Telegram notifications and delete the bot token stored in the "
+"panel."
+msgstr ""
+"Dejar de enviarle las notificaciones por Telegram y borrar el token del bot "
+"guardado en el panel."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "%s is not in this branch."
+msgstr "%s no está en esta rama."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"The panel could not read this repository with git (%s). Check the address, "
+"the branch and the credential under Settings → Git providers."
+msgstr ""
+"El panel no pudo leer este repositorio con git (%s). Revise la dirección, la"
+" rama y la credencial en Ajustes → Proveedores Git."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"There is no Git provider for %s: add it under Settings → Git providers."
+msgstr ""
+"No hay un proveedor Git para %s: añádalo en Ajustes → Proveedores Git."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid ""
+"Writing to GitLab repositories is not available: the panel only reads this "
+"repository."
+msgstr ""
+"La escritura en repositorios de GitLab no está disponible: el panel solo lee "
+"este repositorio."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_code.py:0
+msgid "Git read limit reached. Try again later."
+msgstr "Se alcanzó el límite de lecturas Git. Vuelva a intentarlo más tarde."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_operate.py:0
+msgid "%(repo)s, branch %(branch)s, pinned at its current commit"
+msgstr "%(repo)s, rama %(branch)s, fijado en su commit actual"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "%(credential)s acts without asking until %(date)s UTC."
+msgstr "%(credential)s actúa sin preguntar hasta el %(date)s UTC."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid ""
+"%(credential)s has an auto-approval rule until %(date)s UTC, paused for now:"
+" it asks for approval."
+msgstr ""
+"%(credential)s tiene una regla de aprobación automática hasta el %(date)s "
+"UTC, en pausa por ahora: pide aprobación."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "%(person)s · %(credential)s · %(reason)s"
+msgstr "%(person)s · %(credential)s · %(reason)s"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "%(person)s · %(credential)s · until %(date)s UTC"
+msgstr "%(person)s · %(credential)s · hasta el %(date)s UTC"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "30 days"
+msgstr "30 días"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "7 days"
+msgstr "7 días"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "90 days"
+msgstr "90 días"
+
+#. module: incubacloud_mcp
+#: model:ir.model.constraint,message:incubacloud_mcp.constraint_incubacloud_mcp_auto_approval_live_uniq
+msgid "A credential has one live auto-approval rule at most."
+msgstr ""
+"Una credencial tiene como máximo una regla de aprobación automática vigente."
+
+#. module: incubacloud_mcp
+#: model:ir.model.constraint,message:incubacloud_mcp.constraint_incubacloud_mcp_credential_user_client_uniq
+msgid "A credential is recorded once per user."
+msgstr "Una credencial se registra una sola vez por usuario."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "A leaked credential."
+msgstr "Una credencial filtrada."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid ""
+"A wrong call runs at once. Agents treat \"the panel asks first\" as a\n"
+"                            safety net; with this rule there is none."
+msgstr ""
+"Una llamada equivocada se ejecuta en el acto. Los agentes cuentan con que "
+"«el panel pregunta primero» como red de seguridad; con esta regla no la hay."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_auto_approval__kind__api_key
+msgid "API key"
+msgstr "Clave de API"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "Active"
+msgstr "Activa"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Activity"
+msgstr "Actividad"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_auto_approval__role_at_grant__manager
+msgid "Administrator"
+msgstr "Administrador"
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_incubacloud_mcp_credential
+msgid "Agent credential seen on the MCP endpoint"
+msgstr "Credencial de agente vista en el endpoint MCP"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "An auto-approval rule cannot be changed."
+msgstr "Una regla de aprobación automática no se puede modificar."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_audit_log__approval
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_job__approval
+msgid "Approval"
+msgstr "Aprobación"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_audit_log__approval_rule_id
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_cloud_job__approval_rule_id
+msgid "Approval Rule"
+msgstr "Regla de aprobación"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__cloud_audit_log__approval__person
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__cloud_job__approval__person
+msgid "Approved by the person"
+msgstr "Aprobada por la persona"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Auto-approval"
+msgstr "Aprobación automática"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Auto-approval activity"
+msgstr "Actividad de la aprobación automática"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "Auto-approval granted."
+msgstr "Aprobación automática concedida."
+
+#. module: incubacloud_mcp
+#: model:ir.model,name:incubacloud_mcp.model_incubacloud_mcp_auto_approval
+msgid "Auto-approval of an agent's credential"
+msgstr "Aprobación automática de la credencial de un agente"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.js:0
+msgid "Auto-approval revoked."
+msgstr "Aprobación automática revocada."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "Auto-approval rules are granted in Settings, Agents."
+msgstr ""
+"Las reglas de aprobación automática se conceden en Configuración, Agentes."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "Auto-approval rules are kept as history."
+msgstr "Las reglas de aprobación automática se conservan como historial."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid ""
+"Auto-approval rules are managed by a person in the panel, never through an "
+"agent."
+msgstr ""
+"Las reglas de aprobación automática las gestiona una persona en el panel, "
+"nunca un agente."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__cloud_audit_log__approval__auto
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__cloud_job__approval__auto
+msgid "Auto-approved by a rule"
+msgstr "Aprobada automáticamente por una regla"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Auto-approved calls"
+msgstr "Llamadas aprobadas automáticamente"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Choose a credential…"
+msgstr "Elija una credencial…"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Choose a person…"
+msgstr "Elija una persona…"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "Choose an active user with a role."
+msgstr "Elija un usuario activo con un rol."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "Choose how long the rule lasts."
+msgstr "Elija cuánto dura la regla."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Choose how long…"
+msgstr "Elija cuánto tiempo…"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "Choose one of this user's credentials that connected to the panel."
+msgstr ""
+"Elija una credencial de este usuario que ya se haya conectado al panel."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_credential__client
+msgid "Client"
+msgstr "Cliente"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_credential__client_name
+msgid "Client Name"
+msgstr "Nombre del cliente"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Close"
+msgstr "Cerrar"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_auto_approval__role_at_grant__consultant
+msgid "Consultant"
+msgstr "Consultor"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "Could not load the users and their credentials."
+msgstr "No se pudieron cargar los usuarios y sus credenciales."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "Could not load what this rule approved."
+msgstr "No se pudo cargar lo que aprobó esta regla."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__credential_label
+msgid "Credential Label"
+msgstr "Etiqueta de la credencial"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_auto_approval__revoked_reason__credential_deleted
+msgid "Credential deleted"
+msgstr "Credencial eliminada"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_auto_approval__role_at_grant__developer
+msgid "Developer"
+msgstr "Desarrollador"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid ""
+"Each action run this way is marked auto-approved in the audit log and on\n"
+"                        its jobs. You can revoke the rule at any time."
+msgstr ""
+"Cada acción ejecutada así queda marcada como aprobada automáticamente en el "
+"registro de auditoría y en sus trabajos. Puede revocar la regla en cualquier"
+" momento."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Ended"
+msgstr "Fin"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "Expired"
+msgstr "Caducada"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "Failed to load the auto-approval rules."
+msgstr "No se pudieron cargar las reglas de aprobación automática."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_credential__first_seen
+msgid "First Seen"
+msgstr "Visto por primera vez"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "For"
+msgstr "Durante"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Grant auto-approval"
+msgstr "Conceder aprobación automática"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Grant auto-approval…"
+msgstr "Conceder aprobación automática…"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__granted_by_id
+msgid "Granted By"
+msgstr "Concedida por"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__granted_ip
+msgid "Granted Ip"
+msgstr "IP de concesión"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Granted by"
+msgstr "Concedida por"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_cloud_job__approval
+msgid ""
+"How the agent's call that queued the job was approved, as in the audit log."
+msgstr ""
+"Cómo se aprobó la llamada del agente que encoló el trabajo, como en el "
+"registro de auditoría."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_cloud_audit_log__approval
+msgid ""
+"How the agent's call that wrote the row was approved. Empty: it needed no "
+"approval, or the row is older than this field."
+msgstr ""
+"Cómo se aprobó la llamada del agente que escribió la fila. Vacío: no "
+"necesitaba aprobación o la fila es anterior a este campo."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_incubacloud_mcp_auto_approval__credential_label
+#: model:ir.model.fields,help:incubacloud_mcp.field_incubacloud_mcp_credential__label
+msgid "How the audit names it."
+msgstr "Cómo la nombra la auditoría."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid ""
+"I understand, and I take responsibility for what this agent does without\n"
+"                        asking."
+msgstr ""
+"Lo entiendo, y asumo la responsabilidad de lo que este agente haga sin "
+"preguntar."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Instructions hidden in what the agent reads:"
+msgstr "Instrucciones escondidas en lo que lee el agente:"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__kind
+msgid "Kind"
+msgstr "Tipo"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_credential__label
+msgid "Label"
+msgstr "Etiqueta"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_credential__last_seen
+msgid "Last Seen"
+msgstr "Visto por última vez"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__last_used_at
+msgid "Last Used At"
+msgstr "Último uso"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Last day"
+msgstr "Último día"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Last used"
+msgstr "Último uso"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Let this agent act without asking"
+msgstr "Dejar que este agente actúe sin preguntar"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Newer"
+msgstr "Más recientes"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid ""
+"No credential has connected yet. A rule is granted to an agent that already\n"
+"                connected to this panel: connect it first, then come back."
+msgstr ""
+"Todavía no se ha conectado ninguna credencial. Una regla se concede a un "
+"agente que ya se conectó a este panel: conéctelo primero y vuelva después."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "No rule has been granted."
+msgstr "No se ha concedido ninguna regla."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/controllers/auto_approval.py:0
+msgid "No such auto-approval rule."
+msgstr "No existe esa regla de aprobación automática."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Nothing yet."
+msgstr "Nada todavía."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__notice_version
+msgid "Notice Version"
+msgstr "Versión del aviso"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_auto_approval__kind__oauth
+msgid "OAuth client"
+msgstr "Cliente OAuth"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Older"
+msgstr "Más antiguas"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid ""
+"On this panel the platform does not allow auto-approval now: the rules below are\n"
+"                paused, and none can be granted."
+msgstr ""
+"En este panel la plataforma no permite ahora la aprobación automática: las "
+"reglas de abajo están en pausa y no se puede conceder ninguna."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/cloud_audit_log.py:0
+msgid "Only the platform marks an audit row as done by an agent."
+msgstr ""
+"Solo la plataforma marca una fila de auditoría como hecha por un agente."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "Paused by the platform"
+msgstr "En pausa por la plataforma"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "Paused: the role went up"
+msgstr "En pausa: el rol subió"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Person"
+msgstr "Persona"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_auto_approval__role_at_grant__project_manager
+msgid "Project Manager"
+msgstr "Gerente de proyecto"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid ""
+"Read the notice again and confirm it: it changed, or it was not confirmed."
+msgstr "Vuelva a leer el aviso y confírmelo: ha cambiado o no se confirmó."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_auto_approval__revoked_reason__superseded
+msgid "Replaced by a new rule"
+msgstr "Sustituida por una regla nueva"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "Revoke"
+msgstr "Revocar"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Revoke auto-approval"
+msgstr "Revocar aprobación automática"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_auto_approval__revoked_reason__manual
+msgid "Revoked"
+msgstr "Revocada"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__revoked_at
+msgid "Revoked At"
+msgstr "Revocada el"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__revoked_by_id
+msgid "Revoked By"
+msgstr "Revocada por"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__revoked_reason
+msgid "Revoked Reason"
+msgstr "Motivo de la revocación"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__role_at_grant
+msgid "Role At Grant"
+msgstr "Rol al concederla"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_auto_approval__role_at_grant__user
+msgid "Stakeholder"
+msgstr "Interesado"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_cloud_job__approval_rule_id
+msgid "The auto-approval rule that approved the call that queued the job."
+msgstr ""
+"La regla de aprobación automática que aprobó la llamada que encoló el "
+"trabajo."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_cloud_audit_log__approval_rule_id
+msgid ""
+"The auto-approval rule the row is about: the one that approved the call, or "
+"the one granted or revoked."
+msgstr ""
+"La regla de aprobación automática de la fila: la que aprobó la llamada, o la"
+" concedida o revocada."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_incubacloud_mcp_auto_approval__credential
+#: model:ir.model.fields,help:incubacloud_mcp.field_incubacloud_mcp_credential__client
+msgid ""
+"The credential, as an approval binds it: 'API key #<id>' or 'client_id "
+"<id>'."
+msgstr ""
+"La credencial, tal como la vincula una aprobación: «API key #<id>» o "
+"«client_id <id>»."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "The model's mistakes."
+msgstr "Los errores del modelo."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_incubacloud_mcp_credential__client_name
+msgid "The name the client declares (not verified)."
+msgstr "El nombre que declara el cliente (sin verificar)."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "The next call of"
+msgstr "La siguiente llamada de"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.js:0
+msgid "The rule could not be revoked."
+msgstr "No se pudo revocar la regla."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "The rule was not granted."
+msgstr "La regla no se concedió."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "This panel does not allow auto-approval."
+msgstr "Este panel no permite la aprobación automática."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid ""
+"Until %(date)s, %(credential)s of %(person)s runs every action that would "
+"wait for an approval, without asking."
+msgstr ""
+"Hasta el %(date)s, %(credential)s de %(person)s ejecuta sin preguntar toda "
+"acción que esperaría una aprobación."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Until (UTC)"
+msgstr "Hasta (UTC)"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Until a date…"
+msgstr "Hasta una fecha…"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__use_count
+msgid "Use Count"
+msgstr "Usos"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields.selection,name:incubacloud_mcp.selection__incubacloud_mcp_auto_approval__revoked_reason__user_archived
+msgid "User archived"
+msgstr "Usuario archivado"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "What the panel stops protecting you from:"
+msgstr "De qué deja de protegerle el panel:"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid ""
+"Whoever holds it acts as %(person)s, without asking, until the rule ends. "
+"Revoke the rule and the credential."
+msgstr ""
+"Quien la tenga actúa como %(person)s, sin preguntar, hasta que la regla "
+"termine. Revoque la regla y la credencial."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid ""
+"With %(person)s's role, that includes deleting projects, instances, servers "
+"and backups; restoring over production; commands on production instances and"
+" on servers; security settings and purging the audit log; sign-in links and "
+"backup downloads; writing to any branch and to public repositories."
+msgstr ""
+"Con el rol de %(person)s, eso incluye borrar proyectos, instancias, "
+"servidores y copias; restaurar sobre producción; comandos en instancias de "
+"producción y en servidores; ajustes de seguridad y purgar el registro de "
+"auditoría; enlaces de acceso y descargas de copias; escribir en cualquier "
+"rama y en repositorios públicos."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid ""
+"a log, a mail, a file of a repository, a command's output. If the\n"
+"                            agent follows them, they run."
+msgstr ""
+"un log, un correo, un fichero de un repositorio, la salida de un comando. Si"
+" el agente las sigue, se ejecutan."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "approved"
+msgstr "aprobada"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid ""
+"asks for approval\n"
+"                again. What already ran, or is queued, stays as it is."
+msgstr ""
+"vuelve a pedir aprobación. Lo que ya se ejecutó, o está en cola, se queda "
+"como está."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "auto-approved"
+msgstr "aprobada automáticamente"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "the credential"
+msgstr "la credencial"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "the date you choose"
+msgstr "la fecha que elija"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "the person"
+msgstr "la persona"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/mcp_templates.xml:0
+msgid "via agent"
+msgstr "vía agente"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/mcp_templates.xml:0
+msgid "· approved"
+msgstr "· aprobada"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/mcp_templates.xml:0
+msgid "· auto-approved"
+msgstr "· aprobada automáticamente"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "%(credential)s [%(key)s, last connected %(date)s UTC]"
+msgstr "%(credential)s [%(key)s, última conexión el %(date)s UTC]"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid ""
+"Actions that charge your account are not included: they still ask for "
+"approval."
+msgstr ""
+"No incluye las acciones que cobran a su cuenta: siguen pidiendo aprobación."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Charges"
+msgstr "Cobros"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,field_description:incubacloud_mcp.field_incubacloud_mcp_auto_approval__include_charges
+msgid "Include Charges"
+msgstr "Incluir cobros"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid ""
+"Include charges: orders, purchases and other changes billed to your account\n"
+"                    run without asking too. Unticked, they still ask for approval."
+msgstr ""
+"Incluir cobros: los pedidos, las compras y otros cambios que se facturan a "
+"su cuenta también se ejecutan sin preguntar. Sin marcar, siguen pidiendo "
+"aprobación."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "Included"
+msgstr "Incluidos"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "It also includes what is charged to your account."
+msgstr "También incluye lo que se cobra a su cuenta."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "Still ask for approval"
+msgstr "Siguen pidiendo aprobación"
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_incubacloud_mcp_auto_approval__include_charges
+msgid ""
+"The tools that charge money run without asking too; without it they still "
+"ask."
+msgstr ""
+"Las herramientas que cobran también se ejecutan sin preguntar; sin ello, "
+"siguen preguntando."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "charges included"
+msgstr "cobros incluidos"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid "%(credential)s acts without asking, with no end date."
+msgstr "%(credential)s actúa sin preguntar, sin caducidad."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid ""
+"%(credential)s has an auto-approval rule with no end date, paused for now: "
+"it asks for approval."
+msgstr ""
+"%(credential)s tiene una regla de aprobación automática sin caducidad, en "
+"pausa por ahora: pide aprobación."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "%(person)s · %(credential)s · no end date"
+msgstr "%(person)s · %(credential)s · sin caducidad"
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "Choose a nearer end."
+msgstr "Elija un final más cercano."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "Choose a period or no end date, not both."
+msgstr "Elija un plazo o sin caducidad, no ambos."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid ""
+"It lasts until someone revokes it, the credential is deleted or the person\n"
+"                        is archived. Whoever grants it decides for how long; a date is safer."
+msgstr ""
+"Dura hasta que alguien la revoque, se borre la credencial o se archive a la "
+"persona. Quien la concede decide cuánto dura; una fecha es más segura."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "No end date"
+msgstr "Sin caducidad"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "Recommended: 90 days, the usual rotation period of a credential."
+msgstr ""
+"Recomendado: 90 días, el periodo habitual de rotación de una credencial."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "The rule ends on a day after today."
+msgstr "La regla termina un día posterior a hoy."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "The rule lasts 1 day or more."
+msgstr "La regla dura 1 día o más."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid "This rule has no end date."
+msgstr "Esta regla no caduca."
+
+#. module: incubacloud_mcp
+#: model:ir.model.fields,help:incubacloud_mcp.field_incubacloud_mcp_auto_approval__expires_at
+msgid "When the rule ends; empty, it has no end date."
+msgstr "Cuándo termina la regla; vacío, no caduca."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.js:0
+msgid ""
+"With no end date, %(credential)s of %(person)s runs every action that would "
+"wait for an approval, without asking, until someone revokes the rule."
+msgstr ""
+"Sin caducidad, %(credential)s de %(person)s ejecuta sin preguntar toda "
+"acción que esperaría una aprobación, hasta que alguien revoque la regla."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_auto_approval.py:0
+msgid "Choose a number of days or a date, not both."
+msgstr "Elija un número de días o una fecha, no ambos."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_sections.js:0
+msgid "/min"
+msgstr "/min"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "A manager can correct it in Settings › Agents (MCP)."
+msgstr "Un gerente puede corregirla en Configuración › Agentes (MCP)."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent.xml:0
+msgid "A manager sets it in Settings › Agents (MCP)."
+msgstr "Un gerente la define en Configuración › Agentes (MCP)."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_sections.js:0
+msgid ""
+"AI agents that operate the panel on behalf of a user, and the rules that let"
+" one act without asking."
+msgstr ""
+"Agentes de IA que manejan el panel en nombre de un usuario, y las reglas que"
+" dejan a uno actuar sin preguntar."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/auto_approval/auto_approval.xml:0
+msgid ""
+"An auto-approval rule lets one credential of one person act without asking "
+"until a date, or with no end date: an API key, an OAuth client or the "
+"panel's assistant. Every other agent keeps asking. Each action run this way "
+"is marked auto-approved in the audit log and on its jobs."
+msgstr ""
+"Una regla de aprobación automática deja que una credencial de una persona "
+"actúe sin preguntar hasta una fecha, o sin fecha de fin: una clave API, un "
+"cliente OAuth o el asistente del panel. Los demás agentes siguen "
+"preguntando. Cada acción ejecutada así queda marcada como aprobada "
+"automáticamente en el registro de auditoría y en sus trabajos."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_sections.js:0
+msgid "Auto-approval rules"
+msgstr "Reglas de aprobación automática"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_sections.js:0
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_settings_tab.xml:0
+msgid "Connection"
+msgstr "Conexión"
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_sections.js:0
+msgid ""
+"Let one credential of one person act without asking, until a date or for "
+"good."
+msgstr ""
+"Dejar que una credencial de una persona actúe sin preguntar, hasta una fecha"
+" o para siempre."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_rates_section.xml:0
+msgid ""
+"Past the limit, the panel refuses the calls of that user's agents until the "
+"minute ends."
+msgstr ""
+"Pasado el límite, el panel rechaza las llamadas de los agentes de ese "
+"usuario hasta que acaba el minuto."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_sections.js:0
+msgid "The address to give the agent."
+msgstr "La dirección que hay que dar al agente."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_sections.js:0
+msgid "Tool calls per minute one user's agents may make together."
+msgstr ""
+"Llamadas a herramientas por minuto que pueden hacer entre todos los agentes "
+"de un usuario."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_sections.js:0
+msgid ""
+"Who signs the tokens agents present. Empty: agents connect with API keys "
+"only."
+msgstr ""
+"Quién firma los tokens que presentan los agentes. Vacío: los agentes solo se"
+" conectan con claves API."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/settings/mcp_settings_tab.xml:0
+msgid ""
+"Without an issuer, agents connect with API keys only. With one, the panel "
+"accepts its tokens for the users linked to an enabled OAuth provider with "
+"the same issuer."
+msgstr ""
+"Sin emisor, los agentes solo se conectan con claves API. Con uno, el panel "
+"acepta sus tokens para los usuarios vinculados a un proveedor OAuth activo "
+"con el mismo emisor."
+
+#. module: incubacloud_mcp
+#. odoo-python
+#: code:addons/incubacloud_mcp/models/mcp_tools_manager.py:0
+msgid ""
+"Stop sending this server's security logs (SSH sign-ins, sudo, fail2ban and "
+"changes to sensitive files) to the metrics central."
+msgstr ""
+"Dejar de enviar a la central los registros de seguridad de este servidor "
+"(accesos SSH, sudo, fail2ban y cambios en ficheros sensibles)."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent_format.js:0
+msgid ""
+"Another module in this Odoo, %(module)s, declares /mcp or its OAuth "
+"document, so this panel no longer answers at /mcp, only at /cloud/mcp. "
+"Agents still connected to /mcp have to switch to /cloud/mcp."
+msgstr ""
+"Otro módulo de este Odoo, %(module)s, declara /mcp o su documento OAuth, así "
+"que este panel ya no responde en /mcp, solo en /cloud/mcp. Los agentes que "
+"sigan conectados a /mcp tienen que pasar a /cloud/mcp."
+
+#. module: incubacloud_mcp
+#. odoo-javascript
+#: code:addons/incubacloud_mcp/static/src/connect_agent/connect_agent_format.js:0
+msgid ""
+"Another module in this Odoo, %(module)s, declares /mcp or its OAuth "
+"document, so this panel no longer answers at /mcp, only at /cloud/mcp. If "
+"your proxy forwards this panel's MCP address to /mcp, make it forward to "
+"/cloud/mcp instead."
+msgstr ""
+"Otro módulo de este Odoo, %(module)s, declara /mcp o su documento OAuth, así "
+"que este panel ya no responde en /mcp, solo en /cloud/mcp. Si su proxy "
+"reenvía la dirección MCP de este panel a /mcp, haga que la reenvíe a "
+"/cloud/mcp."
+

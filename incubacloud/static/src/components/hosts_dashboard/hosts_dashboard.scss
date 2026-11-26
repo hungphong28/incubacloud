@@ -1,0 +1,101 @@
+// Hosts dashboard — Relay rebuild.
+// Only screen-specific bits live here; structure/primitives come from
+// relay.scss (rl-page, rl-grid, rl-card, rl-mbar, rl-sb, rl-tag-list…).
+
+.ic-hosts-dashboard {
+
+    // Status accent: coloured left border on each host card.
+    .ic-host-card {
+        border-left: 3px solid $state-neutral;
+
+        &.status-compatible  { border-left-color: $state-ok; }
+        &.status-degraded    { border-left-color: $state-warning; }
+        &.status-unsupported { border-left-color: $state-error; }
+        &.status-checking    { border-left-color: $primary-blue; }
+        &.status-unknown     { border-left-color: $state-neutral; }
+    }
+
+    // The name wraps where it must (a host name often has no spaces) and
+    // the badge keeps its size on the first line, so a long name never
+    // pushes the badge out of the card.
+    .ic-host-card-head {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        margin-bottom: 4px;
+
+        .rl-rname {
+            min-width: 0;
+            overflow-wrap: anywhere;
+        }
+
+        .rl-sb {
+            flex: none;
+        }
+    }
+
+    // An address or a region with no spaces breaks instead of overflowing.
+    .ic-host-card-meta {
+        margin-bottom: 10px;
+        overflow-wrap: anywhere;
+
+        code {
+            font-family: var(--rl-fm);
+        }
+    }
+
+    // Tag badge colour dot (style comes inline from tagDotStyle()).
+    .ic-tag-dot {
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        flex-shrink: 0;
+        display: inline-block;
+    }
+
+    .ic-host-mbars {
+        margin-top: 4px;
+    }
+
+    // --rl-muted, not --rl-faint: the line carries figures (the
+    // allocation among them) and --rl-faint is 3.3:1 on the light theme.
+    .ic-mbar-extra {
+        font-family: var(--rl-fm);
+        font-size: 10px;
+        color: var(--rl-muted);
+        margin-top: 3px;
+    }
+
+    // No live CPU/RAM reading: the reason in words, no bar.
+    .ic-usage-reason {
+        display: flex;
+        align-items: flex-start;
+        gap: 6px;
+        font-size: 12px;
+        line-height: 1.4;
+        color: var(--rl-muted);
+
+        .ic-svg {
+            flex-shrink: 0;
+            margin-top: 2px;
+        }
+    }
+
+    .ic-metrics-placeholder {
+        font-size: 12px;
+        color: var(--rl-muted);
+        font-style: italic;
+        padding: 8px 0;
+        text-align: center;
+    }
+
+    .ic-host-card-foot {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 2px;
+        margin-top: 10px;
+    }
+
+    .ic-ssh-ok        { color: var(--rl-green-text); }
+    .ic-ssh-untrusted { color: var(--rl-amber-text); }
+}

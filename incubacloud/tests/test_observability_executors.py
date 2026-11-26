@@ -1,0 +1,918 @@
+"""Unit tests for the two observability Ansible executors.
+
+Both deploy containers on a real machine, so what matters here is the
+judgement they apply *before* and *after* the playbook runs: refusing to
+install agents that would push into the void, and refusing to call a
+deployment successful when the backend never answered.
+
+Built the same way as the hardening executor's tests — instantiated
+without ``__init__`` so no SSH transport or job record is needed.
+"""
+import asyncio
+import pathlib
+import re
+from unittest.mock import MagicMock, patch
+
+import yaml
+
+from odoo.exceptions import UserError
+from odoo.tests.common import TransactionCase
+
+from odoo.addons.incubacloud.models.abstract_executor import (
+    CANCELLED_WHILE_RUNNING,
+    JobCancelled,
+)
+from odoo.addons.incubacloud.models.metrics_acl_sync_executor import (
+    MetricsAclSyncExecutor,
+)
+from odoo.addons.incubacloud.models.observability_agents_executor import (
+    ObservabilityAgentsExecutor,
+)
+from odoo.addons.incubacloud.models.observability_central_executor import (
+    _ACCOUNT_LOG_READ_PATHS,
+    _ACCOUNT_LOG_WRITE_PATH,
+    _ACCOUNT_READ_PATHS,
+    _ACCOUNT_WRITE_PATH,
+    _DELETE_KEY_IN_FILE_PARAM,
+    _OPERATOR_DELETE_PATH,
+    _OPERATOR_MAX_CONCURRENT,
+    ObservabilityCentralExecutor,
+)
+from odoo.addons.incubacloud.tests._direct import central_names_as_new
+from odoo.addons.incubacloud.tests.test_executor_durable_writes import (
+    JobEndAssertions,
+)
+
+
+class ObservabilityExecutorCase(TransactionCase):
+
+    def setUp(self):
+        super().setUp()
+        # The central's credentials are minted on a durable cursor; in
+        # test mode that cursor rides on this test's transaction.
+        self.registry_enter_test_mode()
+        self.settings = self.env["cloud.settings"].sudo()._get_system()
+        central_names_as_new(self.settings)
+        self.settings.write({
+            "metrics_enabled": True,
+            "metrics_central_url": "http://vm.test:8428",
+            "metrics_remote_write_url": "http://vm.test:8428/api/v1/write",
+            "metrics_remote_write_token": "shared-secret",
+            "metrics_account": "acct_test01",
+            "metrics_retention_days": 45,
+            # The paths of before: the single name has tests of its own
+            # (test_central_single_path.py).
+            "metrics_central_single_path": False,
+            # A read credential never rotated, as on a new panel: on a copy
+            # of a master whose rotation has run, the account's own user
+            # no longer writes and no rotation is due again.
+            "metrics_read_rotated": False,
+            "metrics_read_token_next": False,
+        })
+        self.host = self.env["cloud.host"].create({
+            "name": "HX",
+            "ip_address": "10.0.0.40",
+            "user": "root",
+            "wildcard_domain": "hx.example.com",
+        })
+
+    def _make(self, cls):
+        """Build an executor bound to this test's host.
+
+        :param cls: executor class to instantiate.
+        :return: a usable executor with no transport.
+        """
+        executor = object.__new__(cls)
+        executor.env = self.env
+        executor.job = MagicMock(spec=type(self.env["cloud.job"]))
+        executor.job.host_id = self.host
+        executor.job.env = self.env
+        executor._log_buffer = []
+        executor._sys = lambda *args, **kwargs: None
+        executor._facts = {}
+        # The durable cursor reads the database, not this env's cache,
+        # so whatever the test set up has to be there first.
+        self.env.flush_all()
+        return executor
+
+    def _user(self, cfg, username):
+        """Return the vmauth user dict for *username*, or None.
+
+        :param cfg: the parsed vmauth config.
+        :param username: the account (or ``operator``) to find.
+        """
+        return next(
+            (u for u in cfg.get("users", []) if u["username"] == username),
+            None,
+        )
+
+    def _route(self, user, src_path):
+        """Return the url_map entry of *user* matching *src_path*.
+
+        :param user: a vmauth user dict.
+        :param src_path: the exact ``src_paths`` regex to match.
+        """
+        return next(
+            e for e in user["url_map"] if src_path in e["src_paths"]
+        )
+
+
+class TestAgentsExecutor(ObservabilityExecutorCase):
+
+    def test_refuses_to_install_when_observability_is_off(self):
+        """Belt and braces behind the cron's own gate.
+
+        The reconciliation cron will not queue this job while
+        observability is unconfigured, but the job stays enqueueable
+        directly. Installing anyway would leave three containers running
+        and pushing nowhere, which reads as healthy from the host.
+        """
+        self.settings.metrics_enabled = False
+        with self.assertRaises(UserError):
+            self._make(ObservabilityAgentsExecutor).get_extra_vars()
+
+    def test_refuses_to_install_without_a_remote_write_url(self):
+        self.settings.metrics_remote_write_url = ""
+        with self.assertRaises(UserError):
+            self._make(ObservabilityAgentsExecutor).get_extra_vars()
+
+    def test_extra_vars_carry_the_host_identity_and_credential(self):
+        extra = self._make(ObservabilityAgentsExecutor).get_extra_vars()
+        self.assertEqual(extra["ic_host_id"], str(self.host.id))
+        self.assertEqual(extra["ic_host_name"], "HX")
+        self.assertEqual(extra["ic_remote_write_token"], "shared-secret")
+        self.assertEqual(extra["ic_remote_write_user"], "acct_test01")
+        self.assertEqual(extra["ic_account"], "acct_test01")
+
+    def test_instances_carry_the_traefik_service_prefix(self):
+        """Without it, HTTP samples cannot be attributed to an instance.
+
+        The prefix is derived, not guessed: the panel feeds copier the
+        same project name it forces into COMPOSE_PROJECT_NAME, so the
+        service Traefik reports under is computable from panel state.
+        """
+        project = self.env["cloud.project"].create({"name": "P"})
+        instance = self.env["cloud.instance"].create({
+            "name": "prod", "project_id": project.id,
+            "environment": "production", "host_id": self.host.id,
+            "odoo_version": "19.0",
+        })
+        # ``state`` is only writable through the state machine.
+        instance._transition("deploying")
+        instance._transition("deployed")
+        extra = self._make(ObservabilityAgentsExecutor).get_extra_vars()
+        labels = [
+            i for i in extra["ic_instances"]
+            if i["instance_id"] == str(instance.id)
+        ]
+        self.assertTrue(labels, "the deployed instance was not labelled")
+        self.assertEqual(
+            labels[0]["traefik_prefix"],
+            f"{instance.doodba_project_name}-19-0-",
+        )
+
+    def test_draft_instances_are_not_labelled(self):
+        """A draft instance has no containers; a label for it is noise."""
+        project = self.env["cloud.project"].create({"name": "P"})
+        self.env["cloud.instance"].create({
+            "name": "draft-one", "project_id": project.id,
+            "environment": "staging", "host_id": self.host.id,
+        })
+        extra = self._make(ObservabilityAgentsExecutor).get_extra_vars()
+        self.assertEqual(extra["ic_instances"], [])
+
+    def test_a_failed_playbook_is_an_error(self):
+        executor = self._make(ObservabilityAgentsExecutor)
+        errors = executor.parse_results(
+            {executor._playbook: {"exit_status": 2}},
+        )
+        self.assertTrue(errors)
+
+    def test_partial_agents_are_an_error(self):
+        """Two of three containers up is a broken install, not a success."""
+        executor = self._make(ObservabilityAgentsExecutor)
+        executor._facts = {"ic_agents_running": 2}
+        errors = executor.parse_results(
+            {executor._playbook: {"exit_status": 0}},
+        )
+        self.assertTrue(errors)
+
+    def test_all_three_agents_up_is_a_success(self):
+        executor = self._make(ObservabilityAgentsExecutor)
+        executor._facts = {"ic_agents_running": 3}
+        self.assertEqual(
+            executor.parse_results({executor._playbook: {"exit_status": 0}}),
+            [],
+        )
+
+
+class TestCancellingTheAgentsInstall(ObservabilityExecutorCase):
+    """A person's stop is not a failed install attempt."""
+
+    def _cancel(self, results):
+        """Run the cancel hook of an agents executor and return its log.
+
+        :param results: what the steps answered, or None before them.
+        :return: ``(executor, lines)``: the executor, and what it logged.
+        """
+        executor = self._make(ObservabilityAgentsExecutor)
+        lines = []
+        executor._sys = lines.append
+        executor._alert = MagicMock(spec=ObservabilityAgentsExecutor._alert)
+        asyncio.run(executor.on_cancelled_running(results, JobCancelled("stop")))
+        return executor, lines
+
+    def test_a_stop_does_not_count_as_an_attempt(self):
+        """Two failures already counted: a third would raise the alert."""
+        for state, attempts in (("failed", 2), ("never", 0)):
+            self.host.write({
+                "metrics_agents_state": state,
+                "metrics_agents_attempts": attempts,
+            })
+            for results in ({"playbook": {"exit_status": -1}}, None):
+                executor, _lines = self._cancel(results)
+                self.assertEqual(self.host.metrics_agents_attempts, attempts)
+                self.assertEqual(self.host.metrics_agents_state, state)
+                executor._alert.assert_not_called()
+
+    def test_a_stop_does_not_promise_a_retry(self):
+        """The log says it was cancelled, not that an attempt failed."""
+        _executor, lines = self._cancel({"playbook": {"exit_status": -1}})
+        log = "\n".join(lines)
+        self.assertIn(CANCELLED_WHILE_RUNNING, log)
+        self.assertNotIn("Attempt", log)
+        self.assertNotIn("will retry", log)
+        # What it does say: the cron may queue the install again.
+        self.assertIn("reconciliation cron", log)
+
+    def test_a_failure_still_counts(self):
+        """Only the stop is exempt: a failed playbook is still an attempt."""
+        executor = self._make(ObservabilityAgentsExecutor)
+        executor._alert = MagicMock(spec=ObservabilityAgentsExecutor._alert)
+        asyncio.run(executor.on_failure({}, ["boom"]))
+        self.assertEqual(self.host.metrics_agents_attempts, 1)
+        self.assertEqual(self.host.metrics_agents_state, "failed")
+
+
+class TestCentralExecutor(ObservabilityExecutorCase):
+
+    def test_extra_vars_carry_retention_and_the_account_list(self):
+        extra = self._make(ObservabilityCentralExecutor).get_extra_vars()
+        self.assertEqual(extra["ic_retention_days"], 45)
+        cfg = yaml.safe_load(extra["ic_vmauth_config"])
+        # The vmauth user list IS the access-control list: a user in it
+        # writes and reads its own series and nothing else. The account
+        # is a username.
+        account = self._user(cfg, "acct_test01")
+        self.assertIsNotNone(
+            account, "the account is not a vmauth user, so it cannot write",
+        )
+        # And the label it forces on writes is derived from that user, so
+        # a client cannot write as anyone else.
+        write = self._route(account, _ACCOUNT_WRITE_PATH)
+        self.assertIn("extra_label=ic_account=acct_test01", write["url_prefix"])
+
+    def test_the_operator_credential_is_separate_and_generated(self):
+        """It deletes any account's series, so it must never be an account's own.
+
+        Reusing the account credential here would hand every host a key
+        to every account's series — the exact opposite of what the split
+        exists for.
+        """
+        extra = self._make(ObservabilityCentralExecutor).get_extra_vars()
+        cfg = yaml.safe_load(extra["ic_vmauth_config"])
+        operator = self._user(cfg, "operator")
+        self.assertIsNotNone(operator)
+        self.assertTrue(operator["password"])
+        self.assertNotEqual(operator["password"], "shared-secret")
+        self.assertNotEqual(
+            operator["password"], self._user(cfg, "acct_test01")["password"],
+        )
+        # The operator owns the deletion and nothing else (17-nov-2026).
+        paths = {sp for entry in operator["url_map"] for sp in entry["src_paths"]}
+        self.assertEqual(paths, {_OPERATOR_DELETE_PATH})
+
+    def test_the_probe_reads_as_the_panels_own_account(self):
+        """The deployment and the sync prove the gateway with ``/r/``.
+
+        Not with the operator, which has no read since 17-nov-2026: the
+        credential handed to the playbook is one the list grants a read.
+        """
+        for cls in (ObservabilityCentralExecutor, MetricsAclSyncExecutor):
+            with self.subTest(job=cls._job_type):
+                extra = self._make(cls).get_extra_vars()
+                cfg = yaml.safe_load(extra["ic_vmauth_config"])
+                self.assertNotIn("ic_operator_plain", extra)
+                self.assertEqual(extra["ic_probe_user"], "acct_test01")
+                account = self._user(cfg, "acct_test01")
+                self.assertEqual(extra["ic_probe_plain"], account["password"])
+                self.assertIn(
+                    _ACCOUNT_READ_PATHS,
+                    [sp for e in account["url_map"] for sp in e["src_paths"]],
+                )
+
+    def test_only_the_operator_has_a_cap_on_requests_in_flight(self):
+        """vmauth counts per user and answers 429 at once (Fable A1, 12-nov-2026).
+
+        An account's user is shared by its agents' writes and its reads:
+        a cap there refused writes while reads ran.
+        """
+        extra = self._make(ObservabilityCentralExecutor).get_extra_vars()
+        cfg = yaml.safe_load(extra["ic_vmauth_config"])
+        self.assertEqual(
+            self._user(cfg, "operator")["max_concurrent_requests"], 16,
+        )
+        self.assertEqual(_OPERATOR_MAX_CONCURRENT, 16)
+        for user in cfg["users"]:
+            if user["username"] != "operator":
+                self.assertNotIn("max_concurrent_requests", user)
+
+    def test_retention_falls_back_to_ninety_days(self):
+        """Zero would tell VictoriaMetrics to keep nothing."""
+        self.settings.metrics_retention_days = 0
+        extra = self._make(ObservabilityCentralExecutor).get_extra_vars()
+        self.assertEqual(extra["ic_retention_days"], 90)
+
+    def test_every_data_route_forces_the_account(self):
+        """The label pinning is what the whole boundary rests on.
+
+        Measured against real VM + Loki (lab, 2026-08-10): a client that
+        sends its own extra_label / extra_filters / X-Scope-OrgID has it
+        dropped for colliding with the one the route forces, so it cannot
+        write or read as anyone else. Pinned here so a config change that
+        drops the forcing fails loudly.
+        """
+        extra = self._make(ObservabilityCentralExecutor).get_extra_vars()
+        cfg = yaml.safe_load(extra["ic_vmauth_config"])
+        account = self._user(cfg, "acct_test01")
+        self.assertIn(
+            "extra_label=ic_account=acct_test01",
+            self._route(account, _ACCOUNT_WRITE_PATH)["url_prefix"],
+        )
+        self.assertIn(
+            "acct_test01",
+            self._route(account, _ACCOUNT_READ_PATHS)["url_prefix"],
+        )
+        for logs in (_ACCOUNT_LOG_WRITE_PATH, _ACCOUNT_LOG_READ_PATHS):
+            self.assertIn(
+                "X-Scope-OrgID: acct_test01",
+                self._route(account, logs)["headers"],
+            )
+
+    def test_no_unauthorized_user_so_missing_credentials_are_401(self):
+        """That section's ABSENCE is what makes a credential-less request
+        401 rather than proxied — measured, where adding it turned the
+        401 into a 503 against a dead backend."""
+        extra = self._make(ObservabilityCentralExecutor).get_extra_vars()
+        cfg = yaml.safe_load(extra["ic_vmauth_config"])
+        self.assertNotIn("unauthorized_user", cfg)
+
+    def test_every_route_uses_a_bare_root_prefix_and_drops_the_segment(self):
+        """The path shape that avoids the trailing-slash 404 Loki gives.
+
+        vmauth APPENDS the client's remaining path to url_prefix, so a
+        fixed-path prefix duplicates the path or leaves a slash Loki
+        rejects. Every route must therefore point at the backend root and
+        drop the one-segment account prefix.
+        """
+        extra = self._make(ObservabilityCentralExecutor).get_extra_vars()
+        cfg = yaml.safe_load(extra["ic_vmauth_config"])
+        for user in cfg["users"]:
+            for entry in user["url_map"]:
+                where = f"{user['username']} {entry['src_paths']}"
+                self.assertEqual(
+                    entry.get("drop_src_path_prefix_parts"), 1,
+                    f"{where} must drop the account segment",
+                )
+                root = entry["url_prefix"].split("?", 1)[0]
+                self.assertTrue(
+                    root.endswith("/") and root.count("/") == 3,
+                    f"{where} url_prefix is not a bare root: {root}",
+                )
+
+    def test_a_backend_that_never_answered_is_not_a_success(self):
+        """rc=0 only means Ansible finished, not that the stack works.
+
+        The playbook's own health probe is the real verdict; without
+        this check a central whose container crash-looped would report
+        as deployed and every later query would fail instead.
+        """
+        executor = self._make(ObservabilityCentralExecutor)
+        executor._facts = {"ic_central_up": "False"}
+        errors = executor.parse_results(
+            {executor._playbook: {"exit_status": 0}},
+        )
+        self.assertTrue(errors)
+
+    def test_a_healthy_backend_is_a_success(self):
+        executor = self._make(ObservabilityCentralExecutor)
+        executor._facts = {"ic_central_up": "True"}
+        self.assertEqual(
+            executor.parse_results({executor._playbook: {"exit_status": 0}}),
+            [],
+        )
+
+    def test_a_failed_playbook_short_circuits(self):
+        executor = self._make(ObservabilityCentralExecutor)
+        errors = executor.parse_results(
+            {executor._playbook: {"exit_status": 1}},
+        )
+        self.assertEqual(len(errors), 1)
+
+
+class TestAccountRoutesNameTheirEndpoints(ObservabilityExecutorCase):
+    """An account reaches the endpoints it uses, and nothing else.
+
+    Measured (lab, 2026-09-27) against the ``/r/.*`` these replaced: an
+    account wrote series labelled as ANOTHER account through
+    ``/r/api/v1/import/prometheus`` and that account saw them as its own;
+    it also created snapshots and forced merges. vmauth matches
+    ``src_paths`` against the whole path, so ``re.fullmatch`` here is
+    the same question vmauth asks.
+    """
+
+    #: What the agents and the panel use: since 1.0.230 the panel's reads
+    #: alone, ``query`` and ``query_range`` (plan #84, C1.6).
+    _ALLOWED = (
+        "/w/api/v1/write",
+        "/r/api/v1/query",
+        "/r/api/v1/query_range",
+        "/lw/loki/api/v1/push",
+        "/lr/loki/api/v1/query",
+        "/lr/loki/api/v1/query_range",
+    )
+
+    #: Writes down a read route, deletions, and the backends' admin.
+    _REFUSED = (
+        "/r/api/v1/import/prometheus",
+        "/r/api/v1/import",
+        "/r/api/v1/write",
+        "/r/api/v1/admin/tsdb/delete_series",
+        "/r/api/v1/export",
+        "/r/snapshot/create",
+        "/r/snapshot/delete_all",
+        "/r/internal/force_merge",
+        "/r/internal/resetRollupResultCache",
+        "/r/flags",
+        "/r/metrics",
+        "/r/api/v1/label/a/b/values",
+        "/r/api/v1/query/../../api/v1/import/prometheus",
+        "/w/api/v1/import/prometheus",
+        "/w/api/v1/admin/tsdb/delete_series",
+        "/w/api/v1/write/../import/prometheus",
+        "/w/",
+        "/lw/loki/api/v1/query",
+        "/lr/loki/api/v1/push",
+        "/lr/loki/api/v1/delete",
+        "/lr/flush",
+        "/lr/config",
+        # Grafana's, which nothing uses since 12-nov-2026.
+        "/r/api/v1/query_exemplars",
+        "/r/api/v1/series",
+        "/r/api/v1/labels",
+        "/r/api/v1/label/__name__/values",
+        "/r/api/v1/metadata",
+        "/r/api/v1/rules",
+        "/r/api/v1/status/buildinfo",
+        "/lr/loki/api/v1/labels",
+        "/lr/loki/api/v1/label/job/values",
+        "/lr/loki/api/v1/index/stats",
+    )
+
+    def _account_paths(self):
+        """Return every ``src_paths`` regex of this panel's account."""
+        extra = self._make(ObservabilityCentralExecutor).get_extra_vars()
+        cfg = yaml.safe_load(extra["ic_vmauth_config"])
+        account = self._user(cfg, "acct_test01")
+        return [sp for entry in account["url_map"] for sp in entry["src_paths"]]
+
+    def _reachable(self, path, patterns):
+        """Return True if vmauth would route *path* for this account."""
+        return any(re.fullmatch(p, path) for p in patterns)
+
+    def test_every_endpoint_in_use_is_reachable(self):
+        """Cutting one of these blanks a dashboard or stops an agent."""
+        patterns = self._account_paths()
+        for path in self._ALLOWED:
+            self.assertTrue(
+                self._reachable(path, patterns),
+                f"{path} is in use and no account route serves it",
+            )
+
+    def test_writes_deletions_and_admin_are_not(self):
+        patterns = self._account_paths()
+        for path in self._REFUSED:
+            self.assertFalse(
+                self._reachable(path, patterns),
+                f"an account can reach {path}",
+            )
+
+    def test_no_account_route_is_a_catch_all(self):
+        """A trailing ``.*`` is how the injection route existed."""
+        for pattern in self._account_paths():
+            self.assertNotIn(".*", pattern, pattern)
+
+
+class TestTheOperatorReadsNothing(ObservabilityExecutorCase):
+    """The operator's cross-account read, ``/admin-r/``, is closed (17-nov-2026).
+
+    A panel reads only its own account, through ``/r/``. The operator's
+    one route is series deletion, and the probe of the deployment and the
+    sync reads as the panel's own account instead.
+    """
+
+    #: What the operator's ``/admin-r/`` served until 17-nov-2026, and
+    #: what it never did.
+    _GONE = (
+        "/admin-r/health",
+        "/admin-r/api/v1/query",
+        "/admin-r/api/v1/query_range",
+        "/admin-r/api/v1/import/prometheus",
+        "/admin-r/api/v1/export",
+        "/admin-r/api/v1/admin/tsdb/delete_series",
+        "/admin-r/api/v1/series",
+        "/admin-r/flags",
+    )
+
+    _APPLY_TASKS = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "ansible" / "playbooks" / "tasks" / "vmauth_acl_apply.yml"
+    )
+
+    def _config(self, executor_cls):
+        """Return the parsed vmauth config *executor_cls* would ship."""
+        self.settings._ensure_operator_credential()
+        self.settings.metrics_delete_auth_key = "k" * 43
+        # Recorded as handed in a file, so the deployment keeps it.
+        self.env["ir.config_parameter"].sudo().set_param(
+            _DELETE_KEY_IN_FILE_PARAM, "1",
+        )
+        extra = self._make(executor_cls).get_extra_vars()
+        return yaml.safe_load(extra["ic_vmauth_config"])
+
+    def test_no_user_reaches_admin_r(self):
+        for cls in (ObservabilityCentralExecutor, MetricsAclSyncExecutor):
+            cfg = self._config(cls)
+            patterns = [
+                sp for user in cfg["users"]
+                for entry in user["url_map"] for sp in entry["src_paths"]
+            ]
+            for path in self._GONE:
+                with self.subTest(job=cls._job_type, path=path):
+                    self.assertFalse(
+                        any(re.fullmatch(p, path) for p in patterns),
+                    )
+
+    def test_the_operator_keeps_series_deletion_alone(self):
+        for cls in (ObservabilityCentralExecutor, MetricsAclSyncExecutor):
+            with self.subTest(job=cls._job_type):
+                operator = self._user(self._config(cls), "operator")
+                self.assertEqual(
+                    [sp for e in operator["url_map"] for sp in e["src_paths"]],
+                    [_OPERATOR_DELETE_PATH],
+                )
+                self.assertTrue(
+                    self._route(operator, _OPERATOR_DELETE_PATH)["url_prefix"]
+                    .endswith("?authKey=" + "k" * 43),
+                )
+
+    def test_the_probe_reads_through_the_accounts_route(self):
+        """The task's path is one the account's read route serves."""
+        tasks = yaml.safe_load(self._APPLY_TASKS.read_text())
+        probe = next(t for t in tasks if t["name"] == "Wait for vmauth to answer")
+        uri = probe["ansible.builtin.uri"]
+        path = uri["url"].split("}}", 1)[1].split("?", 1)[0]
+        self.assertEqual(path, "/r/api/v1/query")
+        self.assertTrue(re.fullmatch(_ACCOUNT_READ_PATHS, path))
+        self.assertNotIn("admin-r", yaml.safe_dump(probe))
+        self.assertEqual(uri["url_username"], "{{ ic_probe_user }}")
+        self.assertEqual(uri["url_password"], "{{ ic_probe_plain }}")
+        self.assertTrue(probe["no_log"])
+
+
+class TestSeriesDeletionKey(ObservabilityExecutorCase):
+    """Only the operator's deletion route may carry the deletion key."""
+
+    def _config(self, executor_cls=ObservabilityCentralExecutor):
+        """Return ``(extra_vars, parsed vmauth config)`` for *executor_cls*."""
+        extra = self._make(executor_cls).get_extra_vars()
+        return extra, yaml.safe_load(extra["ic_vmauth_config"])
+
+    def test_the_deployment_mints_it_and_hands_it_to_the_backend(self):
+        extra, _cfg = self._config()
+        self.assertTrue(extra["ic_delete_auth_key"])
+
+    def test_the_job_reads_the_key_it_handed_to_the_backend(self):
+        """The rest of the run sees the key it minted, from its own cache."""
+        self.settings.metrics_delete_auth_key = False
+        extra, _cfg = self._config()
+        self.assertEqual(
+            self.settings.metrics_delete_auth_key, extra["ic_delete_auth_key"],
+        )
+
+    def test_a_redeployment_keeps_the_recorded_key(self):
+        """Rotating it on every deployment would buy nothing."""
+        self.settings.metrics_delete_auth_key = "k" * 43
+        self.env["ir.config_parameter"].sudo().set_param(
+            _DELETE_KEY_IN_FILE_PARAM, "1",
+        )
+        extra, _cfg = self._config()
+        self.assertEqual(extra["ic_delete_auth_key"], "k" * 43)
+
+    def test_a_key_the_backend_got_as_a_flag_is_replaced_once(self):
+        """Before 12-nov-2026 it was in the container's command.
+
+        ``docker inspect`` showed it to the docker group, so the first
+        deployment that hands it in a file mints a new one; the next
+        keeps it.
+        """
+        self.settings.metrics_delete_auth_key = "k" * 43
+        self.env["ir.config_parameter"].sudo().set_param(
+            _DELETE_KEY_IN_FILE_PARAM, False,
+        )
+        first, _cfg = self._config()
+        self.assertTrue(first["ic_delete_auth_key"])
+        self.assertNotEqual(first["ic_delete_auth_key"], "k" * 43)
+        self.assertEqual(
+            self.settings.metrics_delete_auth_key, first["ic_delete_auth_key"],
+        )
+        again, _cfg = self._config()
+        self.assertEqual(again["ic_delete_auth_key"], first["ic_delete_auth_key"])
+
+    def test_the_account_sync_never_replaces_it(self):
+        """Only the deployment writes the file the backend reads."""
+        self.settings.metrics_delete_auth_key = "k" * 43
+        self.settings._ensure_operator_credential()
+        self.env["ir.config_parameter"].sudo().set_param(
+            _DELETE_KEY_IN_FILE_PARAM, False,
+        )
+        _extra, cfg = self._config(MetricsAclSyncExecutor)
+        route = self._route(self._user(cfg, "operator"), _OPERATOR_DELETE_PATH)
+        self.assertTrue(route["url_prefix"].endswith("?authKey=" + "k" * 43))
+
+    def test_a_failed_deployment_leaves_the_key_for_the_next_one(self):
+        """Minted before the playbook, so a failure cannot take it back.
+
+        The backend may not have it yet, and purges fail until a good
+        deployment starts it — with this same key, not a new one.
+        """
+        self.settings.metrics_delete_auth_key = False
+        executor = self._make(ObservabilityCentralExecutor)
+        first = executor.get_extra_vars()["ic_delete_auth_key"]
+        executor._alert = MagicMock(spec=ObservabilityCentralExecutor._alert)
+        asyncio.run(executor.on_failure({}, ["boom"]))
+        again, _cfg = self._config()
+        self.assertEqual(again["ic_delete_auth_key"], first)
+
+    def test_the_operator_route_adds_it_and_reaches_only_delete_series(self):
+        extra, cfg = self._config()
+        route = self._route(self._user(cfg, "operator"), _OPERATOR_DELETE_PATH)
+        self.assertEqual(
+            route["url_prefix"],
+            f"http://victoriametrics:8428/?authKey={extra['ic_delete_auth_key']}",
+        )
+        self.assertFalse(
+            re.fullmatch(_OPERATOR_DELETE_PATH, "/admin-d/snapshot/create"),
+        )
+
+    def test_no_account_ever_sees_it(self):
+        """With it, an account could delete any series of any account."""
+        extra, cfg = self._config()
+        key = extra["ic_delete_auth_key"]
+        for user in cfg["users"]:
+            if user["username"] == "operator":
+                continue
+            self.assertNotIn(key, yaml.safe_dump(user), user["username"])
+
+    def test_the_account_sync_keeps_the_route(self):
+        """The sync REPLACES the document; dropping it would lose the route."""
+        self.settings.metrics_delete_auth_key = "k" * 43
+        self.settings._ensure_operator_credential()
+        _extra, cfg = self._config(MetricsAclSyncExecutor)
+        route = self._route(self._user(cfg, "operator"), _OPERATOR_DELETE_PATH)
+        self.assertTrue(route["url_prefix"].endswith("?authKey=" + "k" * 43))
+
+    def test_the_account_sync_never_mints_it(self):
+        """The backend only knows a key a deployment restarted it with.
+
+        A route carrying a key VictoriaMetrics was never given answers
+        401, so a sync on a central deployed before deletions existed
+        leaves the route out rather than inventing one. Deletion being the
+        operator's only route, the operator is left out with it: vmauth
+        refuses a user without a route.
+        """
+        self.settings.metrics_delete_auth_key = False
+        self.settings._ensure_operator_credential()
+        _extra, cfg = self._config(MetricsAclSyncExecutor)
+        self.assertIsNone(self._user(cfg, "operator"))
+        self.assertFalse(self.settings.metrics_delete_auth_key)
+        for user in cfg["users"]:
+            self.assertTrue(user["url_map"], user["username"])
+
+
+class TestTheListInForceIsAnnounced(ObservabilityExecutorCase):
+    """Whoever hands accounts out hears when the gateway accepts them.
+
+    Until then a granted account sat unused: a layer only learned
+    of it at its next reconciliation, half an hour later, so a new
+    panel showed no dashboards in the meantime.
+    """
+
+    def _record(self, cls):
+        """Record the list *cls* would ship, watching the announcement.
+
+        :param cls: the executor class that records it.
+        :return: the patched ``_metrics_accounts_shipped``.
+        """
+        executor = self._make(cls)
+        executor._accounts_for_deployment()
+        with patch.object(
+            type(self.settings), "_metrics_accounts_shipped", autospec=True,
+        ) as shipped:
+            executor._record_shipped_accounts()
+        return shipped
+
+    def test_the_sync_announces_the_list(self):
+        """The account sync announces the list once it is recorded."""
+        shipped = self._record(MetricsAclSyncExecutor)
+        shipped.assert_called_once_with(self.settings)
+        self.assertEqual(self.settings.metrics_accounts_deployed, "acct_test01")
+
+    def test_the_deployment_announces_it_too(self):
+        """The full deployment writes the same list, so it announces too."""
+        shipped = self._record(ObservabilityCentralExecutor)
+        shipped.assert_called_once_with(self.settings)
+
+    def test_a_run_that_recorded_nothing_announces_nothing(self):
+        """No list recorded, nothing granted: nobody is told otherwise."""
+        executor = self._make(MetricsAclSyncExecutor)
+        with patch.object(
+            type(self.settings), "_metrics_accounts_shipped", autospec=True,
+        ) as shipped:
+            executor._record_shipped_accounts()
+        shipped.assert_not_called()
+
+
+class TestLogCollectorEndpoint(ObservabilityExecutorCase):
+    """Where access logs are pushed is derived, not configured twice."""
+
+    def _url(self):
+        return self._make(
+            ObservabilityAgentsExecutor,
+        )._logs_write_url(self.settings)
+
+    def test_it_is_derived_from_the_metrics_endpoint(self):
+        """One field fewer to fill in is one field fewer to get wrong.
+
+        Both endpoints live under the account prefix vmauth strips: the
+        write path is ``/w/api/v1/write`` and the log path is the sibling
+        ``/lw/loki/api/v1/push``.
+        """
+        self.settings.metrics_remote_write_url = (
+            "https://m.example.com/w/api/v1/write"
+        )
+        self.assertEqual(
+            self._url(), "https://m.example.com/lw/loki/api/v1/push",
+        )
+
+    def test_a_trailing_slash_still_works(self):
+        self.settings.metrics_remote_write_url = (
+            "https://m.example.com/w/api/v1/write/"
+        )
+        self.assertEqual(
+            self._url(), "https://m.example.com/lw/loki/api/v1/push",
+        )
+
+    def test_a_foreign_endpoint_disables_collection(self):
+        """A self-hosted operator may point at their own backend.
+
+        Guessing a URL there would start a collector that retries
+        forever against something that does not exist — worse than not
+        collecting, because it looks like a fault. A backend that is not
+        ours does not carry the ``/w/`` account prefix.
+        """
+        self.settings.metrics_remote_write_url = (
+            "https://vm.example.com/api/v1/write"
+        )
+        self.assertEqual(self._url(), "")
+
+    def test_the_collector_is_not_deployed_without_an_endpoint(self):
+        self.settings.metrics_remote_write_url = (
+            "https://vm.example.com/api/v1/write"
+        )
+        extra = self._make(ObservabilityAgentsExecutor).get_extra_vars()
+        self.assertEqual(extra["ic_logs_write_url"], "")
+
+
+class TestFirstDeploymentIsUsable(ObservabilityExecutorCase):
+    """A central that comes up accepting no writes is the worst outcome.
+
+    It reports healthy from every angle — containers up, health endpoint
+    answering — while silently refusing every agent. The account file is
+    built from state that must therefore already exist when the playbook
+    runs, not be created after it succeeds.
+    """
+
+    def test_the_account_exists_before_the_account_file_is_built(self):
+        """Regression: the credential used to be minted in on_success.
+
+        The first deployment then wrote an empty account file, so the
+        central had to be deployed a second time before it would accept
+        anything — with nothing in the job log to say so.
+        """
+        self.settings.write({
+            "metrics_account": False,
+            "metrics_remote_write_token": False,
+        })
+        extra = self._make(ObservabilityCentralExecutor).get_extra_vars()
+        cfg = yaml.safe_load(extra["ic_vmauth_config"])
+        real_accounts = [
+            u for u in cfg["users"] if u["username"] != "operator"
+        ]
+        self.assertTrue(
+            real_accounts,
+            "the central would have come up accepting no writes at all",
+        )
+        self.assertTrue(self.settings.metrics_account)
+
+
+class TestTheCentralsSecretsOutliveTheJob(JobEndAssertions, ObservabilityExecutorCase):
+    """What a run mints must still be there once the runner ends the job.
+
+    ``get_extra_vars`` runs in the job's asynchronous phase. Core 1.0.135
+    minted the deletion key there with a plain write: VictoriaMetrics
+    started with it and the database never received it. Every secret
+    below is checked by SQL after the same ``env.clear()`` the runner
+    does, which is the check that release was missing.
+    """
+
+    def setUp(self):
+        """Start from a fresh install: nothing minted yet."""
+        super().setUp()
+        # A fresh install: nothing minted yet.
+        self.settings.write({
+            "metrics_account": False,
+            "metrics_remote_write_token": False,
+            "metrics_operator_token": False,
+            "metrics_delete_auth_key": False,
+        })
+
+    def _assert_saved(self, extra):
+        """Every credential the playbook received is the one in the database."""
+        cfg = yaml.safe_load(extra["ic_vmauth_config"])
+        users = {
+            u["username"]: u["password"]
+            for u in cfg["users"]
+            if u["username"] != "operator"
+        }
+        accounts = [user for user in users if not user.endswith("-agent")]
+        (account,) = accounts
+        self.assertTrue(account)
+        self.assertEqual(self.stored(self.settings, "metrics_account"), account)
+        self.assertEqual(
+            self.stored(self.settings, "metrics_remote_write_token"),
+            users[account],
+        )
+        # The agents' user, where this panel mints its credentials.
+        agent = users.get(f"{account}-agent")
+        if agent:
+            self.assertEqual(
+                self.stored(self.settings, "metrics_agent_token"), agent,
+            )
+        # The probe's, which is the account's own.
+        self.assertEqual(extra["ic_probe_plain"], users[account])
+        # The operator's, shipped with the deletion key only.
+        self.assertTrue(self.stored(self.settings, "metrics_operator_token"))
+        operator = self._user(cfg, "operator")
+        if operator:
+            self.assertEqual(
+                self.stored(self.settings, "metrics_operator_token"),
+                operator["password"],
+            )
+
+    def test_the_deployment_saves_everything_it_ships(self):
+        """
+        Every secret the deployment hands the playbook is in the database.
+        """
+        extra = self._make(ObservabilityCentralExecutor).get_extra_vars()
+        self.end_job()
+        self._assert_saved(extra)
+        self.assertEqual(
+            self.stored(self.settings, "metrics_delete_auth_key"),
+            extra["ic_delete_auth_key"],
+        )
+
+    def test_the_account_sync_saves_everything_it_ships(self):
+        """The sync saves what it mints, and never mints the deletion key."""
+        extra = self._make(MetricsAclSyncExecutor).get_extra_vars()
+        self.end_job()
+        self._assert_saved(extra)
+        self.assertFalse(self.stored(self.settings, "metrics_delete_auth_key"))
+
+    def test_the_job_reads_what_it_minted_without_a_query(self):
+        """The rest of the run resolves the panel's own account from the cache."""
+        self._make(ObservabilityCentralExecutor).get_extra_vars()
+        with self.assertQueryCount(0, flush=False):
+            account = self.settings.metrics_account
+        self.end_job()
+        self.assertEqual(account, self.stored(self.settings, "metrics_account"))

@@ -1,0 +1,193 @@
+<templates>
+
+    <t t-name="incubacloud.HostsDashboard">
+        <div class="rl-page ic-hosts-dashboard">
+
+            <!-- Header -->
+            <div class="rl-phead">
+                <div class="rl-htext">
+                    <h1 class="rl-ptitle">Hosts</h1>
+                    <p class="rl-psub">
+                        <t t-esc="state.total"/> host<t t-if="state.total !== 1">s</t>
+                    </p>
+                </div>
+                <div class="rl-pactions">
+                    <button class="rl-btn rl-btn-primary" t-on-click="onAddHost">
+                        <t t-out="env.icon('plus', 15)"/> Add Host
+                    </button>
+                </div>
+            </div>
+
+
+            <TruncationBanner truncated="state.truncated"
+                              total="state.total"
+                              limit="state.limit"
+                              label="'hosts'"/>
+
+            <!-- Loading: a skeleton, so a slow fetch never looks like "empty". -->
+            <t t-if="state.loading">
+                <div class="rl-grid rl-grid-2 ic-hosts-grid">
+                    <t t-foreach="[1, 2]" t-as="i" t-key="i">
+                        <div class="rl-card rl-card-pad ic-skeleton-card" aria-hidden="true">
+                            <div class="ic-skeleton-line ic-skeleton-title"/>
+                            <div class="ic-skeleton-line"/>
+                            <div class="ic-skeleton-line ic-skeleton-short"/>
+                        </div>
+                    </t>
+                </div>
+                <span class="ic-visually-hidden" role="status">Loading hosts…</span>
+            </t>
+
+            <!-- Error: say so and offer a way out, never a silent empty list. -->
+            <t t-elif="state.error">
+                <div class="rl-stub" role="alert">
+                    <span class="rl-si"><t t-out="env.icon('alert', 46)"/></span>
+                    <h3>Could not load hosts</h3>
+                    <p t-esc="state.error"/>
+                    <button class="rl-btn rl-btn-primary" style="margin-top: 14px;"
+                            t-on-click="() => this.loadHosts()">
+                        Retry
+                    </button>
+                </div>
+            </t>
+
+            <!-- Empty state -->
+            <t t-elif="state.visible_hosts.length === 0">
+                <div class="rl-stub">
+                    <span class="rl-si"><t t-out="env.icon('hosts', 46)"/></span>
+                    <h3>No hosts configured</h3>
+                    <p>Add a server to start deploying Odoo instances.</p>
+                </div>
+            </t>
+
+            <!-- Grid of host cards -->
+            <t t-else="">
+                <div class="rl-grid rl-grid-2 ic-hosts-grid">
+                    <t t-foreach="state.visible_hosts" t-as="host" t-key="host.id">
+                        <div class="rl-card rl-card-pad ic-host-card click"
+                             t-att-class="'status-' + host.status"
+                             t-on-click="() => this.onViewHost(host)">
+
+                            <!-- Header: name + status badge -->
+                            <div class="ic-host-card-head">
+                                <span class="rl-rname" t-esc="host.name"/>
+                                <span class="rl-rspacer"/>
+                                <span t-att-class="'rl-sb ' + host.status">
+                                    <span class="rl-d"/><t t-esc="statusLabel(host.status)"/>
+                                </span>
+                            </div>
+
+                            <!-- Meta: ip · cores · ram · region -->
+                            <div class="rl-rmeta ic-host-card-meta">
+                                <t t-if="host.ip_address"><code t-esc="host.ip_address"/></t>
+                                <t t-if="hasMetrics(host)">
+                                    <t t-if="host.ip_address"> · </t><t t-esc="coresLabel(host.cpu_cores)"/>
+                                    · <t t-esc="formatRam(host.ram_total_gb)"/> RAM
+                                </t>
+                                <t t-if="host.region"> · <t t-esc="host.region"/></t>
+                            </div>
+
+                            <!-- Tags -->
+                            <t t-if="host.tags and host.tags.length">
+                                <div class="rl-tag-list">
+                                    <t t-foreach="host.tags" t-as="tag" t-key="tag.id">
+                                        <span class="rl-tag-badge" t-att-style="tagBadgeStyle(tag)">
+                                            <span class="ic-tag-dot" t-att-style="tagDotStyle(tag)"/>
+                                            <t t-esc="tag.name"/>
+                                        </span>
+                                    </t>
+                                </div>
+                            </t>
+
+                            <!-- Metric bars: live CPU and RAM, then Disk. The
+                                 allocation (the instances' limits) is the
+                                 secondary line, never the bar. -->
+                            <t t-if="hasMetrics(host)">
+                                <div class="ic-host-mbars">
+                                    <t t-if="hasLiveUsage(host)">
+                                        <div class="rl-mbar ic-mbar-cpu">
+                                            <div class="rl-mbar-top">
+                                                <span>CPU</span>
+                                                <span><t t-esc="pct(host.cpu_usage)"/>%</span>
+                                            </div>
+                                            <div class="rl-mbar-track">
+                                                <div t-att-class="'rl-mbar-fill ' + mbarClass(pct(host.cpu_usage))"
+                                                     t-att-style="'width:' + pct(host.cpu_usage) + '%'"/>
+                                            </div>
+                                            <t t-if="cpuExtra(host)">
+                                                <div class="ic-mbar-extra" t-esc="cpuExtra(host)"/>
+                                            </t>
+                                        </div>
+                                        <div class="rl-mbar ic-mbar-ram">
+                                            <div class="rl-mbar-top">
+                                                <span>RAM</span>
+                                                <span><t t-esc="pct(host.ram_usage)"/>%</span>
+                                            </div>
+                                            <div class="rl-mbar-track">
+                                                <div t-att-class="'rl-mbar-fill ' + mbarClass(pct(host.ram_usage))"
+                                                     t-att-style="'width:' + pct(host.ram_usage) + '%'"/>
+                                            </div>
+                                            <t t-if="ramExtra(host)">
+                                                <div class="ic-mbar-extra" t-esc="ramExtra(host)"/>
+                                            </t>
+                                        </div>
+                                    </t>
+                                    <!-- No live reading: say why, with no bar,
+                                         so nothing reads as an idle host. -->
+                                    <div t-else="" class="rl-mbar ic-usage-none">
+                                        <div class="rl-mbar-top">
+                                            <span>CPU / RAM</span>
+                                            <span>No data</span>
+                                        </div>
+                                        <div class="ic-usage-reason">
+                                            <t t-out="env.icon(usageIcon(host), 12)"/>
+                                            <span t-esc="usageMissing(host)"/>
+                                        </div>
+                                        <t t-if="allocatedText(host)">
+                                            <div class="ic-mbar-extra" t-esc="allocatedText(host)"/>
+                                        </t>
+                                    </div>
+                                    <div class="rl-mbar">
+                                        <div class="rl-mbar-top">
+                                            <span>Disk</span>
+                                            <span><t t-esc="host.disk"/>%</span>
+                                        </div>
+                                        <div class="rl-mbar-track">
+                                            <div t-att-class="'rl-mbar-fill ' + mbarClass(host.disk)"
+                                                 t-att-style="'width:' + host.disk + '%'"/>
+                                        </div>
+                                        <t t-if="diskExtra(host)">
+                                            <div class="ic-mbar-extra" t-esc="diskExtra(host)"/>
+                                        </t>
+                                    </div>
+                                </div>
+                            </t>
+                            <t t-else="">
+                                <div class="ic-metrics-placeholder">
+                                    No specs yet — run Check from the host page
+                                </div>
+                            </t>
+
+                            <!-- Footer: instance count · SSH trust · last probed -->
+                            <div class="rl-rmeta ic-host-card-foot">
+                                <span><t t-esc="host.instance_count"/> instance<t t-if="host.instance_count !== 1">s</t></span>
+                                <t t-if="host.has_known_hosts_key">
+                                    <span class="ic-ssh-ok"> · SSH ✓</span>
+                                </t>
+                                <t t-else="">
+                                    <span class="ic-ssh-untrusted"> · SSH untrusted</span>
+                                </t>
+                                <t t-if="host.last_probed">
+                                    <span> · <t t-esc="timeAgo(host.last_probed)"/></span>
+                                </t>
+                            </div>
+
+                        </div>
+                    </t>
+                </div>
+            </t>
+
+        </div>
+    </t>
+
+</templates>

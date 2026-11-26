@@ -1,0 +1,167 @@
+# Deploy your first instance
+
+This guide walks you through deploying your first Odoo instance:
+picking a host, a Postgres version, the modules, and watching the deployment
+log in real time.
+
+!!! info "Prerequisites"
+    - A project ([create one](first-project.md)).
+    - A host: either [your own VPS](../hosts/connect.md) or
+      [one ordered through the platform](../hosts/hire.md).
+    - For production, a [backup destination](../backups/index.md#backup-destinations).
+
+!!! warning "Before you create the first instance"
+    - **Production comes first.** A staging is a copy of production: until the
+      project has a production instance, the staging section's **+** stays
+      disabled. Deploy production, then use **Clone to Staging**, next to it
+      in the project's side menu, for a staging with production's data.
+    - **Production needs a backup destination.** Deploying one without any is
+      refused (*No backup backend configured for this instance*). Register a
+      destination first ([Backups](../backups/index.md#backup-destinations))
+      and choose it on the instance, on its project, or for every production
+      instance in **Settings → General → Default backup destination**.
+
+## 1. Open the project and press **+**
+
+In the project's side menu, press **+** next to **Production**. The deployment
+form opens on one page, in sections named as the instance's tabs: **General**,
+**Database**, **Networking**, **Email**, **Repos**, **Dependencies**,
+**Resources** and **Backups** (**Email** and **Backups** on a production only).
+**Database**, **Email**, **Dependencies** and **Resources** start folded under
+**Advanced**: their defaults serve most instances, and a click unfolds them.
+The same fields are on the instance's tabs later, so it's worth getting
+comfortable with each one.
+
+## 2. Pick the environment
+
+- **Production** — the customer-facing instance. Re-deploys go through the safe-rebuild
+  flow: if the new image fails its boot test, the previous version keeps serving.
+- **Staging** — a test copy of production: the project needs its production
+  instance first. You can have many. Re-deploys go through the same boot test.
+
+## 3. Pick the host
+
+Select one of your registered hosts. The platform checks capacity automatically
+and prevents over-provisioning. If your hosts are all full, [order a new one](../hosts/hire.md)
+or [connect another](../hosts/connect.md).
+
+## 4. Odoo and Postgres versions
+
+The instance runs its project's Odoo version, which you pick in the project's form
+(**Odoo version**, when you create the project or later under its **General** tab):
+the panel offers 8.0 to 20.0, and a new project starts on the newest one
+(20.0) unless you pick another. The
+deployment form does not ask for it: a new instance takes its project's, and keeps
+it if the project changes later. The version influences which modules are
+available and which Postgres major versions you can pick in the form's
+**Database** section (on an instance saved as a draft, its **Database** tab, under **More**): 12 alone for Odoo 8.0 to 10.0, 12 to 13 for 11.0 and 12.0 (13 by
+default), 12 to 16 for 13.0 and 14.0 (16 by default), 12 to 17 for 15.0 (17 by
+default), 14 to 18 for 16.0 to 19.0 and 16 to 18 for 20.0, with 17 by default on
+the last two ranges.
+
+If your project has a connected repo with `.copier-answers.yml`, we pre-fill the
+project's version from there; you can still pick another in the project's form.
+
+## 5. Pick modules
+
+Either:
+
+- **Pick from the catalog** — the official Odoo modules for the chosen version,
+  plus the OCA modules in our default repo set.
+- **Use your own** — modules from your project's repo. The repo URL was set when you
+  created the project; you can override per-instance under
+  `Settings → Repository`.
+
+Both modes can be mixed. Our deployer composes a Docker image with everything
+you selected.
+
+## 6. Optional: custom domain
+
+Add `app.example.com` (or any domain you control) under **Networking →
+Domains**. Its certificate is *Automatic* by default: on a host your visitors
+reach directly, the deployer requests a Let's Encrypt certificate and wires up
+HTTPS. The other choices are described in
+[Custom domains and certificates](../instances/index.md#custom-domains-and-certificates).
+
+!!! warning "DNS must be in place"
+    For Let's Encrypt, the domain's A or AAAA record must already point to the
+    host's IP **at the moment of deployment**, otherwise the validation fails.
+    Set the DNS first.
+
+If you skip the domain, the platform generates a subdomain under its base domain
+for testing (on the hosted SaaS: `<name>.<your-subdomain>.incubacloud.io`).
+
+## 7. Hit Deploy
+
+A job starts, and the panel says so: *Started: Deploy Instance*. It shows up
+under **Recent activity** on the instance; click it to open the job log in a
+new tab and follow it live. You'll see the steps in order:
+
+1. Build image (1–3 min depending on dependencies).
+2. Start the database and create it.
+3. Bring up the instance.
+
+When the job ends in green, your instance is up.
+
+Every later deploy of the instance is a rebuild, and a rebuild tries the new
+image before it touches the live one:
+
+1. Build the new image.
+2. **Boot test** — copy the database, boot the new image on the copy and run
+   `click-odoo-update` there, then remove the copy. If this fails, the rebuild
+   stops and the instance keeps serving its previous image. See
+   [The boot test](../instances/index.md#the-boot-test) for how long it takes
+   and how much disk it needs.
+3. Update the changed modules in the live database.
+4. Bring up the new image.
+
+See the boot test stop a broken push while production keeps running: [watch the 98-second video](https://youtu.be/E5u5PfTSKeo).
+
+!!! note "Another action already running?"
+    An instance runs one action at a time. If something else is running on it,
+    the deploy is not refused: it waits its turn — the panel says *Queued behind
+    …*, and Recent activity lists it as *Queued · N ahead* — and starts by
+    itself. You can cancel it while it waits. If the action ahead of it fails,
+    the queue waits until you retry that action or dismiss its alert. See
+    [One action at a time](../instances/index.md#one-action-at-a-time).
+
+## Verify it worked
+
+- [x] The job shows `Done` in green.
+- [x] The instance card shows `Running`.
+- [x] Clicking `Open` takes you to the Odoo login.
+- [x] If you set a custom domain, browsing to it shows the same Odoo with HTTPS.
+
+## What happens next
+
+- Check that your production instance's [backups](../backups/index.md) run.
+- Add the rest of your team via `Settings → Users`.
+- Read about [environments](first-project.md#environments) if you'll use stagings.
+
+## Troubleshooting
+
+??? note "Build failed: pip install error"
+    Usually a Python dependency missing for the Odoo version you picked.
+    Check the build log; the failing line tells you which package. Add it
+    to your repo's `requirements.txt` and redeploy.
+
+    Every deploy and rebuild re-reads the `requirements.txt` of each of
+    your repositories that is not pinned to a commit, so a package you
+    add there is installed on the next build without touching the
+    project's dependency list. If that list already has the same package
+    with a different version, the build stops and raises a dependency
+    conflict alert instead — open it and pick which version wins.
+
+??? note "Boot test failed"
+    A migration script in your custom modules raised an error. Check the
+    boot test log section. Fix the migration, push, redeploy.
+    Production stays untouched.
+
+??? note "HTTPS certificate not issued"
+    Re-check DNS resolution: `dig +short app.example.com` should return the
+    host's IP. Let's Encrypt has rate limits — retry after 1 hour if you
+    hit them.
+
+??? note "Instance running but Odoo errors on login"
+    Open `Logs` from the instance detail. Most first-time issues are missing
+    Postgres extensions or wrong Odoo version vs database version.

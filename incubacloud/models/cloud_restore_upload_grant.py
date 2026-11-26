@@ -1,0 +1,753 @@
+"""A one-use door for putting a backup archive on a host.
+
+The panel already holds the credential that opens every host it manages;
+the person restoring usually does not, and on a managed host they are not
+meant to. The old rsync flow ignored that: it printed a command and
+assumed the operator could authenticate, which is true on a machine they
+own and false on ours.
+
+So the platform lends its access instead of sharing it. It installs a key
+the caller holds the private half of, restricted to one directory, one
+command and a deadline:
+
+* ``command="… rrsync -wo -munge -no-del <dir>"`` — rsync's own
+  restricted wrapper, write only, confined to that directory. No shell, no
+  reads, nothing else runs; a link it receives is stored munged, so it
+  leads nowhere, and nothing is deleted. Behind the door's own check
+  (``scripts/restore_door.sh``): one file, ``restore.zip``, written in
+  place, and nothing beside it. Under a file size limit (``ulimit -f``):
+  that file, and so all the door holds, is no larger than the door's
+  share of the host's free disk when it opened (``upload_limit_bytes``,
+  ``restore_space``): what the disks could restore, less what the other
+  open doors of the host may still receive (18-nov-2026).
+* ``restrict`` — no pty, no port or agent forwarding, no user rc.
+* ``expiry-time`` — OpenSSH stops accepting the key by itself, whether or
+  not anything remembers to remove it.
+
+Four things revoke it: the restore that consumes the archive, the daily
+sweep, the operator, and the watch of the open doors, every few minutes
+(``_watch_doors``), a second line behind the key's own bound: a door
+whose directory holds more than its limit, or
+that writes on the instances' disk once it is down to the reserve, is
+closed there and then — every door of a host shares its disk with the
+host's other instances, whoever's they are. The first closes the key and keeps the
+directory, so a failed restore can be retried without a second upload;
+the sweep removes that directory three days later (``USED_GRANT_DAYS``).
+
+The private key is generated for the caller, shown once and never stored.
+Losing it costs a new grant, which is cheap; keeping it would mean the
+panel custodying a credential to its own hosts for no reason.
+
+One door per instance at a time: each one is a directory anybody holding
+its key fills, on the disk the host's instances share. Opening one closes
+the caller's own door of the instance, and is refused while another
+person's is open. And a key opens one door ever: every key that opened
+one is kept (``cloud.restore.upload.key``), when the grants themselves
+are purged.
+"""
+import logging
+import re
+from datetime import timedelta
+
+from odoo import _, api, fields, models
+from odoo.exceptions import UserError
+
+from ..restore_space import STAGING_ROOT
+from ._concurrency import read_committed_cursor
+from .big_integer import BigInteger
+
+_logger = logging.getLogger(__name__)
+
+#: Directory on the host below which every grant gets its own subdirectory:
+#: on the disk a restore lands its archive on (``restore_space``).
+UPLOAD_ROOT = f"{STAGING_ROOT}/incubacloud-restore"
+
+#: Where releases before 1.0.239 put it, in ``/tmp``: only swept now, for
+#: what a door of theirs left (``upload_dir_sweep``).
+LEGACY_UPLOAD_ROOT = "/tmp/incubacloud-restore"
+
+#: The names an uploaded archive may be restored under: one path
+#: component, starting with a letter or a digit — never ``.``, ``..``,
+#: a hidden file or an option — and nothing a shell or a line of the
+#: host's listing could read as something else. The name is the
+#: uploader's, so it is checked where the listing is read and again
+#: where a restore takes the file.
+SAFE_UPLOAD_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+
+#: Where the forced command lives. The job that installs a key resolves
+#: the wrapper to exactly this path first, and refuses to install a key
+#: if it cannot — an unrestricted key is not a fallback.
+RRSYNC = "/usr/bin/rrsync"
+
+#: The door's own check, run before the wrapper (``scripts/restore_door.sh``):
+#: in the doors' root, which only the account the panel connects as can
+#: reach, put there by the job that opens a door.
+DOOR_COMMAND = f"{UPLOAD_ROOT}/.door.sh"
+
+#: The one file a door takes (``restore_door.sh``).
+DOOR_FILENAME = "restore.zip"
+
+#: The shape of what ``_open`` writes, checked again before a job puts
+#: any of it in a command: a token names a directory and a key line, the
+#: public key is written into ``authorized_keys``.
+GRANT_TOKEN = re.compile(r"[0-9a-f]{16}")
+GRANT_PUBLIC_KEY = re.compile(r"ssh-ed25519 [A-Za-z0-9+/]+={0,2}")
+
+#: How long a grant stays usable. Long enough to send tens of gigabytes
+#: over a domestic uplink, short enough that an unused one is gone by the
+#: next working day.
+GRANT_HOURS = 12
+
+#: How long what a consumed grant left on its host stays there: the
+#: archive a failed restore gave back for its retry, or what else was
+#: sent. Three days lets a restore that failed on a Friday be retried on
+#: the Monday; then the daily sweep revokes the grant again, directory
+#: and all (``_gc_grants``), and the host's own daily sweep takes a
+#: directory that job never reached (``upload_dir_sweep``).
+USED_GRANT_DAYS = 3
+
+#: The advisory lock opening a door of an instance takes, next to the
+#: queues' (``cloud.job``): two doors asked for at once are opened one
+#: after the other.
+_DOOR_LOCK_NAMESPACE = 0x0C10D10D
+
+#: The advisory lock the job that measures a door's share of its host's
+#: disk holds while it measures and records it: two doors of one host,
+#: of two instances, are measured one after the other, each counting
+#: what the other may still receive (``GrantRestoreUploadKeyExecutor``).
+HOST_DOORS_LOCK_NAMESPACE = 0x0C10D10E
+
+
+def forced_command(directory, limit_bytes, wrapper=RRSYNC, door=DOOR_COMMAND):
+    """Return the command a door's key is forced to run.
+
+    *door*, which takes one file and nothing beside it, then *wrapper*,
+    confined to *directory*, under a file size limit of *limit_bytes*:
+    the most the door holds. sshd runs it with the account's login shell, whose
+    ``ulimit -f`` counts in blocks of 512 bytes (``sh``, ``dash``) or of
+    1024 (``bash``): the limit is set by ``/bin/bash`` itself, named here,
+    in blocks of 1024 — and were it in POSIX mode, in blocks of 512, half
+    the limit, never more. Past it the kernel stops the write
+    (``SIGXFSZ``). No character of the line needs quoting but the two
+    single quotes around what bash runs: the directory is the panel's
+    own, ``/var/tmp/incubacloud-restore/<16 hex digits>``.
+
+    :param str directory: the door's directory
+    :param int limit_bytes: the most the door may hold
+    :param str wrapper: the restricted rsync
+    :param str door: the door's check (``scripts/restore_door.sh``)
+    :rtype: str
+    """
+    blocks = max(1, int(limit_bytes) // 1024)
+    return (
+        f"exec /bin/bash -c 'ulimit -f {blocks}"
+        f" && exec /bin/bash {door} receive"
+        f" {wrapper} -wo -munge -no-del {directory}'"
+    )
+
+
+class CloudRestoreUploadKey(models.Model):
+    """A public key that opened an upload door, kept so it never opens another.
+
+    A door's grant is purged a month after it closed; the key it held
+    is not, or a key used once would open a door again after that. Its
+    fingerprint is unique in the database, so two doors asked for at
+    once with one key cannot both open: the second insert waits for the
+    first and inserts nothing (``_claim``). Written by the panel alone,
+    read by nobody.
+    """
+
+    _name = "cloud.restore.upload.key"
+    _description = "Public key that opened an upload door"
+
+    _fingerprint_uniq = models.Constraint(
+        "unique (fingerprint)",
+        "That key already opened an upload door: generate a new one for "
+        "each upload.",
+    )
+
+    fingerprint = fields.Char(required=True, readonly=True)
+
+    @api.model
+    def _claim(self, fingerprint):
+        """Record that *fingerprint* opens a door, or refuse if it did.
+
+        One ``INSERT … ON CONFLICT DO NOTHING``: a key recorded before
+        inserts nothing, and one another transaction is recording waits
+        for it — nothing when it commits, a serialization failure Odoo
+        retries the request on when it was committed after this
+        transaction's snapshot.
+
+        :param str fingerprint: ``SHA256:…`` of the key
+        :raises UserError: when the key already opened one
+        """
+        self.env.cr.execute(
+            "INSERT INTO cloud_restore_upload_key"
+            " (fingerprint, create_uid, write_uid, create_date, write_date)"
+            " VALUES (%s, %s, %s, now() AT TIME ZONE 'UTC',"
+            " now() AT TIME ZONE 'UTC')"
+            " ON CONFLICT (fingerprint) DO NOTHING RETURNING id",
+            (fingerprint, self.env.uid, self.env.uid),
+        )
+        if not self.env.cr.fetchone():
+            raise UserError(_(
+                "That key already opened an upload door: generate a new one "
+                "for each upload."
+            ))
+
+
+class CloudRestoreUploadGrant(models.Model):
+    _name = "cloud.restore.upload.grant"
+    _description = "Temporary SSH access to upload one restore archive"
+    _order = "id desc"
+
+    _token_uniq = models.Constraint(
+        "unique (token)",
+        "Grant token must be unique.",
+    )
+
+    instance_id = fields.Many2one(
+        comodel_name="cloud.instance",
+        required=True,
+        ondelete="cascade",
+        index=True,
+    )
+    host_id = fields.Many2one(
+        comodel_name="cloud.host",
+        required=True,
+        ondelete="cascade",
+        index=True,
+    )
+    token = fields.Char(
+        required=True,
+        index=True,
+        copy=False,
+        help="Names the directory on the host and the key line that "
+             "writes into it.",
+    )
+    public_key = fields.Char(
+        required=True,
+        help="The half installed on the host. The private half is shown "
+             "to the caller once and never stored.",
+    )
+    fingerprint = fields.Char(
+        help="SHA256 fingerprint, so a grant can be recognised in the "
+             "host's authorized_keys without holding the key itself.",
+    )
+    expires_at = fields.Datetime(required=True, index=True)
+    state = fields.Selection(
+        [
+            ("granted", "Granted"),
+            ("used", "Used"),
+            ("revoked", "Revoked"),
+        ],
+        default="granted",
+        required=True,
+        index=True,
+    )
+    upload_limit_bytes = fields.Float(
+        digits=(20, 0),
+        readonly=True,
+        help="The door's share of its host's free disk when it opened: the "
+             "largest archive the disks could restore, less what the other "
+             "open doors of the host may still receive. The one file the "
+             "door takes is no larger, and a door whose directory holds "
+             "more is closed.",
+    )
+    key_removed = fields.Boolean(
+        readonly=True,
+        copy=False,
+        help="Whether the job that removes the door's key from its host has "
+             "done so. Until then, or until its deadline, a door closed in the "
+             "panel still counts against its host's free disk and is watched.",
+    )
+    received_filename = fields.Char(readonly=True)
+    # An archive past 2 GiB is common: 64 bits (``BigInteger``).
+    received_bytes = BigInteger(readonly=True)
+    received_sha256 = fields.Char(readonly=True)
+    notice = fields.Char(
+        readonly=True,
+        help="Why the door did not open, or why what arrived through it "
+             "cannot be restored, as the last job on it said: what the "
+             "Import dialog shows. Empty when there is nothing to say.",
+    )
+    user_id = fields.Many2one(
+        comodel_name="res.users",
+        default=lambda self: self.env.user.id,
+        readonly=True,
+    )
+
+    # ── Shape of what goes on the host ────────────────────────────────────
+
+    def _directory(self):
+        """Return the directory on the host this grant may write into."""
+        self.ensure_one()
+        return f"{UPLOAD_ROOT}/{self.token}"
+
+    def _remote_path(self, filename="restore.zip"):
+        """Return where an uploaded archive lands on the host."""
+        self.ensure_one()
+        return f"{self._directory()}/{filename}"
+
+    def _in_lang(self):
+        """Return an environment that speaks the language of who opened it.
+
+        What the jobs on a door write for the Import dialog to show
+        (``notice``) is written in that person's language, as the dialog
+        would say it.
+
+        :rtype: odoo.api.Environment
+        """
+        self.ensure_one()
+        lang = self.sudo().user_id.lang or "en_US"
+        return self.env(context=self.env.context | {"lang": lang})
+
+    def _key_comment(self):
+        """Return the marker that identifies this grant's key line.
+
+        Removal keys on it, so it must name exactly one grant and never
+        collide with a key an operator put there themselves.
+        """
+        self.ensure_one()
+        return f"ic-restore-{self.token}"
+
+    def _check_job(self, job):
+        """Refuse a grant a job may not act on, before any command is built.
+
+        Grants are written by the panel alone (``_open``, ``sudo``), but
+        a job names its grant by id in a payload its caller wrote: the
+        grant must be of the job's own instance and host, and still of
+        the shape ``_open`` gave it.
+
+        :param job: the ``cloud.job`` about to act on this grant
+        :raise ValueError: when the grant is not the job's, or not of
+            that shape
+        """
+        self.ensure_one()
+        if self.instance_id != job.instance_id or self.host_id != job.host_id:
+            raise ValueError(
+                "The upload grant is not one of this job's instance and "
+                "host: nothing was done."
+            )
+        self._check_shape()
+
+    def _check_shape(self):
+        """Refuse a grant not of the shape ``_open`` gives, before any command.
+
+        :raise ValueError: when its token or its key is not
+        """
+        self.ensure_one()
+        if not GRANT_TOKEN.fullmatch(self.token or "") \
+                or not GRANT_PUBLIC_KEY.fullmatch(self.public_key or ""):
+            raise ValueError(
+                "The upload grant is not one the panel opened: nothing "
+                "was done."
+            )
+
+    def _authorized_keys_line(self):
+        """Return the restricted ``authorized_keys`` line to install.
+
+        Every restriction is load-bearing and none of them is the only
+        one: the forced command confines the session to one directory in
+        write-only mode, ``restrict`` removes everything a shell would
+        offer, and the expiry closes the door on its own.
+
+        ``-munge`` and ``-no-del`` are part of the confinement. Without
+        the first, one session stored a link to any directory of the
+        account and the next wrote through it — its ``authorized_keys``
+        among them, a shell as the account the panel connects as (root
+        on the platform's hosts; 28-oct-2026). Without the second, a
+        session could delete what an earlier one sent. Both exist only
+        in the rrsync of rsync 3.2.4 and later, which is why the key is
+        installed only where that one is (``_ensure_rrsync``).
+
+        And the door takes one file, ``restore.zip``, no larger than
+        ``upload_limit_bytes`` (``forced_command``, ``restore_door.sh``):
+        each door of a host fills the disk the host's instances share. A
+        door whose limit was not measured has no line.
+
+        :raise ValueError: when the door has no limit
+        """
+        self.ensure_one()
+        if not self.upload_limit_bytes or self.upload_limit_bytes < 1:
+            raise ValueError(
+                "The upload door has no size limit measured: no key was "
+                "installed."
+            )
+        limit_bytes = int(self.upload_limit_bytes)
+        stamp = fields.Datetime.to_string(
+            self.expires_at,
+        ).replace("-", "").replace(":", "").replace(" ", "")
+        command = forced_command(self._directory(), limit_bytes)
+        return (
+            f'command="{command}",'
+            'restrict,'
+            f'expiry-time="{stamp}" {self.public_key} {self._key_comment()}'
+        )
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────
+
+    @api.model
+    def _parse_public_key(self, public_key):
+        """Return the caller's public key in the one shape a grant installs.
+
+        Only an ``ssh-ed25519`` key, read by ``cryptography`` and written
+        back by it: what reaches ``authorized_keys`` is the key alone,
+        never the caller's text — its comment, its options or a line
+        break in it would be part of the key's line. Nothing of what was
+        given is quoted back: a private key pasted by mistake must not
+        end up in an error.
+
+        :param str public_key: ``ssh-ed25519 AAAA… [comment]``
+        :return: ``ssh-ed25519 AAAA…``
+        :rtype: str
+        :raise UserError: for anything that is not such a key
+        """
+        from cryptography.exceptions import UnsupportedAlgorithm
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+
+        refused = UserError(_(
+            "That is not an ed25519 public key: give the line ssh-keygen "
+            "writes to the .pub file (ssh-ed25519 AAAA…)."
+        ))
+        words = (public_key or "").split()
+        if len(words) < 2 or words[0] != "ssh-ed25519":
+            raise refused
+        try:
+            key = serialization.load_ssh_public_key(
+                f"{words[0]} {words[1]}".encode("ascii"),
+            )
+        except (UnicodeEncodeError, ValueError, UnsupportedAlgorithm):
+            raise refused from None
+        if not isinstance(key, ed25519.Ed25519PublicKey):
+            raise refused
+        line = key.public_bytes(
+            encoding=serialization.Encoding.OpenSSH,
+            format=serialization.PublicFormat.OpenSSH,
+        ).decode()
+        if not GRANT_PUBLIC_KEY.fullmatch(line):
+            raise refused
+        return line
+
+    @api.model
+    def _open(self, instance, hours=GRANT_HOURS, public_key=None):
+        """Create a grant with a fresh keypair and return it with the key.
+
+        With *public_key*, the grant installs the caller's own key and
+        no keypair is made. A key opens one grant only: two lines of
+        ``authorized_keys`` with the same key would have sshd pick one
+        of their directories for every session, and a key that already
+        held a door is no longer a one-use one (``cloud.restore.upload.key``).
+        And an instance has one door open at a time
+        (``_doors_to_close``): the doors that went before it are closed
+        once nothing refuses this one.
+
+        :param instance: ``cloud.instance`` the archive is destined for.
+        :param hours: lifetime of the grant.
+        :param str public_key: the caller's ``ssh-ed25519`` public key,
+            or None to generate a keypair.
+        :return: ``(grant, private_key_pem)`` — the private half exists
+            only in this return value; None with *public_key*.
+        :raise UserError: when the instance has no host to open on,
+            another person's door of it is open, or *public_key* is not
+            a key that may open one.
+        """
+        import secrets
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+
+        instance.ensure_one()
+        if not instance.host_id:
+            raise UserError(_("Instance has no host assigned."))
+        if public_key:
+            public = self._parse_public_key(public_key)
+            private = None
+        else:
+            key = ed25519.Ed25519PrivateKey.generate()
+            public = key.public_key().public_bytes(
+                encoding=serialization.Encoding.OpenSSH,
+                format=serialization.PublicFormat.OpenSSH,
+            ).decode()
+            private = key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.OpenSSH,
+                encryption_algorithm=serialization.NoEncryption(),
+            ).decode()
+        closing = self._doors_to_close(instance)
+        # Every key, whoever's and on whatever instance: a key is unique
+        # on every host.
+        self.env["cloud.restore.upload.key"]._claim(self._fingerprint(public))
+        closing._revoke()
+        # The panel's own record: people read grants, never write them
+        # (``ir.model.access.csv``).
+        grant = self.sudo().create({
+            "instance_id": instance.id,
+            "host_id": instance.host_id.id,
+            "token": secrets.token_hex(8),
+            "public_key": public,
+            "fingerprint": self._fingerprint(public),
+            "expires_at": fields.Datetime.now() + timedelta(hours=hours),
+        }).with_env(self.env)
+        return grant, private
+
+    @api.model
+    def _doors_to_close(self, instance):
+        """Return the doors of *instance* to close before another one opens.
+
+        Under a lock of the instance's doors, held until the transaction
+        ends: two doors asked for at once open one after the other. One
+        whose deadline passed is closed, as the sweep would; the
+        caller's own is closed too (a key lost with the dialog that
+        showed it); another person's is left open, and the new one
+        refused. A door another transaction opened after this one's
+        snapshot is seen by a fresh read, and refused alike. And a door
+        a restore waiting in the queue is to take its archive from is
+        not closed: closing it removes the archive, and the restore
+        would fail. The new door is refused instead, which keeps one
+        door at a time (``_awaited_by_restore``).
+
+        :param instance: the ``cloud.instance`` a door is asked for
+        :return: the grants to revoke, in the caller's environment
+        :raises UserError: while another person's door of it is open
+        """
+        self.env.cr.execute(
+            "SELECT pg_advisory_xact_lock(%s, %s)",
+            (_DOOR_LOCK_NAMESPACE, instance.id),
+        )
+        now = fields.Datetime.now()
+        open_doors = self.sudo().search([
+            ("instance_id", "=", instance.id),
+            ("state", "=", "granted"),
+        ])
+        expired = open_doors.filtered(lambda g: g.expires_at <= now)
+        others = (open_doors - expired).filtered(
+            lambda g: g.user_id != self.env.user,
+        )
+        if others:
+            raise UserError(_(
+                "An upload door is already open for this instance, opened by "
+                "%(person)s until %(deadline)s UTC: one door at a time. Ask "
+                "them to close it, or wait until it expires.",
+                person=others[0].user_id.name or "",
+                deadline=fields.Datetime.to_string(others[0].expires_at),
+            ))
+        if self._awaited_by_restore(instance, open_doors - others):
+            raise UserError(_(
+                "A restore of what arrived through your upload door of this "
+                "instance is waiting in the queue: opening another door would "
+                "close that one and remove what it holds. Wait until the "
+                "restore has run, or cancel it, and then open another door."
+            ))
+        self.env.flush_all()
+        # Not ``cr``: ``_`` reads the language through a local of that
+        # name, and this cursor is closed by the time a refusal is said.
+        with read_committed_cursor(self.env.registry) as fresh_cr:
+            fresh_cr.execute(
+                "SELECT id FROM cloud_restore_upload_grant"
+                " WHERE instance_id = %s AND state = 'granted'"
+                " AND expires_at > now() AT TIME ZONE 'UTC'",
+                (instance.id,),
+            )
+            fresh = {row[0] for row in fresh_cr.fetchall()}
+        if fresh - set(self.sudo().browse(fresh).exists().ids):
+            raise UserError(_(
+                "Another upload door was opened for this instance a moment "
+                "ago: one door at a time. Close it, or wait until it expires."
+            ))
+        return (open_doors - others).with_env(self.env)
+
+    @api.model
+    def _awaited_by_restore(self, instance, doors):
+        """Return the *doors* a restore of *instance* waits to take from.
+
+        A restore through a door (``ssh_upload``) names its grant in its
+        payload, and marks it used only once it runs: until then, closing
+        the door would remove the archive it is about to take.
+
+        :param instance: the ``cloud.instance``
+        :param doors: ``cloud.restore.upload.grant`` records of it
+        :return: those of *doors* a waiting or running restore names
+        """
+        Job = self.env["cloud.job"].sudo()
+        restores = Job.search([
+            ("instance_id", "=", instance.id),
+            ("job_type_id.code", "=", "restore_instance"),
+            ("state", "in", Job._active_states),
+        ])
+        awaited = set()
+        for job in restores:
+            payload = job.payload or {}
+            if payload.get("mode") != "ssh_upload":
+                continue
+            try:
+                awaited.add(int(payload.get("grant_id") or 0))
+            except (TypeError, ValueError):
+                continue
+        return doors.filtered(lambda grant: grant.id in awaited)
+
+    @api.model
+    def _fingerprint(self, public_key):
+        """Return the SHA256 fingerprint OpenSSH would print for a key."""
+        import base64
+        import hashlib
+
+        parts = (public_key or "").split()
+        if len(parts) < 2:
+            return ""
+        try:
+            blob = base64.b64decode(parts[1])
+        except (ValueError, TypeError):
+            return ""
+        digest = base64.b64encode(hashlib.sha256(blob).digest()).decode()
+        return "SHA256:" + digest.rstrip("=")
+
+    def _mark_used(self):
+        """Record that the archive this grant carried has been consumed."""
+        return self.filtered(lambda g: g.state == "granted").sudo().write(
+            {"state": "used"}
+        )
+
+    def _revoke(self, reason="revoked", states=("granted",)):
+        """Enqueue removal of the key from the host and close the grant.
+
+        Idempotent: a grant already closed enqueues nothing, so the daily
+        sweep and the restore that consumed the archive can both call it.
+
+        :param reason: state to leave behind (``revoked`` or ``used``).
+        :param states: the states a grant must be in to be revoked: the
+            sweep also passes ``used``, to remove what a consumed grant
+            left in its directory.
+        :return: ids of the jobs enqueued.
+        """
+        jobs = []
+        for grant in self:
+            if grant.state not in states:
+                continue
+            # An ordinary job of the instance's queue: the key stops
+            # being accepted at its expiry anyway, so the revocation can
+            # wait its turn behind whatever runs.
+            jobs.append(self.env["cloud.job"].enqueue(
+                grant.host_id.id,
+                grant.instance_id.id,
+                "revoke_restore_upload_key",
+                payload={"grant_id": grant.id},
+            ))
+            grant.sudo().state = reason
+        return jobs
+
+    @api.model
+    def _key_may_work_domain(self):
+        """Return the domain of the doors whose key may still take an upload.
+
+        The open ones, and the ones closed in the panel — revoked, or
+        consumed by a restore — whose key the job that removes it has not
+        removed yet (``key_removed``), until their deadline, when OpenSSH
+        stops accepting it, and only once a limit was measured: a door
+        whose key never went in has none. Those count in their host's
+        free disk and are watched, as an open door is (the review of
+        18-nov-2026, M1).
+
+        :rtype: list
+        """
+        return [
+            "|", ("state", "=", "granted"),
+            "&", "&", ("key_removed", "=", False),
+            ("expires_at", ">", fields.Datetime.now()),
+            ("upload_limit_bytes", ">", 0),
+        ]
+
+    @api.model
+    def _watch_doors(self):
+        """Have every host with an open door measure what its doors hold.
+
+        A ``watch_restore_uploads`` job per host (the cron's, every five
+        minutes): it closes a door whose directory holds more than its
+        limit, or every door that writes on the instances' disk once it
+        is down to the reserve (``restore_space``). The key's file size
+        limit bounds each file; this bounds what many files, or many
+        doors, add up to. Hosts without a door whose key may take an upload
+        (``_key_may_work_domain``) are not reached.
+
+        :return: ids of the jobs queued
+        """
+        hosts = self.sudo().search(self._key_may_work_domain()).host_id
+        jobs = []
+        for host in hosts:
+            try:
+                # A host-level type, gated to managers: the cron is none.
+                jobs.append(self.env["cloud.job"].sudo().enqueue(
+                    host.id, False, "watch_restore_uploads",
+                ))
+            except Exception as exc:  # noqa: BLE001 - one host must not stop the rest
+                _logger.warning(
+                    "Could not queue the watch of the upload doors of %s: %s",
+                    host.name, exc,
+                )
+        return jobs
+
+    @api.model
+    def _close_for_update(self):
+        """Close every open door, saying why: the update that changed them.
+
+        A door opened before 1.0.239 writes to ``/tmp`` under a key that
+        takes any number of files, each up to its limit; the restore
+        after the update reads only ``/var/tmp`` and the door's one file.
+        Such a door is closed as its revocation does, and the Import
+        dialog tells the person to ask for another key (end-migration of
+        1.0.239). What it held in ``/tmp`` goes with the day's sweep
+        (``upload_dir_sweep``).
+
+        :return: the doors closed
+        """
+        doors = self.sudo().search([("state", "=", "granted")])
+        for door in doors:
+            door._revoke()
+            door.notice = door._in_lang()._(
+                "The panel was updated while this upload door was open, and "
+                "the update closed it: ask for another upload key and send "
+                "the archive again."
+            )
+        return doors
+
+    @api.model
+    def _gc_grants(self):
+        """Revoke grants whose deadline has passed, then purge old rows.
+
+        The key on the host stops being accepted at its expiry with or
+        without this — that is what ``expiry-time`` buys — but the line
+        and the directory would otherwise accumulate on every host that
+        ever received an upload.
+
+        A grant a restore consumed had its key revoked then, its
+        directory kept: a failed restore gives the archive back there
+        for its retry, a successful one leaves whatever else was sent.
+        ``USED_GRANT_DAYS`` after its last change it is revoked again,
+        directory and all. Rows go a month after their last change, so a
+        revocation still finds its grant.
+
+        :return: number of grants revoked.
+        """
+        now = fields.Datetime.now()
+        expired = self.search([
+            ("state", "=", "granted"),
+            ("expires_at", "<", now),
+        ])
+        expired._revoke()
+        consumed = self.search([
+            ("state", "=", "used"),
+            ("write_date", "<", now - timedelta(days=USED_GRANT_DAYS)),
+        ])
+        consumed._revoke(states=("used",))
+        cutoff = now - timedelta(days=30)
+        self.search([
+            ("state", "!=", "granted"),
+            ("write_date", "<", cutoff),
+        ]).sudo().unlink()
+        if expired or consumed:
+            _logger.info(
+                "restore upload grants: revoked %d expired, %d consumed",
+                len(expired), len(consumed),
+            )
+        return len(expired) + len(consumed)

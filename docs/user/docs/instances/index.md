@@ -1,0 +1,431 @@
+# Instances
+
+An **instance** is a running Odoo deployment — one container, one database,
+one filestore. It belongs to a project and runs on a host.
+
+!!! warning "Before you create the first instance"
+    - **Production comes first.** A staging is a copy of production: until the
+      project has a production instance, the staging section's **+** stays
+      disabled. Deploy production, then use **Clone to Staging**, next to it
+      in the project's side menu, for a staging with production's data.
+    - **Production needs a backup destination.** Deploying one without any is
+      refused (*No backup backend configured for this instance*). Register a
+      destination first ([Backups](../backups/index.md#backup-destinations))
+      and choose it on the instance, on its project, or for every production
+      instance in **Settings → General → Default backup destination**.
+
+    An instance's environment is chosen when it is created and cannot be
+    changed later.
+
+## Concepts
+
+- **Production instance** — customer-facing. Re-deploys go through the safe-rebuild
+  flow (boot test before swap). One per project.
+- **Staging instance** — test copy. Re-deploys go through the same boot test. As many as you like:
+  stagings run on servers you already pay for, so they never count against the
+  instance allowance of a SaaS plan.
+- **Odoo version** — one the panel offers, 8.0 to 20.0, taken from the project
+  when the instance is created and fixed once it is deployed. Odoo 20.0 runs on
+  PostgreSQL 16 to 18; 16.0 to 19.0, on 14 to 18; 13.0 to 15.0, on 12 up to 16 or
+  17; 11.0 and 12.0, on 12 to 13; 8.0 to 10.0, on 12 alone.
+- **Sleeping** (SaaS Free plan) — on Free it is your control plane, not your
+  instances, that is suspended after ~30 minutes without traffic to save
+  resources. It wakes up on the next request (the first request after a nap takes
+  a few seconds). The instances you deploy keep running.
+
+!!! info "IncubaCloud SaaS"
+    Instances on the hosted service are served through a CDN, which caps a single
+    request at **100 MB** and at **100 seconds** to first byte. See
+    [Service limits](../reference/limits.md) for what to use instead when you hit
+    either one.
+
+## Lifecycle
+
+```
+deploy → running → rebuild → running → ... → archive or delete
+```
+
+A rebuild updates the image and modules without downtime (production) or
+restarts the container (staging).
+
+## One action at a time
+
+An instance runs **one action at a time** — deploy, rebuild, restart, backup,
+restore and the rest. Press a button while another action is running and the
+new one is not refused: it **waits in the instance's queue** and starts by
+itself when the one ahead of it ends, in the order they were asked for.
+
+- The panel tells you which: *Started: Rebuild Instance*, or *Queued behind
+  Deploy Instance*.
+- **Recent activity** lists a waiting action as *Queued · N ahead*: how many
+  actions start before it.
+- *Queued · waiting for a free slot (root.user 1/1)* means nothing runs on
+  the instance, but the panel already runs as many actions as it runs at
+  once (here one of one). It starts as soon as one of them ends.
+- *Running · on the server, reconnecting at 12:03:05* means a long step,
+  such as building the image of a rebuild, goes on on the server while the
+  panel steps away and comes back for it at that time. Nothing to do: the action is
+  running, and **Cancel** still stops it.
+- Changed your mind? A waiting action has not started yet, so **Cancel** takes
+  it out of the queue at once and nothing happens on the server.
+- Asking twice for the same thing while it waits — two restarts, the same
+  backup — does not queue it twice. A queue holds five actions at most.
+
+!!! warning "After a failure, the queue waits for you"
+    When a deploy, rebuild, restore or delete fails, what is queued behind it
+    does not start: a restart after a broken deploy would only fail again. The
+    waiting actions show **Action required**, which leads to the failure's
+    alert. **Retry** the failed action — once it succeeds the queue moves on —
+    or **dismiss** the alert in **Alerts** to let the queue go on as it is.
+    With **Auto-rebuild**, a rebuild that failed does not stop the next
+    push: pushing the fix rebuilds the instance, and once that rebuild
+    succeeds the alert closes by itself.
+
+Deleting an instance does not wait for the actions queued on it: they are
+cancelled, and the deletion starts as soon as the action running now ends.
+
+Every action has a log. Click it in **Recent activity** (or in **View all
+activity**) to open its log in a new tab; a button never opens one by itself.
+
+## Ending an instance
+
+Both endings remove the containers, the database and the files from the host.
+They differ in what happens to the **backups**.
+
+!!! warning "Deleting destroys the backups too"
+    An instance's backups belong to that instance. **Delete completely** empties
+    them before the containers come down — there is no option to keep them, and
+    nothing to restore from afterwards. If you might want the data later,
+    archive instead, or [download a backup](../backups/restore.md) first.
+
+    Because it cannot be undone, the panel asks you to type the instance name.
+
+**Archive** keeps one restorable copy. A fresh full backup is taken at that
+moment — not the last nightly one, so nothing since it is lost — and everything
+older is pruned, leaving exactly one copy. The instance moves to the
+**Archived** tab of its project, where you can see the size of that copy and
+when it was last verified.
+
+From there you can:
+
+- **Revive** it — deploy it again, on the original host or any other, and
+  restore the copy into it.
+- **Delete** it — which destroys the copy as well, and again asks for the name.
+
+An archived instance keeps its name reserved inside its project: creating a new
+instance with that name is refused, because it would compute the same backup
+path and write into the copy being kept.
+
+!!! note "Archiving without a backup destination"
+    An instance with no backup backend has no copy to keep, so archiving it
+    keeps only the record. The panel says so and asks you to confirm in
+    writing.
+
+## Common tasks
+
+- [Deploy your first instance](../getting-started/first-deploy.md)
+- Rebuild after pushing changes to your repo (Instance detail → Rebuild)
+- [View logs](logs.md) (Instance detail → Logs). Odoo's log is kept one file per day and survives rebuilds: pick a day, search every day at once, or download one
+- Open a shell on the container (Instance detail → Shell)
+- [Size its memory and CPU](resources.md) (Instance detail → More → Resources), and what the panel derives from them
+- [Restore from a backup](../backups/restore.md)
+- [Refresh a staging with production data](#refresh-from-production)
+- [Get a preview instance for every pull request](#pull-request-previews)
+- [Keep a staging that is about to expire](#stagings-expire-when-nobody-uses-them)
+- [Add a custom domain](#custom-domains-and-certificates) (Instance detail → Networking → Domains)
+
+## Custom domains and certificates
+
+**Instance detail → Networking → Domains** lists the names the instance answers
+to. Leave it empty and the platform generates one under the host's wildcard
+domain. Each row has an optional redirect target (with *301* for a permanent
+redirect) and a **Certificate** choice:
+
+| Certificate | What happens |
+|---|---|
+| **Automatic** (default) | The host decides. If a CDN answers for the name *and* the certificate the host holds covers it, the host serves that one; otherwise it asks Let's Encrypt. Pick this unless you have a reason not to. |
+| **Let's Encrypt** | Always asks Let's Encrypt, whatever the host. The domain's DNS must point straight at the host when it deploys. |
+| **Existing certificate** | Serves a certificate already on the host — its default certificate (Host detail → Traefik), or one loaded by hand. Use it for a purchased wildcard or a certificate from your own CA. |
+| **No TLS** | No TLS for this name. The host still redirects HTTP to HTTPS, so in practice visitors get a self-signed certificate. |
+
+Changes take effect on the next deploy or rebuild. The deploy log says, one line
+per domain, how each name got its certificate — for *Automatic*, which way the
+host decided:
+
+```
+TLS for app.example.com: automatic → Let's Encrypt
+```
+
+!!! warning "Existing certificate needs a certificate"
+    A deploy that asks for *Existing certificate* on a host holding none stops
+    before touching the host and names the domain. Load the certificate first;
+    the steps are in [RB-12](https://github.com/incubacloud/incubacloud/blob/19.0/docs/runbooks/RB-12-custom-domain-certificate.md).
+
+## Refresh from production
+
+**Instance detail → Refresh from production** replaces a staging instance's
+database and filestore with a copy of its project's production, keeping the
+staging's own code (repositories and branches) untouched. It is the button you
+press when your test copy has drifted away from real data.
+
+Two data sources:
+
+- **Latest backup** (recommended) — restores the most recent snapshot from the
+  production's backup destination. No extra load on production.
+- **Live dump from production** — dumps the production database on the spot, so
+  you get the data as of right now. It costs a `pg_dump` on a live database, and
+  it is the only option when the production has no backup destination configured
+  (the dialog then picks it for you).
+
+**Neutralize the database** is on by default: the restored copy comes up with
+scheduled actions and outgoing mail servers disabled and Odoo's test banner
+showing. Leave it on unless you are deliberately testing a cron or a mail flow —
+a staging carrying production's data will otherwise invoice, dun and email your
+real customers. A rebuild that updates the modules of a neutralized staging or
+preview neutralizes it again afterwards, and its mail goes back to the staging's
+mail catcher: the update switches on again the scheduled actions its modules
+ship. A database without Odoo's test banner is left as it is.
+
+The refresh runs as two jobs (a download on the production, a restore on the
+staging) that you can follow in the activity timeline. If the download fails the
+restore never starts and the staging is left untouched. Refreshing updates the
+modules to the staging's code before it starts, unless **Auto-update modules** is
+off; if that update fails, the staging stays stopped and the job says so.
+
+Cloning a production to a new staging (**Project → Clone to staging**) applies
+the same neutralization, and always takes a live dump: a production created
+today has no backup to copy until its first nightly run.
+
+## Auto-update
+
+If you push commits to a connected repo, these settings control what happens:
+
+- **Auto-rebuild** — trigger a rebuild automatically when commits land on the
+  connected branch. Off by default.
+- **Auto-update modules** — during rebuild, run `click-odoo-update` to update
+  only the modules whose checksum changed. On by default. Off, the rebuild
+  runs no boot test either.
+- **Test the new image before applying it** — the boot test below. On by
+  default.
+
+They live under `Instance detail → More → Build`.
+
+**Auto-rebuild** acts on GitHub's push notifications, which reach the panel
+through the [GitHub App](../projects/index.md#private-repositories), and on
+[GitLab's webhooks](../projects/gitlab.md#rebuild-on-push-webhooks), so the
+panel must be reachable from the internet.
+
+!!! info "IncubaCloud SaaS"
+    On the Free plan the control plane sleeps after 30 minutes without use, and
+    a push notification of GitHub or GitLab that arrives while it sleeps only
+    wakes it: the push is not acted on. Rebuilding on push needs a paid plan,
+    whose control plane never sleeps; on Free, rebuild by hand.
+
+### The boot test
+
+Before a rebuild puts its new image into service, it copies the instance's
+database, boots the new image on the copy and updates the copy's modules. If
+that fails, the rebuild stops and the instance keeps its previous image and
+its database as they were.
+
+The copy is a full one, made with `pg_basebackup` into a Docker volume on the
+server's disk, so it needs room and time. Before copying, the rebuild measures
+the database and the free space of Docker's disk, and the job's log says what
+it found, for example:
+
+```text
+boot test: the database takes 50.0 GiB, Docker's disk has 100.0 GiB free and
+the test needs 60.0 GiB; the copy should take about 6 min, and the test has
+69 min
+```
+
+- **Disk.** The test needs the database's size, a tenth more for what the
+  update writes, and 5 GiB left free for the server's other instances. With
+  less free space the rebuild stops before copying anything, says how much is
+  missing and changes nothing.
+- **Time.** The estimate assumes 150 MB/s; a server with a local disk usually
+  copies at about twice that, and the log gives the real speed once the copy
+  ends. On ext4, count about 30 minutes for every 500 GB. The test has an hour
+  plus the copy at 100 MB/s, and at most six hours: past that the rebuild stops
+  before copying and says so.
+
+For a database too large to copy in reasonable time, turn off **Test the new
+image before applying it**. The rebuild then applies the new image and the
+module update straight to the instance, says so first in its result and leaves
+a warning in Alerts. Turn it back on and the next rebuild that passes the test
+clears the warning.
+
+## Pull request previews
+
+A project can create a throwaway staging for every pull request, so a change can
+be looked at running — on real data — before it is merged. It is **off by
+default**; turn it on under **Project → Settings → Preview instances for pull
+requests and merge requests**. GitLab merge requests get previews the same way:
+see [Merge request previews](../projects/gitlab.md#merge-request-previews).
+
+With it on, opening (or reopening) a pull request on a repository that one of
+the project's **production** instances follows does this, with nobody pressing
+anything:
+
+1. A staging named `pr-<number>` is created on the **same host** as that
+   production, following the pull request's branch.
+2. It receives a copy of the production's data as it is at that moment — a
+   live dump, so it works even before the first backup — **neutralized** exactly
+   like [Refresh from production](#refresh-from-production): scheduled actions
+   and outgoing mail servers disabled, test banner showing.
+3. It gets an address of its own under the host's wildcard domain
+   (`<project>-pr-<number>.<host domain>`), and the panel comments that link on
+   the pull request once the preview is up.
+4. Every new push to the pull request rebuilds it.
+5. Closing or merging the pull request deletes it, comment included.
+
+Things worth knowing before switching it on:
+
+- A preview is a full copy of production data sitting on your host for as long
+  as the pull request stays open. Anyone who can reach its address and log in
+  sees that data.
+- It needs the [GitHub App](../getting-started/first-project.md) connected to the
+  repository: the webhook that announces the pull request, and the comment, both
+  go through it.
+- A production instance that pins the repository to a fixed commit does not get
+  previews for it — a pin says "this instance does not move with the branch".
+- If a preview cannot be created, the pull request gets a comment saying why and
+  the production instance an alert. Fix the cause, then close and reopen the
+  pull request to try again.
+- The copy's modules are updated to the pull request's code before it starts.
+  If that update fails, the preview stays stopped and the comment says it could
+  not be updated; push a fix to the branch and its rebuild brings it up. If the
+  update never ended (the connection to the server dropped or it ran out of
+  time), it may still be running: a push rebuilds the preview only once the
+  restore's alert is dismissed.
+- The panel acts on the pull requests of one installation of its GitHub App,
+  the one under **Settings → GitHub**. If the App is installed on another
+  account too, a pull request there gets no preview: the production that would
+  have been copied gets an alert naming the account instead. Choosing that
+  installation resolves it, or dismiss it.
+
+## Stagings expire when nobody uses them
+
+A staging that nobody has touched for **90 days** is deleted automatically.
+Production instances are never affected.
+
+The clock measures *use*, not age: a staging somebody opens every week never
+expires, however old it is. Two things reset it to zero:
+
+- **You did something with it from the panel** — deployed, rebuilt, restarted,
+  restored, refreshed it, connected as a user, or opened a shell on it.
+- **Somebody logged into its Odoo.** The panel reads the last login from the
+  staging's own database once a day.
+
+Two things deliberately do **not** count. Rebuilds triggered by a push are code
+arriving, not a person looking at it. And the health probes that run every few
+minutes are the platform watching, not you.
+
+!!! danger "A staging has no backup to go back to"
+    Deletion removes the containers, the database and the files. Unlike
+    [archiving](#ending-an-instance), it keeps no copy, so whatever was only in
+    that staging is gone. If it holds something you want, download a backup
+    before the deadline.
+
+### What you see before it happens
+
+You get two warnings, and the second one reaches you whatever your notification
+preferences are:
+
+| When | What happens |
+|---|---|
+| 14 days before | A warning, and an amber **Expires in N days** badge on the instance |
+| 3 days before | A second, critical warning; the badge turns red |
+| On the day | Deleted |
+
+The badge appears next to the instance name in the project sidebar and in the
+instance's own header, from the first warning on.
+
+### How to stop it
+
+- **Use it.** Anything in the list above starts the 90 days over.
+- **Press Keep** on the badge in the instance header. One click, same effect.
+- **Mark it as permanent** — *Instance detail → General → Never purge
+  automatically*. For the ones that should stay regardless: a QA environment
+  nobody logs into for months is still not disposable.
+
+!!! note "Nothing is ever deleted the day the feature notices it"
+    Each step waits for the one before it, and deletion waits at least a day
+    after the final warning. A platform that had been down for a month comes
+    back and *warns*; it cannot warn and delete in the same pass.
+
+[Pull request previews](#pull-request-previews) follow the same rule, on top of
+being deleted when their pull request closes.
+
+Administrators can change the 90 days, or switch the whole thing off, under
+**Settings → Instances → Staging autopurge**.
+
+## Email on staging
+
+A staging never emails anybody. Whatever it sends — password resets, order
+confirmations, invitations — is caught by a mail server that runs alongside it
+and goes no further. That is what makes it safe to restore a copy of production
+and click around in it: the customers in that copy are real, and none of them
+will hear from you.
+
+See a staging copy of production catch every email it sends: [watch it in 90 seconds](https://youtu.be/jcaXDk8nkns).
+
+Open **Instance detail → Mails** to read what was caught. The list shows when
+each message arrived, who it was for and what it said; open one to see the HTML
+as the recipient would have seen it, the plain-text alternative, and what was
+attached.
+
+!!! warning "The mailbox is temporary"
+    The catcher keeps everything in memory. Restarting the instance — a rebuild,
+    an update, a stop and start — empties it. If a message matters, read it
+    before you restart.
+
+**Clear mailbox** empties it on purpose, which is the way to make "now watch
+what this button sends" readable.
+
+Production is the opposite: its email is real and leaves the server. There is no
+Mails tab there, and the SMTP relay you configure under *Email* is the one
+that will actually deliver: see [Mail relay](mail-relay.md), which covers
+Microsoft 365 with OAuth2 and **Send test mail**.
+
+## What a staging can reach on the internet
+
+A staging is a copy of production that people poke at, so what it can talk to
+matters. It reaches only the hostnames on its own list; everything else is
+refused at the network, before Odoo ever sees it. That is what stops a staging
+from calling a payment gateway, a tax agency or a customer's webhook while
+somebody is trying things out in it.
+
+Open **Instance detail → More → Whitelist** to see and edit the list. A new staging
+starts with whatever its host publishes, so in the usual case there is nothing
+to decide. Add the hostname of any API the code under test genuinely needs —
+written plainly, `api.example.com`, with no `https://`, no port and no path.
+
+!!! note "It takes a rebuild"
+    The list is part of the instance's configuration, not a live setting.
+    **Save** records it and the instance shows *Changes not deployed*; it
+    applies on the next **Rebuild**.
+
+Emptying the list does not open the staging up — it falls back to the shared
+list of its host, which is what every staging used before this existed.
+
+Production has no such list. A production instance is yours, its traffic is not
+filtered by the platform, and the tab is absent rather than empty.
+
+## Odoo's website info page is blocked
+
+Odoo shows anyone the list of installed apps and its exact version at
+`/website/info` (also `/es/website/info` and the other languages). That tells a
+stranger which known flaws to try, so the proxy of every host refuses it on
+every instance with a `403 Forbidden`, before the request reaches Odoo. Your
+own signed-in users lose the page too: the proxy does not know who is signed in.
+
+To let anyone open it on one instance, turn on **Allow Odoo's public website
+info page** under `Instance detail → Networking` and rebuild the instance. It is
+off for every instance, and a staging cloned from production starts with it off.
+While the instance is stopped or asleep, the page stays blocked.
+
+## See also
+
+- [Hosts](../hosts/index.md) — where instances run.
+- [Backups](../backups/index.md) — how to keep their data safe.

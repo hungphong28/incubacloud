@@ -1,0 +1,246 @@
+import logging
+
+from odoo import _, api, fields, models
+from odoo.exceptions import UserError
+
+from ..github.credentials import GitHubAppCredentials
+from .encrypted_char import EncryptedChar, EncryptedText
+
+_logger = logging.getLogger(__name__)
+
+
+class CloudGitHubApp(models.Model):
+    """GitHub App configuration — system-level singleton.
+
+    In BYO mode there is exactly one record in this model, shared across the
+    whole Odoo instance.  The private key is stored encrypted at rest and is
+    never returned to front-end clients via JSON-RPC; instead, callers receive
+    only a ``has_private_key`` boolean flag.
+    """
+
+    _name = "cloud.github.app"
+    _inherit = ["cloud.security.mixin"]
+    _description = "GitHub App Configuration"
+    _rec_name = "app_id"
+
+    app_id = fields.Char(
+        string="App ID",
+        required=True,
+        help="Numeric identifier of the GitHub App (found in App settings).",
+    )
+    installation_id = fields.Char(
+        string="Installation ID",
+        help=(
+            "ID of the GitHub App installation on your organisation or account."
+            " Found under Settings → GitHub Apps → Configure → URL parameter."
+            " Taken from the installation webhook only when the account that"
+            " owns the App installs it; otherwise a manager chooses it with"
+            " Check installation."
+        ),
+    )
+    private_key = EncryptedText(
+        string="Private Key (PEM)",
+        required=True,
+        groups="base.group_system",
+        help=(
+            "RSA private key in PEM format generated for this GitHub App."
+            " Stored encrypted at rest; never exposed in logs or API"
+            " responses."
+        ),
+    )
+    webhook_secret = EncryptedChar(
+        string="Webhook Secret",
+        groups="incubacloud.group_cloud_manager",
+        help=(
+            "Secret used to validate incoming webhook HMAC-SHA256 signatures."
+            " Must match the value configured in the GitHub App webhook settings."
+        ),
+    )
+    owner_login = fields.Char(
+        string="App Owner",
+        readonly=True,
+        help=(
+            "GitHub account that owns the App, as the manifest flow answered"
+            " it. The App is public: only an installation on this account is"
+            " taken from the webhook by itself."
+        ),
+    )
+    owner_type = fields.Selection(
+        [("user", "User account"), ("organization", "Organization")],
+        string="App Owner Type",
+        readonly=True,
+        help=(
+            "Whether the account that owns the App is a user account or an"
+            " organization, as the manifest flow answered it."
+        ),
+    )
+    slug = fields.Char(
+        string="App Slug",
+        readonly=True,
+        help=(
+            "GitHub App slug (URL-safe name). Auto-set during manifest flow. "
+            "Used to generate the direct org installation link."
+        ),
+    )
+
+    # ── Singleton constraint ────────────────────────────────────────────────
+
+    @api.constrains("app_id")
+    def _check_singleton(self):
+        if self.env["cloud.github.app"].search_count([]) > 1:
+            raise UserError(
+                _("Only one GitHub App configuration is allowed per system.")
+            )
+
+    # ── Security checks ──────────────────────────────────────────────────────
+
+    def write(self, vals):
+        self._check_can_manage_settings()
+        res = super().write(vals)
+        if vals.get("installation_id"):
+            self._resolve_other_installation_alerts(str(vals["installation_id"]))
+        return res
+
+    def _resolve_other_installation_alerts(self, installation_id):
+        """Resolve the alerts about pull requests of an installation now chosen.
+
+        ``github_pr_other_installation`` said that the pull requests of
+        this installation got no preview, the panel acting on another
+        one; it acts on this one now.
+
+        :param str installation_id: the installation chosen
+        """
+        # Here, not at the top: that module's model inherits a mixin
+        # imported after this one.
+        from .cloud_github_event import PR_OTHER_INSTALLATION_CODE as code
+
+        Alert = self.env["cloud.alert"].sudo()
+        for alert in Alert.search([
+            ("code", "=", code),
+            ("state", "=", "active"),
+            ("dedup_key", "=", installation_id),
+        ]):
+            Alert.resolve_alert(
+                code, instance=alert.instance_id or None, key=installation_id,
+            )
+
+    def unlink(self):
+        self._check_can_manage_settings()
+        return super().unlink()
+
+    # ── Credential helpers ──────────────────────────────────────────────────
+
+    def _get_credentials(self):
+        """Return a GitHubAppCredentials instance from this record."""
+        self.ensure_one()
+        return GitHubAppCredentials(
+            app_id=self.app_id,
+            installation_id=self.installation_id,
+            private_key_pem=self.sudo().private_key,
+            webhook_secret=self.webhook_secret or "",
+        )
+
+    # ── Installation auto-detection ─────────────────────────────────────────
+
+    @api.model
+    def _process_installation_event(self, payload: dict) -> bool:
+        """Auto-set installation_id from an installation.created webhook.
+
+        Called by the webhook controller when it receives an
+        ``installation`` event with action ``created``.
+
+        The App is public: GitHub signs the installation of any account
+        with the panel's webhook secret, so a valid signature says nothing
+        about who installed it. Only an installation on the account that
+        owns the App (``owner_login``, kept by the manifest flow) is taken
+        here; any other waits for a manager to choose it with Check
+        installation (``/cloud/detect_github_installation``), which names
+        its account.
+
+        Returns ``True`` if the installation_id was updated.
+        """
+        installation = payload.get("installation") or {}
+        installation_id = str(installation.get("id") or "")
+        if not installation_id:
+            return False
+
+        app = self.search([], limit=1)
+        if not app:
+            return False
+
+        account = str((installation.get("account") or {}).get("login") or "")
+        if not (app.owner_login and account.lower() == app.owner_login.lower()):
+            _logger.info(
+                "GitHub App installation %s on %r is not on the App owner's "
+                "account: a manager chooses it.",
+                installation_id, account,
+            )
+            return False
+
+        if not app.installation_id:
+            app.write({"installation_id": installation_id})
+            _logger.info(
+                "GitHub App installation_id auto-set to %s", installation_id
+            )
+            return True
+
+        return False
+
+    @api.model
+    def _is_own_installation(self, payload: dict) -> bool:
+        """Return whether *payload* is about the installation this panel uses.
+
+        The App the manifest creates is public, so anyone may install it
+        on their own account and GitHub tells this panel about it.
+
+        :param dict payload: a decoded webhook body: ``installation``,
+            ``pull_request`` and the other App events name the
+            installation they were sent for.
+        :return: ``True`` when its installation id is the stored one.
+        """
+        installation_id = str(
+            (payload.get("installation") or {}).get("id") or ""
+        )
+        app = self.search([], limit=1)
+        return bool(installation_id) and installation_id == (
+            app.installation_id or ""
+        )
+
+    # ── Odoo backend action ─────────────────────────────────────────────────
+
+    def action_test_connection(self):
+        """Test the GitHub App connection from the Odoo backend form view.
+
+        An Administrator's, as ``/cloud/test_github_connection`` is.
+
+        :raises AccessError: below Administrator
+        """
+        self.ensure_one()
+        self.env["cloud.security.mixin"]._check_can_manage_settings()
+        service = self.env["cloud.github.credential.service"]
+        result = service.test_connection()
+        if result.get("ok"):
+            return {
+                "type": "ir.actions.client",
+                "tag": "display_notification",
+                "params": {
+                    "title": _("Connection Successful"),
+                    "message": _(
+                        "Connected to GitHub App '%(name)s' (ID: %(id)s).",
+                        name=result.get("app_name", ""),
+                        id=result.get("app_id", ""),
+                    ),
+                    "type": "success",
+                    "sticky": False,
+                },
+            }
+        return {
+            "type": "ir.actions.client",
+            "tag": "display_notification",
+            "params": {
+                "title": _("Connection Failed"),
+                "message": result.get("error", _("Unknown error.")),
+                "type": "danger",
+                "sticky": True,
+            },
+        }

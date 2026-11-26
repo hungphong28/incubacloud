@@ -1,0 +1,262 @@
+# IncubaCloud Core
+
+[![License: ELv2](https://img.shields.io/badge/License-Elastic%20v2-blue.svg)](LICENSE)
+[![Odoo](https://img.shields.io/badge/Odoo-19.0-purple.svg)](https://www.odoo.com)
+[![CI](https://github.com/incubacloud/incubacloud/actions/workflows/ci.yml/badge.svg)](https://github.com/incubacloud/incubacloud/actions/workflows/ci.yml)
+
+**IncubaCloud** is an Odoo-native platform for deploying, managing and monitoring remote Odoo instances — host management, instance lifecycle, GitHub integration, backups, terminals and audit trails, all from inside your ERP.
+
+Built on Odoo Community: the panel itself uses no Enterprise modules, so you don't need an Enterprise license to run it. It deploys both editions. The code is on GitHub, free to install and use under the [Elastic License 2.0](#licensing).
+
+| | |
+|---|---|
+| **Install and update the panel** | [INSTALL.md](INSTALL.md) — what the panel adds to your Odoo 19.0: dependencies, settings, proxy, a dedicated job runner, safe updates |
+| **Use it** | [docs.incubacloud.io](https://docs.incubacloud.io/) — hosts, projects, instances, backups, agents |
+| **How it is built** | [architecture](docs/architecture.md), [API endpoints](docs/api-endpoints.md), [MCP server](docs/mcp.md), [assistant](docs/assistant.md), [observability](docs/observability-operations.md), [runbooks](docs/runbooks/README.md), [roadmap](docs/roadmap.md) |
+| **Contribute** | [CONTRIBUTING.md](CONTRIBUTING.md), [CLA.md](CLA.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) |
+| **Report a vulnerability** | [SECURITY.md](SECURITY.md) — not in a public issue |
+| **What changed** | [CHANGELOG.md](CHANGELOG.md) |
+
+---
+
+## What IncubaCloud does
+
+- Deploy [doodba](https://github.com/Tecnativa/doodba)-based Odoo instances on your own servers with a single click
+- Full instance lifecycle: safe rebuilds with boot tests, start/stop/restart, clone to staging, delete
+- GitHub App integration with webhook-triggered auto-rebuilds
+- S3 backups via duplicity: list, create, download, restore
+- Interactive terminals (xterm.js) and container log viewer
+- Connect-as: passwordless login to managed instances
+- 5-tier role-based access control with full audit trail
+- AI assistant inside the panel, with your own AI key
+- MCP server: Claude, Cursor or another AI agent looks at projects, reads logs, deploys, backs up or clones a staging, under your permissions, and asks for approval before deleting or spending ([guide](https://docs.incubacloud.io/agents/))
+
+---
+
+## Features
+
+### Infrastructure
+
+- Register and manage VPS servers with SSH credentials (password or key)
+- Automated host setup: Docker, Traefik reverse proxy, deployment tools
+- Live host metrics (CPU, RAM, disk) collected every 5 minutes
+- Health checks and Docker prune (automatic daily cleanup)
+- Transport abstraction layer — SSH today, extensible to other backends
+- Multi-domain support per instance via Traefik with optional redirects
+
+### Instance lifecycle
+
+- **Deploy** instances via [copier](https://copier.readthedocs.io/) with automatic module initialization
+- Odoo 8.0 to 20.0 offered, each series described once (`_odoo_versions.py`): its PostgreSQL range (16 to 18 for 20.0, 14 to 18 for 16.0 to 19.0, 12 up to 13, 16 or 17 for 11.0 to 15.0, 12 alone for 8.0 to 10.0), the tool that dumps and loads its database (`click-odoo-contrib` up to 19.0, `odoo db` on 20.0) and the doodba template it needs
+- **Safe rebuild**: new Docker images are tested with a boot test against a cloned database before applying — if it fails, the instance keeps the old image
+- **Auto-update modules** via `click-odoo-update` checksums (only changed modules are updated)
+- Start, stop, restart and delete operations
+- Clone production to staging with database and filestore copy
+- Rebuild fingerprinting for smart cache invalidation
+- Pluggable action system for custom job types
+- One operation at a time per instance (and per host): what is asked for meanwhile waits in a queue, shows its place and can be cancelled while it waits
+
+### GitHub integration
+
+- GitHub App authentication for private repository access
+- Webhook-triggered auto-rebuilds on push events
+- Freeze functionality to prevent auto-rebuilds on specific repos
+- PR preview environments
+- Webhook event audit log
+
+### Backups and data
+
+- S3-compatible or SFTP backup backends with encrypted credentials
+- Full backup lifecycle via duplicity: list, create, download, restore
+- Export for development: sanitized tarballs stripped of tokens and passwords
+- Scheduled backup refresh and retention policies
+
+### Developer tools
+
+- Interactive terminal (xterm.js + PTY) with session management and idle timeout
+- Container log viewer with real-time streaming per service
+- Job log terminal with stdout/stderr separation
+- Connect-as: passwordless login to any user on managed instances
+
+### Security and governance
+
+- **5-tier RBAC**: Stakeholder (read-only) → Consultant → Project Manager → Developer → Administrator
+- Audit trail with filtering, configurable retention and automated purge
+- Multi-user attribution; job notifications via email (immediate or daily digest), Telegram and HMAC-signed webhooks
+- Encrypted secrets (Fernet) for passwords, SSH keys and S3 credentials
+- HMAC-SHA256 validated GitHub webhooks
+
+---
+
+## Modules
+
+| Module | Description |
+|---|---|
+| `incubacloud` | Core platform — hosts, projects, instances, jobs, GitHub, backups, terminals and UI |
+| `incubacloud_mcp` | MCP server: AI agents work on the panel under the user's permissions |
+| `incubacloud_pitr` | Continuous recovery: restore an instance to any minute |
+| `incubacloud_mcp_pitr` | Continuous recovery for agents |
+| `incubacloud_assistant` | AI assistant inside the panel, with your own AI key |
+| `auth_oauth_github` | Sign-in with GitHub |
+| `incubacloud_connect` | Companion module: magic-link passwordless login installed on managed instances |
+
+Which of them to install on the panel: [INSTALL.md](INSTALL.md#what-the-panel-needs).
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Odoo (IncubaCloud)                    │
+│                                                         │
+│  ┌─────────────────┐    ┌──────────────────────────┐   │
+│  │   OWL SPA       │    │   JSONRPC Controllers    │   │
+│  │  /cloud/        │◄──►│   /cloud/*               │   │
+│  └─────────────────┘    └──────────┬───────────────┘   │
+│                                    │                    │
+│  ┌─────────────────────────────────▼──────────────────┐ │
+│  │              Odoo ORM (models/)                    │ │
+│  │  cloud.host · cloud.project · cloud.instance       │ │
+│  │  cloud.job · cloud.backup.backend · cloud.alert    │ │
+│  └──────────────────────┬─────────────────────────────┘ │
+│                         │                               │
+│  ┌──────────────────────▼─────────────────────────────┐ │
+│  │         queue_job (OCA) worker process             │ │
+│  │                                                    │ │
+│  │  cloud.job.execute() → AbstractSSHExecutor.run()  │ │
+│  └──────────────────────┬─────────────────────────────┘ │
+│                         │ asyncssh                      │
+└─────────────────────────┼───────────────────────────────┘
+                          │ SSH
+              ┌───────────▼──────────┐
+              │     Remote VPS       │
+              │  Git · Docker · OS   │
+              └──────────────────────┘
+```
+
+IncubaCloud acts as the **control plane**, not the runtime. All heavy lifting happens on the remote server; Odoo is the orchestrator.
+
+### Key models
+
+| Model | Description |
+|---|---|
+| `cloud.host` | VPS server — IP, SSH credentials, Traefik config, live metrics |
+| `cloud.project` | Groups instances; holds default repos and team members |
+| `cloud.instance` | One Odoo deployment — version, DB config, SMTP, domains, backup backend |
+| `cloud.job` | Async remote execution record; waits in its instance's (or host's) queue until it is handed to a `queue.job` |
+| `cloud.job.type` | Job type definition with pluggable action support |
+| `cloud.job.log.chunk` | Individual log line (stdout / stderr / system) |
+| `cloud.backup.backend` | S3-compatible or SFTP backup target — encrypted credentials |
+| `cloud.github.app` | GitHub App configuration (singleton) |
+| `cloud.github.event` | Immutable webhook audit log |
+| `cloud.alert` | Infrastructure alerts and notifications |
+
+See [docs/architecture.md](docs/architecture.md) for the full module structure and [docs/api-endpoints.md](docs/api-endpoints.md) for the REST API reference.
+
+---
+
+## Videos
+
+- [Odoo: push to Git without breaking production (safe boot check)](https://youtu.be/E5u5PfTSKeo)
+- [Odoo staging: a real copy of production that can't email your customers](https://youtu.be/jcaXDk8nkns)
+
+---
+
+## Installation
+
+Standard Odoo 19.0 modules, for an Odoo 19.0 you already run or a new one; Community is enough. Add this repository and OCA's `queue_job` ([OCA/queue](https://github.com/OCA/queue) 19.0, at the commit [INSTALL.md](INSTALL.md#what-the-panel-needs) names) to your `addons_path`. Install the Python packages of this repository's [`requirements.txt`](requirements.txt) and of OCA/queue's (`openupgradelib`, `requests`), and `ssh` and `sshpass`. Run Odoo with a UTF-8 locale and `INCUBACLOUD_SECRET_KEY` in its environment, and give it the settings the panel's jobs need: `queue_job` in `server_wide_modules`, `limit_time_real` of at least 900 (we use 3600), more workers than jobs running at once, and the panel's database selected by name.
+
+[INSTALL.md](INSTALL.md) lists what the panel needs, explains each setting and what the proxy must pass, recommends a dedicated job runner, and shows how to update the panel without losing running jobs.
+
+**GitLab webhooks:** a GitLab server must reach the panel at
+`/cloud/gitlab/webhook/` for pushes to rebuild. Leave that path out of any
+basic authentication in front of the panel (each delivery carries its own
+token). A GitLab server of your own that delivers to an address of its own
+network needs **Admin → Settings → Network → Outbound requests → Allow
+requests to the local network from webhooks and integrations**. An internal
+GitLab is fine: the core sets no network limits on Git servers.
+
+Running the tests: [CONTRIBUTING.md](CONTRIBUTING.md#running-tests).
+
+---
+
+## Use cases
+
+- Odoo partners managing multiple customer environments
+- Technical teams standardizing deployment workflows
+- Foundation for building managed Odoo services
+
+---
+
+## Roadmap
+
+What is in progress, planned and left for later (see [docs/roadmap.md](docs/roadmap.md) for the full picture):
+
+- **Server security monitoring** — failed logins and their sources, alert rules and a Security view per server
+- **SFTP backup destinations** — with continuous recovery (restore to any minute) over SFTP
+- **Later** — managed version upgrades (OpenUpgrade / Enterprise upgrade service), data migrations (ETL) and per-instance database metrics
+
+Open a GitHub issue with the `enhancement` label to influence priorities.
+
+---
+
+## Status
+
+**Production-ready** — IncubaCloud Core is actively used in production environments. The platform provides a stable feature set with comprehensive test coverage, role-based access control and audit logging.
+
+---
+
+## Contributing
+
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+
+If you are an Odoo partner or developer:
+- Bug reports and security issues → see [SECURITY.md](SECURITY.md)
+- Architectural discussions → open an issue first
+- New providers or integrations → discuss before submitting
+
+---
+
+## Licensing
+
+Copyright © INCUBACLOUD, SOCIEDAD LIMITADA.
+
+IncubaCloud Core is licensed under the **[Elastic License 2.0 (ELv2)](LICENSE)**, except the two modules the table below marks LGPL-3.0, which carry their own `LICENSE` file.
+
+| Module | Licence | Manifest `license` |
+|---|---|---|
+| `incubacloud` | ELv2 | `Other proprietary` |
+| `incubacloud_pitr` | ELv2 | `Other proprietary` |
+| `incubacloud_mcp` | ELv2 | `Other proprietary` |
+| `incubacloud_mcp_pitr` | ELv2 | `Other proprietary` |
+| `incubacloud_assistant` | ELv2 | `Other proprietary` |
+| `incubacloud_connect` | LGPL-3.0 | `LGPL-3` |
+| `auth_oauth_github` | LGPL-3.0 | `LGPL-3` |
+
+Odoo's manifest accepts only a closed list of licence keys, and ELv2 is not one of them: `Other proprietary` is the key that list has for it. The licence of these modules is the ELv2 in [LICENSE](LICENSE).
+
+Under the ELv2 you are free to:
+- Use the software for your own Odoo installations
+- Study and modify the source code
+- Distribute modified versions
+
+You may **not**:
+- Offer the software (or a product substantially based on it) as a hosted or managed service to third parties
+
+Using IncubaCloud to deploy, run and support Odoo for your own clients is allowed: for example, as an Odoo partner, a freelancer or an agency whose clients pay you for development, support or consulting. That includes giving those clients access to their own projects in the panel, which is what the client roles are for. What the ELv2 does not allow is offering IncubaCloud itself to third parties as a hosted or managed service, such as an Odoo hosting platform built on it.
+
+The third-party software IncubaCloud uses is listed, with its licences, in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Odoo is a trademark of Odoo S.A. IncubaCloud is not affiliated with Odoo S.A.
+
+---
+
+## Contact
+
+Project maintained by **IncubaCloud**
+
+Support and partnerships:
+contact@incubacloud.io
+
+**Rather not run it yourself?** The [hosted platform](https://www.incubacloud.io/?utm_source=github&utm_medium=readme) runs the same panel for you.

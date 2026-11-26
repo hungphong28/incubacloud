@@ -1,0 +1,234 @@
+"""Lightweight rate-limit counter backed by the DB.
+
+One row per bucket (e.g. ``webhook_ip:1.2.3.4`` or
+``terminal_user:42``), tumbling window (default 60s). Exceeded buckets
+return ``False`` from ``hit()`` so callers can short-circuit without
+raising.
+
+Caps are read from ``cloud.settings`` so the admin can tune them from
+Settings → Rates without redeploying:
+
+  * ``rate_limit_webhook_per_min``        (default 300)
+  * ``rate_limit_terminal_per_min``       (default 30)
+  * ``rate_limit_terminal_user_per_min``  (default 10)
+  * ``rate_limit_host_console_per_min``   (default 3)
+  * ``rate_limit_connect_per_min``        (default 20)
+  * ``rate_limit_connect_user_per_min``   (default 10)
+  * ``rate_limit_github_previews_per_hour`` (default 10)
+  * ``rate_limit_github_imports_per_hour``  (default 5)
+  * ``rate_limit_git_reads_per_hour``       (default 120)
+
+Inheriting modules can ship their own rate-limit model (with their
+own caps, buckets and GC cadence) as a sibling rather than reusing
+this one — keeping the modules decoupled and letting each evolve
+independently.
+
+The counter is deliberately simple: single row per bucket updated via
+ORM write. Under concurrent contention two writers may both read the
+same count and both increment — the actual throughput may exceed the
+configured cap by a small factor. For our use case (preventing brute
+force and cost DoS) that is acceptable; tightening to a strict atomic
+cap would require ``SELECT ... FOR UPDATE`` or Redis.
+"""
+from datetime import timedelta
+
+from odoo import api, fields, models, tools
+
+from ._concurrency import read_committed_cursor
+
+
+# Defaults used when cloud.settings returns 0 or the singleton isn't
+# ready yet (e.g. during an installation where the hook fires before
+# the default record exists).
+RATE_LIMIT_DEFAULTS = {
+    'rate_limit_webhook_per_min': 300,
+    'rate_limit_terminal_per_min': 30,
+    'rate_limit_terminal_user_per_min': 10,
+    # A host shell is root on the whole machine, so it gets a far
+    # tighter cap than the container terminal. Applied per user and,
+    # separately, per host.
+    'rate_limit_host_console_per_min': 3,
+    'rate_limit_connect_per_min': 20,
+    'rate_limit_connect_user_per_min': 10,
+    # Reading logs: the viewer polls the live tail every 4 s, so the
+    # read cap has to clear ~15/min per open viewer with room for a few
+    # of them. The sweep is a different animal — it decompresses days
+    # of logs on the customer's host — and gets a much tighter one.
+    'rate_limit_logs_per_min': 60,
+    'rate_limit_log_search_per_min': 6,
+    # Reading captured mail: a browse of the tab is one listing
+    # plus one read per message opened, so the cap has to clear a
+    # few minutes of ordinary clicking without letting the tab
+    # become a way to walk a whole mailbox at speed.
+    'rate_limit_mail_reads_per_min': 30,
+    'rate_limit_github_previews_per_hour': 10,
+    'rate_limit_github_imports_per_hour': 5,
+    # Reads of a Git provider's repository (GitLab) from the editor:
+    # each one is a git process on the panel, heavier than a call to
+    # GitHub's API.
+    'rate_limit_git_reads_per_hour': 120,
+}
+
+
+def consume_quota(env, bucket, **hit_kwargs):
+    """Count one hit on *bucket* in a transaction of its own.
+
+    The one function every quota of a request counts with: the hourly
+    caps of GitHub previews and imports and of git reads
+    (``consume_hourly_quota``), the assistant's tool calls and its
+    failed authentications. Committed at once, so a hit refused later
+    still counts and parallel requests do not fight over the bucket's
+    row inside their own transactions. The cursor runs at READ
+    COMMITTED (:func:`read_committed_cursor`): at Odoo's REPEATABLE READ
+    a hit that met a row another hit had just created or committed was
+    aborted with "could not serialize access due to concurrent update",
+    logged at ERROR. Here the second hit waits for the row and adds to
+    it, and the atomic upsert of :meth:`CloudRateLimit.hit` hands each
+    hit its own count, so parallel hits never pass the cap.
+
+    :param env: an Odoo environment, of the user who asks (its user and
+        context are kept)
+    :param str bucket: the rate-limit bucket
+    :param hit_kwargs: ``cap_key`` or ``max_per_window``, and
+        ``window_seconds``, as :meth:`CloudRateLimit.hit` takes them
+    :return: whether the hit is within the cap
+    :rtype: bool
+    """
+    with read_committed_cursor(env.registry) as cr:
+        quota_env = api.Environment(cr, env.uid, dict(env.context))
+        allowed = quota_env['cloud.rate.limit'].sudo().hit(
+            bucket, **hit_kwargs,
+        )
+        cr.commit()
+        return allowed
+
+
+def refund_quota(env, bucket):
+    """Give back the hit :func:`consume_quota` counted on *bucket*.
+
+    For a request refused after its hit was counted, by something that
+    is no use of what the quota limits (a queue that already holds the
+    same job, say): the hit was committed at once, so the request's own
+    rollback does not undo it. In a transaction of its own, as the hit
+    was; the count never goes below zero. A hit test mode did not count
+    (:meth:`CloudRateLimit.hit`) leaves no row, and nothing is given back.
+
+    :param env: an Odoo environment, as :func:`consume_quota` takes it
+    :param str bucket: the rate-limit bucket the hit was counted on
+    """
+    with read_committed_cursor(env.registry) as cr:
+        quota_env = api.Environment(cr, env.uid, dict(env.context))
+        quota_env['cloud.rate.limit'].sudo()._unhit(bucket)
+        cr.commit()
+
+
+class CloudRateLimit(models.Model):
+    _name = 'cloud.rate.limit'
+    _description = 'Cloud Rate Limit Counter'
+
+    bucket = fields.Char(required=True, index=True)
+    window_start = fields.Datetime(required=True)
+    count = fields.Integer(default=0)
+
+    _bucket_uniq = models.Constraint(
+        'unique (bucket)',
+        'One row per rate-limit bucket.',
+    )
+
+    # ── Config accessors ────────────────────────────────────────────────────
+
+    @api.model
+    def _get_cap(self, key):
+        """Return the configured cap for *key* or the documented default.
+
+        Reads from the ``cloud.settings`` singleton. Any non-positive
+        value falls back to the default so a misconfigured 0 can't
+        accidentally lock every request out.
+        """
+        default = RATE_LIMIT_DEFAULTS[key]
+        settings = self.env['cloud.settings'].sudo()._get()
+        value = getattr(settings, key, 0) or 0
+        return value if value > 0 else default
+
+    # ── Hit / check ─────────────────────────────────────────────────────────
+
+    @api.model
+    def hit(self, bucket, cap_key=None,
+            max_per_window=None, window_seconds=60):
+        """Register a hit on *bucket*. Return True if allowed, False if over.
+
+        Caller passes either ``cap_key`` (read from settings) or a
+        literal ``max_per_window``. In test mode the check is bypassed
+        unless the context flag ``force_rate_limit`` is set — tests
+        that target this code opt in explicitly.
+        """
+        if tools.config.get('test_enable') and not (
+            self.env.context.get('force_rate_limit')
+        ):
+            return True
+        if max_per_window is None:
+            if cap_key is None:
+                raise ValueError(
+                    "hit() requires cap_key or max_per_window",
+                )
+            max_per_window = self._get_cap(cap_key)
+        # Atomic upsert: insert the row if missing, otherwise update
+        # in place. The CASE expression resets the window when expired
+        # (now - window_start >= window_seconds) or increments the
+        # counter. RETURNING count gives the post-update value so we
+        # can compare against the cap and decide allow/deny without a
+        # second query. This collapses what used to be a TOCTOU race
+        # (two readers both observing count=N and both writing N+1)
+        # into a single statement that Postgres serialises via the
+        # row-level lock taken by ON CONFLICT.
+        self.env.cr.execute(
+            """
+            INSERT INTO cloud_rate_limit (
+                bucket, window_start, count,
+                create_uid, create_date, write_uid, write_date
+            )
+            VALUES (%s, NOW(), 1, 1, NOW(), 1, NOW())
+            ON CONFLICT (bucket) DO UPDATE SET
+                window_start = CASE
+                    WHEN NOW() - cloud_rate_limit.window_start
+                         >= INTERVAL '1 second' * %s
+                    THEN NOW()
+                    ELSE cloud_rate_limit.window_start
+                END,
+                count = CASE
+                    WHEN NOW() - cloud_rate_limit.window_start
+                         >= INTERVAL '1 second' * %s
+                    THEN 1
+                    ELSE cloud_rate_limit.count + 1
+                END,
+                write_date = NOW()
+            RETURNING count
+            """,
+            (bucket, window_seconds, window_seconds),
+        )
+        new_count = self.env.cr.fetchone()[0]
+        return new_count <= max_per_window
+
+    @api.model
+    def _unhit(self, bucket):
+        """Take one hit off *bucket*'s count, never below zero.
+
+        :func:`refund_quota`'s statement: one atomic update, as
+        :meth:`hit`'s upsert is, and nothing when the bucket has no row.
+
+        :param str bucket: the rate-limit bucket
+        """
+        self.env.cr.execute(
+            """
+            UPDATE cloud_rate_limit
+               SET count = GREATEST(count - 1, 0), write_date = NOW()
+             WHERE bucket = %s
+            """,
+            (bucket,),
+        )
+
+    @api.model
+    def _gc(self, older_than_hours=24):
+        """Remove rows whose window is older than N hours. Cron-invoked."""
+        cutoff = fields.Datetime.now() - timedelta(hours=older_than_hours)
+        self.sudo().search([('window_start', '<', cutoff)]).unlink()

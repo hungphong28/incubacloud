@@ -1,0 +1,538 @@
+import { Monitoring } from "../components/monitoring/monitoring";
+import { Component, useState, onMounted, onWillUnmount, onWillStart, useSubEnv } from "@odoo/owl";
+import { rpc } from "@web/core/network/rpc";
+import { _t } from "@web/core/l10n/translation";
+import { useService } from "@web/core/utils/hooks";
+import { useDebouncedBus } from "../utils/use_debounced_bus";
+import { createProjectStore } from "../store/project_store";
+import { ProjectDashboard } from "../components/project_dashboard/project_dashboard";
+import { ProjectDetail } from "../components/project_detail/project_detail";
+
+import { HostsDashboard } from "../components/hosts_dashboard/hosts_dashboard";
+import { HostDetail } from "../components/host_detail/host_detail";
+import { InstanceDetail } from "../components/instance_detail/instance_detail";
+import { Settings } from "../components/settings/settings";
+import { legacySection } from "../components/settings/settings_registry";
+import "../components/settings/core_sections";
+import { BackupBackendsList } from "../components/backup_backend_detail/backup_backends_list";
+import { BackupBackendDetail } from "../components/backup_backend_detail/backup_backend_detail";
+import { SessionsAccess } from "../components/sessions_access/sessions_access";
+import { SlideOver } from "../components/slide_over/slide_over";
+import { AppHeader } from "../components/app_header/app_header";
+import { ProjectSidebar } from "../components/project_sidebar/project_sidebar";
+import { MainComponentsContainer } from "@web/core/main_components_container";
+import { ToastContainer } from "../toast/toast_container";
+import { createToastService } from "../toast/toast";
+import { relayIcon } from "../utils/icons";
+
+// Apply the saved UI theme as early as possible (default: light) to avoid a flash.
+try { document.documentElement.setAttribute("data-ic-theme", localStorage.getItem("ic-theme") || "light"); } catch (e) { /* private mode */ }
+
+const _BASE = "/cloud";
+
+// ── Route extension registry ─────────────────────────────────────────────────
+// Private modules call registerRoute() to add SPA routes without modifying core.
+const _routeExtensions = [];
+
+/**
+ * Register an additional SPA route from a third-party module.
+ * @param {string}   name  - route identifier (e.g. 'custom_page')
+ * @param {function} parse - (parts: string[]) => params object | null
+ * @param {function} build - (params: object) => URL string
+ */
+export function registerRoute(name, parse, build) {
+    _routeExtensions.push({ name, parse, build });
+}
+
+export function _parseRoute(pathname) {
+    const path = pathname.startsWith(_BASE) ? pathname.slice(_BASE.length) : "/";
+    const parts = path.split("/").filter(Boolean);
+
+    if (!parts.length) return { route: "projects", params: {} };
+
+    switch (parts[0]) {
+        case "projects": {
+            if (parts.length === 1) return { route: "projects", params: {} };
+            if (parts[1] === "new") return { route: "new_project", params: {} };
+            const pid = parseInt(parts[1]);
+            if (isNaN(pid)) return { route: "projects", params: {} };
+            if (parts[2] === "settings") return { route: "project_settings", params: { project_id: pid } };
+            if (parts.length === 2) return { route: "project_detail", params: { project_id: pid } };
+            if (parts[2] === "instances") {
+                if (parts.length === 3) return { route: "project_detail", params: { project_id: pid } };
+                if (parts[3] === "new") {
+                    const env = new URLSearchParams(window.location.search).get("env") || undefined;
+                    return { route: "create_instance", params: { project_id: pid, ...(env ? { environment: env } : {}) } };
+                }
+                const iid = parseInt(parts[3]);
+                if (!isNaN(iid)) {
+                    // ?tab= opens one of its tabs (the first steps link to Networking).
+                    const tab = new URLSearchParams(window.location.search).get("tab") || undefined;
+                    return { route: "instance_detail", params: { project_id: pid, instance_id: iid, ...(tab ? { tab } : {}) } };
+                }
+            }
+            return { route: "project_detail", params: { project_id: pid } };
+        }
+        case "hosts": {
+            if (parts.length === 1) return { route: "hosts", params: {} };
+            if (parts[1] === "new") return { route: "new_host", params: {} };
+            const hid = parseInt(parts[1]);
+            if (!isNaN(hid)) {
+                // ?tab= opens one of its tabs (Monitoring links to Metrics).
+                const tab = new URLSearchParams(window.location.search).get("tab") || undefined;
+                return { route: "host_detail", params: { host_id: hid, ...(tab ? { tab } : {}) } };
+            }
+            return { route: "hosts", params: {} };
+        }
+        case "monitoring":
+            return { route: "monitoring", params: {} };
+        case "sessions":
+            return { route: "sessions", params: {} };
+        case "settings": {
+            // /cloud/settings/<section>#<field>; ?tab= is a link from
+            // before the sections, which Settings maps to one.
+            const section = parts[1] || undefined;
+            const tab = !section
+                ? new URLSearchParams(window.location.search).get("tab") || undefined
+                : undefined;
+            const field = window.location.hash.slice(1) || undefined;
+            return {
+                route: "settings",
+                params: {
+                    ...(section ? { section } : {}),
+                    ...(tab ? { tab } : {}),
+                    ...(field ? { field } : {}),
+                },
+            };
+        }
+        case "backup-backends": {
+            if (parts.length === 1) return { route: "backup_backends", params: {} };
+            if (parts[1] === "new") return { route: "new_backup_backend", params: {} };
+            const bid = parseInt(parts[1]);
+            if (!isNaN(bid)) return { route: "backup_backend_detail", params: { backend_id: bid } };
+            return { route: "backup_backends", params: {} };
+        }
+        default: {
+            for (const ext of _routeExtensions) {
+                const params = ext.parse(parts);
+                if (params !== null) return { route: ext.name, params };
+            }
+            return { route: "projects", params: {} };
+        }
+    }
+}
+
+export function _buildUrl(route, params = {}) {
+    switch (route) {
+        case "projects":          return `${_BASE}/projects`;
+        case "new_project":        return `${_BASE}/projects/new`;
+        case "project_detail":    return `${_BASE}/projects/${params.project_id}`;
+        case "project_settings":  return `${_BASE}/projects/${params.project_id}/settings`;
+
+        case "create_instance": {
+            const qs = params.environment ? `?env=${params.environment}` : "";
+            return `${_BASE}/projects/${params.project_id}/instances/new${qs}`;
+        }
+        case "instance_detail": {
+            const qs = params.tab ? `?tab=${encodeURIComponent(params.tab)}` : "";
+            return `${_BASE}/projects/${params.project_id}/instances/${params.instance_id}${qs}`;
+        }
+        case "hosts":             return `${_BASE}/hosts`;
+        case "new_host":          return `${_BASE}/hosts/new`;
+        case "host_detail": {
+            const qs = params.tab ? `?tab=${encodeURIComponent(params.tab)}` : "";
+            return `${_BASE}/hosts/${params.host_id}${qs}`;
+        }
+
+        case "monitoring":            return `${_BASE}/monitoring`;
+        case "sessions":              return `${_BASE}/sessions`;
+        case "settings": {
+            const section = params.section || legacySection(params.tab);
+            const path = section ? `${_BASE}/settings/${section}` : `${_BASE}/settings`;
+            return params.field ? `${path}#${params.field}` : path;
+        }
+        case "backup_backends":       return `${_BASE}/backup-backends`;
+        case "new_backup_backend":    return `${_BASE}/backup-backends/new`;
+        case "backup_backend_detail": return `${_BASE}/backup-backends/${params.backend_id}`;
+        default: {
+            for (const ext of _routeExtensions) {
+                if (ext.name === route) return ext.build(params);
+            }
+            return _BASE;
+        }
+    }
+}
+
+/**
+ * Whether a move from *fromUrl* to *toUrl* asks the sidebar's count
+ * badges again: when it changes section (the first segment after
+ * ``/cloud``: projects, hosts, backup-backends, settings, …) or lands
+ * on a section's own page, as a click on a sidebar entry does.
+ *
+ * @param {string} fromUrl the panel's address before the move
+ * @param {string} toUrl the address it moves to
+ * @returns {boolean}
+ */
+export function _refreshesNavCounts(fromUrl, toUrl) {
+    const path = (url) => (url || "").split("?")[0].replace(/\/+$/, "");
+    const section = (url) => path(url).split("/")[2] || "";
+    return section(fromUrl) !== section(toUrl) || path(toUrl) === `${_BASE}/${section(toUrl)}`;
+}
+
+export class Chrome extends Component {
+    static components = { AppHeader, ProjectSidebar, ProjectDashboard, ProjectDetail, HostsDashboard, HostDetail, InstanceDetail, Settings, BackupBackendsList, BackupBackendDetail, Monitoring, SessionsAccess, SlideOver, MainComponentsContainer, ToastContainer };
+
+    get isInsideProject() {
+        const r = this.state.route;
+        return ["project_detail", "project_settings", "create_instance", "instance_detail"].includes(r)
+            && !!this.state.params.project_id;
+    }
+    static props = { disableLoader: Function };
+
+    /**
+     * Keyboard activation for sidebar nav items: Enter and Space fire
+     * the same handler as a click. This is what makes the
+     * tabindex="0" list items actually operable without a mouse —
+     * before it, the global nav was click-only (audit item 7).
+     */
+    onNavItemKeydown(ev) {
+        if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            ev.currentTarget.click();
+        }
+    }
+
+    /**
+     * Close the off-canvas navigation (backdrop tap / Escape).
+     */
+    closeSidebar() {
+        this.state.sidebarOpen = false;
+    }
+
+    /**
+     * Escape closes the off-canvas navigation, the way every overlay
+     * on the platform behaves. With no overlay open it dismisses the
+     * latest toast instead: errors persist, and the keyboard needs a
+     * way to close them. Modals stop Escape before it gets here; the
+     * slide-over and open dropdowns handle it themselves, so they win.
+     *
+     * @param {KeyboardEvent} ev
+     */
+    onGlobalKeydown(ev) {
+        if (ev.key !== "Escape") return;
+        if (this.state.sidebarOpen) {
+            this.state.sidebarOpen = false;
+            return;
+        }
+        if (this.state.slideOver || ev.defaultPrevented) return;
+        if (ev.target?.closest?.("[aria-expanded='true'], .rl-sel--open")) return;
+        this._dismissLatestToast?.();
+    }
+
+    /**
+     * Text of a failed-job toast: what failed, on what, and why in one
+     * line, so the user knows whether to act before opening anything.
+     *
+     * @param {{name: string, target_name?: string, error?: string}} brief
+     *     the ``/cloud/get_job_brief`` answer
+     * @returns {string}
+     */
+    _jobFailedMessage(brief) {
+        if (!brief.target_name) return _t("%s failed", brief.name);
+        if (!brief.error) return _t("%s on %s failed", brief.name, brief.target_name);
+        return _t("%s on %s failed: %s", brief.name, brief.target_name, brief.error);
+    }
+
+    /**
+     * Open the job history of the failed job's instance, or of its host
+     * when the job has no instance: the failed job is at the top.
+     *
+     * @param {{host_id?: number, instance_id?: number}} brief
+     */
+    _openJobsOf(brief) {
+        this.state.slideOver = {
+            panel: "jobs",
+            instanceId: brief.instance_id || false,
+            hostId: brief.instance_id ? false : (brief.host_id || false),
+            expanded: false,
+        };
+    }
+
+    setup() {
+        const initial = _parseRoute(window.location.pathname);
+        this.state = useState({
+            route: initial.route,
+            params: initial.params,
+            features: {},
+            role: 'stakeholder',
+            permissions: {},
+            userName: '',
+            userLogin: '',
+            avatarUrl: '',
+            alertCount: 0,
+            navCounts: {},   // { projects, hosts, backups, ... } for sidebar badges
+            projectName: "",
+            slideOver: null,  // { panel: "jobs"|"alerts", instanceId }
+            // Off-canvas navigation. Only meaningful under the mobile
+            // breakpoint, where the sidebar leaves the flow; on desktop
+            // the sidebar is docked and this stays false.
+            sidebarOpen: false,
+        });
+
+        this._pollAlertCount = async () => {
+            try {
+                const data = await rpc('/cloud/get_alert_count', {});
+                this.state.alertCount = data.count;
+            } catch (_e) { console.debug("Alert count fetch skipped:", _e); }
+        };
+        /**
+         * Ask the sidebar's count badges again (``/cloud/get_nav_counts``)
+         * and merge them in: a badge the answer leaves out (one an addon
+         * counts only in ``/cloud/get_config``) keeps its value.
+         */
+        this._refreshNavCounts = async () => {
+            try {
+                const data = await rpc('/cloud/get_nav_counts', {});
+                this.state.navCounts = { ...this.state.navCounts, ...(data?.nav_counts || {}) };
+            } catch (_e) { console.debug("Nav counts fetch skipped:", _e); }
+        };
+        // Coalesced: a create that navigates, or a burst of jobs ending,
+        // asks once.
+        const triggerNavCounts = useDebouncedBus(() => this._refreshNavCounts());
+        this._busService = useService("bus_service");
+        // Debounce overview invalidations: a burst of alert mutations
+        // (e.g. dismiss-all-selected) would otherwise trigger as many
+        // ``get_alert_count`` RPCs as there are rows affected.
+        const triggerAlertRefresh = useDebouncedBus(() => this._pollAlertCount());
+        this._onOverviewUpdate = (payload) => {
+            triggerAlertRefresh();
+            // Critical alerts ride the overview event already filtered
+            // per user on the server (record rules checked before each
+            // send) — safe to display without a round-trip.
+            for (const alert of payload?.critical || []) {
+                this._toastApi?.error(alert.message);
+            }
+        };
+
+        /**
+         * Live job toasts. Chunk-flush events carry a running state and
+         * are ignored; the terminal transition (done/failed) fetches
+         * displayable info back through the ACL path — jobs the user
+         * cannot see (and hidden background types) return ok:false and
+         * never toast.
+         * @param {{id: number, state: string}} payload bus event
+         */
+        this._toastedJobs = new Set();
+        this._onJobEvent = async (payload) => {
+            const { id, state } = payload || {};
+            if (!id || (state !== "done" && state !== "failed")) return;
+            // A job that ended may have removed a host or a project.
+            triggerNavCounts();
+            const key = `${id}:${state}`;
+            if (this._toastedJobs.has(key)) return;
+            if (this._toastedJobs.size > 500) this._toastedJobs.clear();
+            this._toastedJobs.add(key);
+            try {
+                const brief = await rpc("/cloud/get_job_brief", { job_id: id });
+                if (!brief?.ok) return;
+                if (brief.state === "done") {
+                    this._toastApi?.success(_t("%s completed", brief.name));
+                } else if (brief.state === "failed") {
+                    this._toastApi?.error(
+                        this._jobFailedMessage(brief),
+                        { label: _t("View"), onClick: () => this._openJobsOf(brief) },
+                    );
+                }
+            } catch (_e) { console.debug("Job toast skipped:", _e); }
+        };
+
+        onWillStart(async () => {
+            try {
+                const config = await rpc("/cloud/get_config", {});
+                this.state.features = config.features || {};
+                this.state.role = config.role || 'stakeholder';
+                this.state.permissions = config.permissions || {};
+                this.state.navCounts = config.nav_counts || {};
+                if (config.user) {
+                    this.state.userName = config.user.name || '';
+                    this.state.userLogin = config.user.login || '';
+                    this.state.avatarUrl = config.user.avatar_url || '';
+                }
+            } catch (_e) { console.warn("Failed to load initial config:", _e); }
+        });
+
+        // Slot for the current "form dirty" guard. Registered by
+        // detail components via useNavGuard(). Only one slot — the SPA
+        // shows a single page per route, so there is never a valid
+        // reason for two guards at once. If two components register
+        // we keep the latest (mirrors the user's focus).
+        this._navGuard = null;
+
+        // Remember the pre-popstate URL so we can rewind the browser
+        // history when the user cancels a back/forward transition.
+        this._lastAcceptedRoute = _parseRoute(window.location.pathname);
+
+        this._onPopState = async () => {
+            const parsed = _parseRoute(window.location.pathname);
+            // popstate has already mutated history before we get the
+            // event — if the guard rejects, we push the previous URL
+            // back so the address bar matches reality.
+            if (this._navGuard) {
+                const ok = await this._navGuard();
+                if (!ok) {
+                    const prev = this._lastAcceptedRoute;
+                    history.pushState(
+                        null, "",
+                        _buildUrl(prev.route, prev.params),
+                    );
+                    return;
+                }
+            }
+            const prev = this._lastAcceptedRoute;
+            this.state.route = parsed.route;
+            this.state.params = parsed.params;
+            this._lastAcceptedRoute = parsed;
+            if (_refreshesNavCounts(_buildUrl(prev.route, prev.params), window.location.pathname)) {
+                triggerNavCounts();
+            }
+        };
+
+        this._onGlobalKeydown = (ev) => this.onGlobalKeydown(ev);
+
+        onMounted(() => {
+            this.props.disableLoader();
+            window.addEventListener("popstate", this._onPopState);
+            window.addEventListener("keydown", this._onGlobalKeydown);
+            this._pollAlertCount();
+            this._busService.subscribe("cloud_overview", this._onOverviewUpdate);
+            this._busService.subscribe("cloud_jobs", this._onJobEvent);
+            this._busService.start();
+        });
+
+        onWillUnmount(() => {
+            window.removeEventListener("popstate", this._onPopState);
+            window.removeEventListener("keydown", this._onGlobalKeydown);
+            this._busService.unsubscribe("cloud_overview", this._onOverviewUpdate);
+            this._busService.unsubscribe("cloud_jobs", this._onJobEvent);
+        });
+
+        const appState = this.state;
+        const pollAlertCount = this._pollAlertCount;
+        let _alertReturnUrl = null;
+        // Toast notification service
+        const { toastApi, toasts, dismissToast, dismissLatestToast } = createToastService();
+        // Referenced by the bus handlers above (they only run
+        // post-mount, long after setup finished assigning this).
+        this._toastApi = toastApi;
+        this._dismissLatestToast = dismissLatestToast;
+
+        // Single source of truth for project data on the SPA side.
+        // Owns the cloud_jobs bus subscription that drives the
+        // ``/cloud/get_project_full`` cache; replaces the eight
+        // ad-hoc env helpers (project cache + sidebar callback
+        // registry) the codebase used to wire by hand. See
+        // ``store/project_store.js`` for the contract.
+        const projectStore = createProjectStore({ busService: this._busService });
+        useSubEnv({
+            toast: toastApi,
+            toasts,
+            dismissToast,
+            icon: relayIcon,
+            projectStore,
+            setAlertReturnUrl: (url) => { _alertReturnUrl = url; },
+            getAlertReturnUrl: () => _alertReturnUrl,
+            get alertCount() { return appState.alertCount; },
+            get role() { return appState.role; },
+            get permissions() { return appState.permissions; },
+            get navCounts() { return appState.navCounts; },
+            get userInfo() {
+                return {
+                    name: appState.userName,
+                    login: appState.userLogin,
+                    avatarUrl: appState.avatarUrl,
+                };
+            },
+            get currentRoute() {
+                return {
+                    route: appState.route,
+                    params: appState.params,
+                    projectName: appState.projectName,
+                };
+            },
+            setProjectName: (name) => { appState.projectName = name; },
+            refreshAlertCount: () => pollAlertCount(),
+            // After a project, a host or a backup destination is created
+            // or deleted: the sidebar's badges, asked again.
+            refreshNavCounts: () => triggerNavCounts(),
+            toggleSlideOver: (panel, instanceId = false, hostId = false) => {
+                if (appState.slideOver && appState.slideOver.panel === panel) {
+                    appState.slideOver = null;
+                } else {
+                    appState.slideOver = { panel, instanceId, hostId, expanded: false };
+                }
+            },
+            closeSlideOver: () => {
+                appState.slideOver = null;
+            },
+            // The alerts panel, open on one alert (what keeps a job that
+            // reads "Action required"); all of them without an id.
+            openAlert: (alertId) => {
+                appState.slideOver = { panel: "alerts", alertId: alertId || false, expanded: false };
+            },
+            // Read back as a prop (AppHeader) or off this.state (the
+            // shell), so only the setter belongs on env.
+            toggleSidebar: () => {
+                appState.sidebarOpen = !appState.sidebarOpen;
+            },
+            navigate: async (route, params = {}) => {
+                if (route === "logout") {
+                    // ``beforeunload`` (still registered by useNavGuard)
+                    // fires for full-page reloads, so logout inherits
+                    // the same warning for free — no special casing.
+                    window.location.href = "/";
+                    return;
+                }
+                if (this._navGuard) {
+                    const ok = await this._navGuard();
+                    if (!ok) return;
+                }
+                const url = _buildUrl(route, params);
+                const fromUrl = window.location.pathname;
+                history.pushState(null, "", url);
+                if (_refreshesNavCounts(fromUrl, url)) triggerNavCounts();
+                appState.route = route;
+                appState.params = params;
+                // Picking a destination closes the off-canvas menu, so
+                // the target page is not left hidden behind it.
+                appState.sidebarOpen = false;
+                this._lastAcceptedRoute = { route, params };
+                // Drop project state when navigating away so the store
+                // doesn't keep refreshing in the background after we
+                // leave the project context.
+                const projectRoutes = [
+                    "project_detail", "project_settings", "create_instance",
+                    "instance_detail", "project_hub",
+                ];
+                if (!projectRoutes.includes(route)) {
+                    appState.projectName = "";
+                    projectStore.invalidate();
+                }
+            },
+            setNavGuard: (fn) => { this._navGuard = fn; },
+            clearNavGuard: () => { this._navGuard = null; },
+            get features() { return appState.features; },
+        });
+    }
+
+    closeSlideOver() {
+        this.state.slideOver = null;
+    }
+
+    toggleSlideOverSize() {
+        if (this.state.slideOver) {
+            this.state.slideOver.expanded = !this.state.slideOver.expanded;
+        }
+    }
+}
+
+Chrome.template = "incubacloud.AppShell";

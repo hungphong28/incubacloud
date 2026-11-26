@@ -1,0 +1,26 @@
+// ModuleSelector — chip-based addon selector
+// The base `.ic-module-*` chip + dropdown rules live in repo_editor.scss
+// (restyled to rl design tokens). This file only adds the overlap/conflict
+// affordances and the exclude-section heading tweak.
+
+.ic-module-overlap-error {
+    margin-top: 5px;
+    font-family: var(--rl-fm);
+    font-size: 11px;
+    color: var(--rl-red);
+    padding: 3px 8px;
+    border-radius: 5px;
+    background: var(--rl-red-soft);
+}
+
+.ic-module-chip.ic-module-chip--conflict {
+    background: var(--rl-red-soft);
+    border: 1px solid var(--rl-red);
+    color: var(--rl-red);
+}
+
+// Exclude-section heading
+.ic-repo-excludes-label {
+    margin-top: 6px;
+    opacity: 0.75;
+}

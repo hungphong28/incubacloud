@@ -1,0 +1,639 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+<template id="log_terminal" name="Cloud Job Log Terminal">&lt;!DOCTYPE html&gt;
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>Log — <t t-esc="job_name"/></title>
+    <link rel="icon" type="image/svg+xml" href="/incubacloud/static/src/img/icon-solid.svg"/>
+    <link rel="stylesheet" href="/incubacloud/static/fonts/fonts.css"/>
+    <link rel="preload" href="/incubacloud/static/fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin=""/>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            background: #0a0c0d;
+            color: #c3cad0;
+            font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, Consolas, monospace;
+            font-size: 13px;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* ── Header ── */
+        .terminal-header {
+            background: #101315;
+            border-bottom: 1px solid #262b2f;
+            padding: 8px 16px;
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
+            align-items: center;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+
+        .terminal-job-info {
+            font-family: 'Space Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif;
+            font-size: 13px;
+            color: #c3cad0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-width: 0;
+        }
+        .terminal-job-instance {
+            color: #eef1f3;
+            font-weight: 600;
+        }
+        .terminal-job-host-sep { color: #737d85; margin: 0 2px; }
+        .terminal-job-host { color: #8a949c; }
+
+        /* ── Search ── */
+        .search-wrap {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .search-input {
+            background: #181c1f;
+            border: 1px solid #333a3f;
+            border-radius: 4px;
+            color: #c3cad0;
+            font-family: inherit;
+            font-size: 12px;
+            padding: 4px 10px;
+            width: 220px;
+            outline: none;
+            transition: border-color 0.15s;
+        }
+        .search-input:focus { border-color: #2fc78c; }
+        .search-input::placeholder { color: #737d85; }
+
+        .search-count {
+            font-size: 11px;
+            color: #737d85;
+            white-space: nowrap;
+            text-align: right;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .search-count.has-results { color: #9fd6e2; }
+        .search-count.no-results  { color: #ff9b9d; }
+        .search-esc-tip {
+            font-size: 10px;
+            color: #737d85;
+            background: #181c1f;
+            border: 1px solid #333a3f;
+            border-radius: 3px;
+            padding: 1px 5px;
+            letter-spacing: 0.03em;
+        }
+
+        .job-state-badge {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            justify-self: end;
+        }
+        .state-pending  { background: rgba(239,165,62,.14); color: #f0c987; }
+        .state-running  { background: rgba(79,182,198,.14); color: #9fd6e2; }
+        .state-done     { background: rgba(47,199,140,.15); color: #9fe7c4; }
+        .state-failed   { background: rgba(255,96,99,.15); color: #ff9b9d; }
+        .state-cancelled{ background: #181c1f; color: #8a949c; }
+
+        /* ── Terminal body ── */
+        .terminal-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 12px 16px;
+            scroll-behavior: smooth;
+        }
+        .terminal-body::-webkit-scrollbar { width: 6px; }
+        .terminal-body::-webkit-scrollbar-thumb { background: #333a3f; border-radius: 3px; }
+
+        .line {
+            display: flex;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .line .prefix {
+            flex-shrink: 0;
+            opacity: 0.45;
+            user-select: none;
+            margin-right: 0.8em;
+            white-space: nowrap;
+        }
+        .line.stdout { color: #c3cad0; }
+        .line.stderr { color: #ff9b9d; }
+        .line.system {
+            color: #9fd6e2;
+            font-style: italic;
+        }
+        .line.search-hidden { display: none; }
+        .line mark {
+            background: rgba(239,165,62,.3);
+            color: inherit;
+            border-radius: 2px;
+        }
+
+        /* ── Footer ── */
+        .terminal-footer {
+            background: #101315;
+            border-top: 1px solid #262b2f;
+            padding: 6px 16px;
+            font-size: 11px;
+            color: #737d85;
+            display: flex;
+            justify-content: space-between;
+            flex-shrink: 0;
+        }
+        #status-text { color: #8a949c; }
+
+        /* Blinking cursor while running */
+        .cursor {
+            display: inline-block;
+            width: 8px;
+            height: 13px;
+            background: #2fc78c;
+            vertical-align: text-bottom;
+            animation: blink 1s step-end infinite;
+            margin-left: 2px;
+        }
+        @keyframes blink { 50% { opacity: 0; } }
+
+        /* ── Trigger bar ── */
+        .terminal-trigger-bar {
+            background: #181c1f;
+            border-bottom: 1px solid #262b2f;
+            padding: 8px 16px;
+            font-family: 'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif;
+            font-size: 12px;
+            color: #c3cad0;
+            flex-shrink: 0;
+        }
+        .terminal-trigger-row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+        }
+        .terminal-trigger-icon { color: #8a949c; }
+        .terminal-trigger-label {
+            color: #8a949c;
+            text-transform: uppercase;
+            font-size: 10px;
+            letter-spacing: 0.06em;
+        }
+        .terminal-trigger-sha {
+            color: #2fc78c;
+            font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, Consolas, monospace;
+            font-weight: 600;
+        }
+        .terminal-trigger-branch { color: #8a949c; }
+        .terminal-trigger-msg { color: #c3cad0; }
+        .terminal-trigger-by { color: #8a949c; }
+        .terminal-trigger-tag {
+            margin-left: auto;
+            padding: 2px 8px;
+            border-radius: 10px;
+            background: rgba(47,199,140,.15);
+            color: #2fc78c;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .terminal-coalesced-list {
+            list-style: none;
+            margin: 6px 0 0;
+            padding: 6px 0 0;
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .terminal-coalesced-list li {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            gap: 6px;
+            padding: 3px 0;
+            font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, Consolas, monospace;
+            font-size: 11px;
+        }
+        .terminal-cp-sha { color: #2fc78c; font-weight: 600; }
+        .terminal-cp-branch { color: #8a949c; font-family: inherit; }
+        .terminal-cp-msg { color: #c3cad0; font-family: 'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif; }
+        .terminal-cp-by { color: #8a949c; font-family: 'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif; }
+        .terminal-cp-reason {
+            margin-left: auto;
+            padding: 1px 6px;
+            border-radius: 10px;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            font-family: 'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif;
+        }
+        .terminal-cp-reason.reason-cooldown { background: rgba(239,165,62,.14); color: #f0c987; }
+        .terminal-cp-reason.reason-active_job { background: rgba(47,199,140,.15); color: #2fc78c; }
+    </style>
+</head>
+<body>
+
+    <div class="terminal-header">
+        <div class="terminal-job-info">
+            <t t-esc="job_name"/>
+            <t t-if="job_instance"> — <span class="terminal-job-instance"><t t-if="job_project"><t t-esc="job_project"/> / </t><t t-esc="job_instance"/></span></t>
+            <span class="terminal-job-host-sep"> · </span><span class="terminal-job-host"><t t-esc="job_host"/></span>
+        </div>
+        <div class="search-wrap">
+            <input id="search-input" class="search-input" type="text"
+                   placeholder="Search lines…" autocomplete="off" spellcheck="false"/>
+            <span id="search-count" class="search-count">
+                <span id="search-count-text"></span>
+                <span id="search-esc-tip" class="search-esc-tip" style="display: none">Esc to clear</span>
+            </span>
+        </div>
+        <div style="display: flex;align-items: center;justify-content: flex-end;gap: 10px;">
+            <a t-attf-href="/cloud/log/{{job_id}}/download"
+               style="color: #8a949c;font-size: 12px;text-decoration: none;"
+               title="Download log file">
+                <i class="fa fa-download"/> Download
+            </a>
+            <span id="state-badge" class="job-state-badge state-pending">pending</span>
+        </div>
+    </div>
+
+    <t t-if="job_trigger">
+        <div class="terminal-trigger-bar">
+            <div class="terminal-trigger-row">
+                <i class="fa fa-github terminal-trigger-icon"/>
+                <span class="terminal-trigger-label">Triggered by</span>
+                <span class="terminal-trigger-sha" t-esc="job_push_sha"/>
+                <t t-if="job_push_branch">
+                    <span class="terminal-trigger-branch">@<t t-esc="job_push_branch"/></span>
+                </t>
+                <span class="terminal-trigger-msg" t-esc="job_push_message"/>
+                <t t-if="job_push_by">
+                    <span class="terminal-trigger-by">by <t t-esc="job_push_by"/></span>
+                </t>
+                <t t-if="job_trigger == 'coalesced' and job_coalesced_pushes and len(job_coalesced_pushes) > 1">
+                    <span class="terminal-trigger-tag">coalesced · +<t t-esc="len(job_coalesced_pushes) - 1"/> more push(es)</span>
+                </t>
+            </div>
+            <t t-if="job_trigger == 'coalesced' and job_coalesced_pushes">
+                <ul class="terminal-coalesced-list">
+                    <li t-foreach="job_coalesced_pushes" t-as="cp">
+                        <span class="terminal-cp-sha" t-esc="cp.get('push_sha')"/>
+                        <t t-if="cp.get('push_branch')">
+                            <span class="terminal-cp-branch">@<t t-esc="cp.get('push_branch')"/></span>
+                        </t>
+                        <span class="terminal-cp-msg" t-esc="cp.get('push_message')"/>
+                        <t t-if="cp.get('push_by')">
+                            <span class="terminal-cp-by">by <t t-esc="cp.get('push_by')"/></span>
+                        </t>
+                        <t t-if="cp.get('skip_reason')">
+                            <span t-attf-class="terminal-cp-reason reason-#{cp.get('skip_reason')}"
+                                  t-esc="cp.get('skip_reason')"/>
+                        </t>
+                    </li>
+                </ul>
+            </t>
+        </div>
+    </t>
+
+    <div class="terminal-body" id="terminal">
+        <span id="cursor" class="cursor"/>
+    </div>
+
+    <div class="terminal-footer">
+        <span id="status-text">Connecting...</span>
+        <span id="line-count">0 lines</span>
+    </div>
+
+    <script type="text/javascript">
+        var odoo = <t t-out="json.dumps({'csrf_token': csrf_token, '__session_info__': session_info})"/>;
+        var WS_VERSION = <t t-out="json.dumps(ws_version)"/>;
+
+        (function () {
+            var JOB_ID   = <t t-esc="job_id"/>;
+            var afterId  = 0;
+            var lineCount = 0;
+            var polling  = true;
+            /* Polling is now a fallback: the websocket below delivers
+             * events in real time and calls ``poll()`` immediately,
+             * so the timer exists only for resiliency when the bus
+             * drops (network blip, sleep/wake, Odoo worker restart).
+             * 10 s keeps recovery time bounded without the old 600 ms
+             * firehose of RPCs. */
+            var POLL_MS  = 10000;
+
+            var terminal    = document.getElementById('terminal');
+            var cursor      = document.getElementById('cursor');
+            var badge       = document.getElementById('state-badge');
+            var statusText  = document.getElementById('status-text');
+            var lineCountEl = document.getElementById('line-count');
+            var searchInput    = document.getElementById('search-input');
+            var searchCount    = document.getElementById('search-count');
+            var searchCountTxt = document.getElementById('search-count-text');
+            var searchEscTip   = document.getElementById('search-esc-tip');
+
+            var DONE_STATES = ['done', 'failed', 'cancelled'];
+            var userScrolledUp = false;
+
+            /* Track whether the user has scrolled away from the bottom */
+            terminal.addEventListener('scroll', function () {
+                var atBottom = terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight &lt; 32;
+                userScrolledUp = !atBottom;
+            });
+
+            function scrollToBottom() {
+                if (!userScrolledUp) {
+                    terminal.scrollTop = terminal.scrollHeight;
+                }
+            }
+
+            /* ── RPC helper ── */
+            function rpc(method, args) {
+                return fetch('/web/dataset/call_kw', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Csrf-Token': odoo.csrf_token,
+                    },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({
+                        jsonrpc: '2.0',
+                        method: 'call',
+                        id: Date.now(),
+                        params: {
+                            model: 'cloud.job',
+                            method: method,
+                            args: args,
+                            kwargs: {},
+                        },
+                    }),
+                }).then(function (r) { return r.json(); })
+                  .then(function (r) { return r.result; });
+            }
+
+            /* ── ANSI SGR → styled spans ──
+             *
+             * git-aggregator, pip, docker compose and friends pepper
+             * their stdout with ANSI colour escapes (``\x1b[…m``). The
+             * terminal appended them verbatim before, rendering the ESC
+             * byte as a ▯ box in the middle of every line. This mini
+             * parser consumes those sequences and emits span nodes with
+             * inline ``color``/``background``/``font-weight``/``opacity``
+             * instead. Covers the common SGR set: reset, bold, dim, 8
+             * basic fg/bg, 8 bright, 256-colour palette (38;5;N / 48;5;N)
+             * and truecolour (38;2;R;G;B).
+             */
+            var ANSI_BASIC = {
+                30:'#333a3f', 31:'#ff6063', 32:'#2fc78c', 33:'#efa53e', 34:'#4fb6c6', 35:'#ff9b9d', 36:'#9fd6e2', 37:'#c3cad0',
+                90:'#737d85', 91:'#ff9b9d', 92:'#9fe7c4', 93:'#f0c987', 94:'#9fd6e2', 95:'#ff9b9d', 96:'#e4f1f2', 97:'#eef1f3'
+            };
+            function ansi256(n) {
+                if (n &lt; 16) return ANSI_BASIC[n &lt; 8 ? 30 + n : 82 + n];
+                if (n &lt; 232) {
+                    n -= 16;
+                    var scale = [0, 95, 135, 175, 215, 255];
+                    return 'rgb(' + scale[Math.floor(n/36)] + ',' + scale[Math.floor((n%36)/6)] + ',' + scale[n%6] + ')';
+                }
+                var v = 8 + (n - 232) * 10;
+                return 'rgb(' + v + ',' + v + ',' + v + ')';
+            }
+            function applyAnsiCodes(state, raw) {
+                var codes = (raw === '' ? [0] : raw.split(';').map(function (x) { return parseInt(x, 10); }));
+                for (var i = 0; i &lt; codes.length; i++) {
+                    var c = codes[i];
+                    if (!isFinite(c) || c === 0)      { state.fg = null; state.bg = null; state.bold = false; state.dim = false; state.italic = false; state.underline = false; }
+                    else if (c === 1)                 { state.bold = true; }
+                    else if (c === 2)                 { state.dim = true; }
+                    else if (c === 3)                 { state.italic = true; }
+                    else if (c === 4)                 { state.underline = true; }
+                    else if (c === 22)                { state.bold = false; state.dim = false; }
+                    else if (c === 23)                { state.italic = false; }
+                    else if (c === 24)                { state.underline = false; }
+                    else if (c === 39)                { state.fg = null; }
+                    else if (c === 49)                { state.bg = null; }
+                    else if (c >= 30 &amp;&amp; c &lt;= 37)     { state.fg = ANSI_BASIC[c]; }
+                    else if (c >= 40 &amp;&amp; c &lt;= 47)     { state.bg = ANSI_BASIC[c - 10]; }
+                    else if (c >= 90 &amp;&amp; c &lt;= 97)     { state.fg = ANSI_BASIC[c]; }
+                    else if (c >= 100 &amp;&amp; c &lt;= 107)   { state.bg = ANSI_BASIC[c - 10]; }
+                    else if (c === 38 &amp;&amp; codes[i+1] === 5) { state.fg = ansi256(codes[i+2] || 0); i += 2; }
+                    else if (c === 48 &amp;&amp; codes[i+1] === 5) { state.bg = ansi256(codes[i+2] || 0); i += 2; }
+                    else if (c === 38 &amp;&amp; codes[i+1] === 2) { state.fg = 'rgb(' + (codes[i+2]||0) + ',' + (codes[i+3]||0) + ',' + (codes[i+4]||0) + ')'; i += 4; }
+                    else if (c === 48 &amp;&amp; codes[i+1] === 2) { state.bg = 'rgb(' + (codes[i+2]||0) + ',' + (codes[i+3]||0) + ',' + (codes[i+4]||0) + ')'; i += 4; }
+                }
+            }
+            function emitRun(parent, text, state) {
+                if (!text) return;
+                if (!state.fg &amp;&amp; !state.bg &amp;&amp; !state.bold &amp;&amp; !state.dim &amp;&amp; !state.italic &amp;&amp; !state.underline) {
+                    parent.appendChild(document.createTextNode(text));
+                    return;
+                }
+                var span = document.createElement('span');
+                var css = '';
+                if (state.fg) css += 'color:' + state.fg + ';';
+                if (state.bg) css += 'background:' + state.bg + ';';
+                if (state.bold) css += 'font-weight:bold;';
+                if (state.dim) css += 'opacity:0.65;';
+                if (state.italic) css += 'font-style:italic;';
+                if (state.underline) css += 'text-decoration:underline;';
+                span.style.cssText = css;
+                span.textContent = text;
+                parent.appendChild(span);
+            }
+            function appendAnsiText(parent, text) {
+                var re = /\x1b\[([0-9;]*)m/g;
+                var state = { fg: null, bg: null, bold: false, dim: false, italic: false, underline: false };
+                var last = 0;
+                var m;
+                while ((m = re.exec(text)) !== null) {
+                    if (m.index > last) emitRun(parent, text.slice(last, m.index), state);
+                    applyAnsiCodes(state, m[1]);
+                    last = re.lastIndex;
+                }
+                if (last &lt; text.length) emitRun(parent, text.slice(last), state);
+            }
+
+            /* ── Render chunks ── */
+            var PREFIX = { stdout: 'out', stderr: 'err', system: 'sys' };
+
+            function appendChunks(chunks) {
+                var query = searchInput.value.trim();
+                chunks.forEach(function (chunk) {
+                    var line = document.createElement('span');
+                    line.className = 'line ' + chunk.source;
+
+                    var prefix = document.createElement('span');
+                    prefix.className = 'prefix';
+                    var srcLabel = '[' + (PREFIX[chunk.source] || chunk.source) + ']';
+                    prefix.textContent = (chunk.ts ? chunk.ts + '  ' : '') + srcLabel;
+
+                    line.appendChild(prefix);
+                    appendAnsiText(line, chunk.content + '\n');
+                    terminal.insertBefore(line, cursor);
+
+                    afterId = Math.max(afterId, chunk.id);
+                    lineCount++;
+                });
+                lineCountEl.textContent = lineCount + ' line' + (lineCount !== 1 ? 's' : '');
+                if (query) {
+                    applySearch(query);
+                } else {
+                    scrollToBottom();
+                }
+            }
+
+            /* ── Search ── */
+            function applySearch(query) {
+                var lines = terminal.querySelectorAll('.line');
+                if (!query) {
+                    lines.forEach(function (l) { l.classList.remove('search-hidden'); });
+                    searchCountTxt.textContent = '';
+                    searchCount.className = 'search-count';
+                    searchEscTip.style.display = 'none';
+                    scrollToBottom();
+                    return;
+                }
+                var lower = query.toLowerCase();
+                var matched = 0;
+                lines.forEach(function (l) {
+                    var text = l.textContent.toLowerCase();
+                    if (text.indexOf(lower) !== -1) {
+                        l.classList.remove('search-hidden');
+                        matched++;
+                    } else {
+                        l.classList.add('search-hidden');
+                    }
+                });
+                searchCountTxt.textContent = matched + ' match' + (matched !== 1 ? 'es' : '');
+                searchCount.className = 'search-count ' + (matched > 0 ? 'has-results' : 'no-results');
+                searchEscTip.style.display = '';
+            }
+
+            searchInput.addEventListener('input', function () {
+                applySearch(searchInput.value.trim());
+            });
+
+            searchInput.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape') {
+                    searchInput.value = '';
+                    applySearch('');
+                }
+            });
+
+            /* ── Update state badge ── */
+            function updateBadge(state) {
+                badge.textContent = state || '—';
+                badge.className = 'job-state-badge state-' + (state || 'pending');
+            }
+
+            /* ── Poll loop (fallback for the websocket below) ── */
+            var pollTimer = null;
+            function scheduleNext(delay) {
+                if (!polling) return;
+                if (pollTimer !== null) clearTimeout(pollTimer);
+                pollTimer = setTimeout(function () {
+                    pollTimer = null;
+                    poll();
+                }, delay);
+            }
+            function poll() {
+                rpc('load_chunks', [JOB_ID, afterId])
+                    .then(function (result) {
+                        if (!result) return;
+                        appendChunks(result.chunks || []);
+                        updateBadge(result.state);
+
+                        if (DONE_STATES.indexOf(result.state) !== -1) {
+                            polling = false;
+                            cursor.style.display = 'none';
+                            statusText.textContent = 'Job ' + result.state + '.';
+                        } else {
+                            statusText.textContent = 'Running…';
+                        }
+                    })
+                    .catch(function (err) {
+                        statusText.textContent = 'Connection error — retrying…';
+                    })
+                    .finally(function () { scheduleNext(POLL_MS); });
+            }
+
+            /* ── Websocket: push-based invalidation ──
+             *
+             * Raw WebSocket speaks Odoo's bus protocol directly:
+             *   client subscribes → server pushes JSON arrays of
+             *   ``{id, message: {type, payload}}`` on each cloud_jobs
+             *   event. Payload is intentionally thin (``{id: job_id}``)
+             *   so we don't leak data through the unpermissioned bus —
+             *   the HTTP ``load_chunks`` RPC enforces ACLs.
+             *
+             * The bundled ``bus_service`` is not loaded on this
+             * standalone template (would pull in the whole backend
+             * bundle), so we talk the protocol inline.
+             *
+             * Behavior:
+             *   - On every matching push, poll now (and reset the
+             *     10 s fallback timer via scheduleNext).
+             *   - On disconnect, reconnect with 1→30 s exponential
+             *     backoff until the job reaches a done state.
+             */
+            var ws = null;
+            var wsRetry = 1000;
+            function openWs() {
+                if (!polling) return;
+                var scheme = (location.protocol === 'https:') ? 'wss' : 'ws';
+                var wsUrl = scheme + '://' + location.host + '/websocket?version=' + encodeURIComponent(WS_VERSION);
+                try { ws = new WebSocket(wsUrl); }
+                catch (_e) { setTimeout(openWs, wsRetry); wsRetry = Math.min(wsRetry * 2, 30000); return; }
+                ws.onopen = function () {
+                    wsRetry = 1000;
+                    ws.send(JSON.stringify({
+                        event_name: 'subscribe',
+                        data: { channels: ['cloud_jobs'], last: 0 },
+                    }));
+                };
+                ws.onmessage = function (ev) {
+                    var notifs;
+                    try { notifs = JSON.parse(ev.data); } catch (_e) { return; }
+                    if (!Array.isArray(notifs)) return;
+                    var matched = false;
+                    for (var i = 0; i &lt; notifs.length; i++) {
+                        var m = notifs[i] &amp;&amp; notifs[i].message;
+                        if (m &amp;&amp; m.type === 'cloud_jobs' &amp;&amp; m.payload &amp;&amp; m.payload.id === JOB_ID) {
+                            matched = true; break;
+                        }
+                    }
+                    if (matched) {
+                        if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
+                        poll();
+                    }
+                };
+                ws.onclose = function () {
+                    ws = null;
+                    if (polling) {
+                        setTimeout(openWs, wsRetry);
+                        wsRetry = Math.min(wsRetry * 2, 30000);
+                    }
+                };
+                ws.onerror = function () { try { ws.close(); } catch (_e) {} };
+            }
+
+            poll();
+            openWs();
+        })();
+    </script>
+
+</body>
+</html>
+</template>
+</odoo>

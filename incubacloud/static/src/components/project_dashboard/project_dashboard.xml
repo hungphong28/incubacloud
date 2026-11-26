@@ -1,0 +1,92 @@
+<templates>
+
+    <t t-name="incubacloud.ProjectDashboard">
+        <div class="rl-page">
+
+            <!-- Header -->
+            <div class="rl-phead">
+                <div class="rl-htext">
+                    <h1 class="rl-ptitle">Projects</h1>
+                    <p class="rl-psub">
+                        <t t-esc="state.total"/> project<t t-if="state.total !== 1">s</t>
+                        <t t-if="firstStepsReopen">
+                            · <button type="button" class="ic-fs-reopen"
+                                      t-on-click="() => this.reopenFirstSteps()">First steps</button>
+                        </t>
+                    </p>
+                </div>
+                <t t-if="env.permissions?.can_create_project">
+                    <div class="rl-pactions">
+                        <button class="rl-btn rl-btn-ghost" t-on-click="openImportGitHub">
+                            <t t-out="env.icon('git', 15)"/> Import from GitHub
+                        </button>
+                        <button class="rl-btn rl-btn-primary" t-on-click="() => this.openCreateProject()">
+                            <t t-out="env.icon('plus', 15)"/> New Project
+                        </button>
+                    </div>
+                </t>
+            </div>
+
+            <TruncationBanner truncated="state.truncated"
+                              total="state.total"
+                              limit="state.limit"
+                              label="'projects'"/>
+
+            <FirstSteps/>
+
+            <!-- Loading: a skeleton, so a slow fetch never looks like "empty". -->
+            <t t-if="state.loading">
+                <div class="rl-grid rl-grid-3">
+                    <t t-foreach="[1, 2, 3]" t-as="i" t-key="i">
+                        <div class="rl-card rl-card-pad ic-skeleton-card" aria-hidden="true">
+                            <div class="ic-skeleton-line ic-skeleton-title"/>
+                            <div class="ic-skeleton-line"/>
+                            <div class="ic-skeleton-line ic-skeleton-short"/>
+                        </div>
+                    </t>
+                </div>
+                <span class="ic-visually-hidden" role="status">Loading projects…</span>
+            </t>
+
+            <!-- Error: say so and offer a way out, never a silent empty list. -->
+            <t t-elif="state.error">
+                <div class="rl-stub" role="alert">
+                    <span class="rl-si"><t t-out="env.icon('alert', 46)"/></span>
+                    <h3>Could not load projects</h3>
+                    <p t-esc="state.error"/>
+                    <button class="rl-btn rl-btn-primary" style="margin-top: 14px;"
+                            t-on-click="() => this.loadProjects()">
+                        Retry
+                    </button>
+                </div>
+            </t>
+
+            <!-- Empty state: the first steps card takes its place while it shows -->
+            <t t-elif="state.projects.length === 0 and firstStepsShown"/>
+            <t t-elif="state.visible_projects.length === 0">
+                <div class="rl-stub">
+                    <span class="rl-si"><t t-out="env.icon('projects', 46)"/></span>
+                    <h3>No projects yet</h3>
+                    <p>Create your first project to start managing Odoo instances.</p>
+                    <t t-if="env.permissions?.can_create_project">
+                        <button class="rl-btn rl-btn-primary" style="margin-top: 14px;"
+                                t-on-click="() => this.openCreateProject()">
+                            <t t-out="env.icon('plus', 15)"/> Create your first project
+                        </button>
+                    </t>
+                </div>
+            </t>
+
+            <!-- Projects grid (cards) -->
+            <t t-else="">
+                <div class="rl-grid rl-grid-3">
+                    <t t-foreach="state.visible_projects" t-as="project" t-key="project.id">
+                        <ProjectCard project="project"/>
+                    </t>
+                </div>
+            </t>
+
+        </div>
+    </t>
+
+</templates>

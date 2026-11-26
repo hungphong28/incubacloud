@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+<t t-name="incubacloud_mcp.McpRatesSection">
+    <t t-if="state.loading or state.loadError">
+        <t t-call="incubacloud.SettingsLoadState"/>
+    </t>
+    <t t-elif="state.loaded">
+        <SettingsBlock title.translate="Agents (MCP)"
+                       how.translate="Past the limit, the panel refuses the calls of that user's agents until the minute ends.">
+            <SettingField id="'rate_limit_mcp_user_per_min'" form="state.form"/>
+        </SettingsBlock>
+    </t>
+</t>
+
+</templates>

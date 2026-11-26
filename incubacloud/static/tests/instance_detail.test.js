@@ -1,0 +1,1346 @@
+import { Deferred, describe, expect, test } from "@odoo/hoot";
+import { allowTranslations, patchWithCleanup } from "@web/../tests/web_test_helpers";
+import { rpc } from "@web/core/network/rpc";
+import { InstanceDetail } from "@incubacloud/components/instance_detail/instance_detail";
+import {
+    newestSeries,
+    pgDefaultFor,
+    pgVersionsFor,
+    seriesKey,
+} from "@incubacloud/utils/odoo_versions";
+
+/**
+ * InstanceDetail pure-logic tests.
+ *
+ * The component requires useService("orm"), useService("bus_service"), useEnv(),
+ * and makes RPC calls on mount. We extract and test every helper, constant, and
+ * getter as standalone functions — no component mounting needed.
+ */
+
+// ── Constants (mirrored from source) ────────────────────────────────────────
+
+const ODOO_VERSIONS = [
+    "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0",
+    "14.0", "15.0", "16.0", "17.0", "18.0", "19.0", "20.0",
+];
+// The cards the backend serves today (``_odoo_versions.picker_facts``):
+// 20.0 runs on PostgreSQL 16 to 18, the rest on 14 to 18.
+const VERSION_FACTS = Object.fromEntries(
+    ODOO_VERSIONS.map((v) => [v, {
+        postgres: v === "20.0" ? ["16", "17", "18"] : ["14", "15", "16", "17", "18"],
+        postgres_default: "17",
+    }]),
+);
+
+// ── Helpers (mirrored from source) ──────────────────────────────────────────
+
+function timeAgo(dateStr) {
+    if (!dateStr) return "";
+    const now = new Date();
+    const d = new Date(dateStr);
+    const secs = Math.floor((now - d) / 1000);
+    if (secs < 60) return "just now";
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    return `${days}d ago`;
+}
+
+function formatDate(dateStr) {
+    if (!dateStr) return "";
+    const d = new Date(dateStr);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// The shipped job-state helpers, not copies of them: a copy kept
+// passing when the instance's queue added ``queued``.
+function isActiveJob(state) {
+    return InstanceDetail.prototype.isActiveJob(state);
+}
+
+function jobIcon(code) {
+    const map = {
+        deploy_instance: "fa-rocket",
+        rebuild_instance: "fa-wrench",
+        restart_instance: "fa-refresh",
+        stop_instance: "fa-stop",
+        start_instance: "fa-play",
+        export_instance: "fa-download",
+        delete_instance: "fa-trash-o",
+        restore_instance: "fa-database",
+    };
+    return map[code] || "fa-cog";
+}
+
+function jobStateClass(state) {
+    return InstanceDetail.prototype.jobStateClass(state);
+}
+
+function envLabel(env) {
+    return { staging: "Staging", production: "Production" }[env] || env;
+}
+
+function statusLabel(inst) {
+    if (!inst) return "";
+    if (inst.state === "deploying") return "Building...";
+    if (inst.state === "deleting") return "Removing...";
+    if (!inst.deployed) return "Not deployed";
+    if (inst.running) return "Running";
+    if (inst.status === "error") return "Error";
+    return "Stopped";
+}
+
+function statusClass(inst) {
+    if (!inst) return "";
+    if (inst.state === "deploying" || inst.state === "deleting") {
+        return "st-provisioning";
+    }
+    if (!inst.deployed) return "st-pending";
+    if (inst.running) return "st-running";
+    if (inst.status === "error") return "st-error";
+    return "st-stopped";
+}
+
+// ── Pip requirements helpers (mirrored from source) ─────────────────────────
+
+function _parseReqLine(line) {
+    const stripped = line.split('#')[0].trim();
+    if (!stripped) return null;
+    const m = stripped.match(/^([A-Za-z0-9_.-]+)/);
+    if (!m) return null;
+    const name = m[1].toLowerCase();
+    const markerM = stripped.match(/;(.+)/);
+    const marker = markerM ? markerM[1].trim().toLowerCase() : '';
+    return { name, raw: stripped, key: marker ? `${name}|${marker}` : name };
+}
+
+function _formatSource(url, branch) {
+    const m = (url || '').match(/github\.com[:/](.+)/);
+    const name = m ? m[1].replace(/\.git$/, '') : (url || '').replace(/\/$/, '');
+    return branch ? `${name} (${branch})` : name;
+}
+
+function _escapeRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function _buildPkgMap(text) {
+    const pkgMap = {};
+    const re = /<<<<<<< (?<eSrc>[^\n]*)\n(?<eLine>[^\n]*)\n=======\n(?<iLine>[^\n]*)\n>>>>>>> (?<iSrc>[^\n]*)/g;
+    let m;
+    while ((m = re.exec(text || '')) !== null) {
+        const parsed = _parseReqLine(m.groups.eLine.trim());
+        if (parsed) {
+            pkgMap[parsed.key] = {
+                type: 'conflict', spec: parsed.raw, name: parsed.name,
+                existingSrc: m.groups.eSrc.trim(), block: m[0],
+            };
+        }
+    }
+    const cleanOnly = (text || '').replace(
+        /<<<<<<< [^\n]*\n[^\n]*\n=======\n[^\n]*\n>>>>>>> [^\n]*/g, ''
+    );
+    for (const line of cleanOnly.split('\n')) {
+        const parsed = _parseReqLine(line);
+        if (parsed && !(parsed.key in pkgMap)) {
+            pkgMap[parsed.key] = { type: 'clean', spec: parsed.raw, name: parsed.name, block: null };
+        }
+    }
+    return pkgMap;
+}
+
+function mergeRequirements(existingText, incomingText, repoUrl, repoBranch) {
+    const sourceLabel = _formatSource(repoUrl, repoBranch);
+    const pkgMap = _buildPkgMap(existingText);
+    let newText = existingText || '';
+    const added = [];
+    const conflicts = [];
+
+    for (const line of (incomingText || '').split('\n')) {
+        const parsed = _parseReqLine(line);
+        if (!parsed) continue;
+        const { name, raw, key } = parsed;
+
+        if (!(key in pkgMap)) {
+            added.push(raw);
+            pkgMap[key] = { type: 'clean', spec: raw, name, block: null };
+        } else if (pkgMap[key].spec === raw) {
+            // exact duplicate — skip
+        } else if (pkgMap[key].type === 'conflict') {
+            const oldBlock = pkgMap[key].block;
+            const existingSrc = pkgMap[key].existingSrc;
+            const existingSpec = pkgMap[key].spec;
+            const newBlock = `<<<<<<< ${existingSrc}\n${existingSpec}\n=======\n${raw}\n>>>>>>> ${sourceLabel}`;
+            newText = newText.replace(oldBlock, newBlock);
+            pkgMap[key].block = newBlock;
+            conflicts.push({ name, existing: existingSpec, existingSource: existingSrc, incoming: raw, incomingSource: sourceLabel });
+        } else {
+            const existingSpec = pkgMap[key].spec;
+            const newBlock = `<<<<<<< existing\n${existingSpec}\n=======\n${raw}\n>>>>>>> ${sourceLabel}`;
+            newText = newText.replace(
+                new RegExp('^' + _escapeRegex(existingSpec) + '$', 'm'), newBlock
+            );
+            pkgMap[key] = { type: 'conflict', spec: existingSpec, name, existingSrc: 'existing', block: newBlock };
+            conflicts.push({ name, existing: existingSpec, existingSource: 'existing', incoming: raw, incomingSource: sourceLabel });
+        }
+    }
+
+    if (added.length) {
+        const base = newText.trimEnd();
+        newText = base + (base ? '\n' : '') + added.join('\n');
+    }
+
+    return { content: newText, conflicts };
+}
+
+function applyPipResolutions(text, choices) {
+    return (text || '').replace(
+        /<<<<<<< [^\n]*\n([^\n]*)\n=======\n[^\n]*\n>>>>>>> [^\n]*/g,
+        (block, existingLine) => {
+            const parsed = _parseReqLine(existingLine.trim());
+            return (parsed && parsed.name in choices) ? choices[parsed.name] : block;
+        }
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("InstanceDetail — ODOO_VERSIONS constant", () => {
+    test("is an array of strings", () => {
+        expect(Array.isArray(ODOO_VERSIONS)).toBe(true);
+        for (const v of ODOO_VERSIONS) {
+            expect(typeof v).toBe("string");
+        }
+    });
+
+    test("contains common versions", () => {
+        expect(ODOO_VERSIONS).toInclude("14.0");
+        expect(ODOO_VERSIONS).toInclude("17.0");
+        expect(ODOO_VERSIONS).toInclude("19.0");
+    });
+
+    test("starts at 7.0 and ends at 20.0", () => {
+        expect(ODOO_VERSIONS[0]).toBe("7.0");
+        expect(ODOO_VERSIONS[ODOO_VERSIONS.length - 1]).toBe("20.0");
+    });
+
+    test("has 14 entries", () => {
+        expect(ODOO_VERSIONS.length).toBe(14);
+    });
+});
+
+describe("InstanceDetail — PostgreSQL versions follow the series' card", () => {
+    test("a form's float version names the backend's series", () => {
+        expect(seriesKey(19)).toBe("19.0");
+        expect(seriesKey(19.0)).toBe("19.0");
+        expect(seriesKey("19.0")).toBe("19.0");
+        expect(seriesKey("")).toBe("");
+    });
+
+    test("the picker offers the series' range", () => {
+        expect(pgVersionsFor(VERSION_FACTS, 19)).toEqual(["14", "15", "16", "17", "18"]);
+        expect(pgDefaultFor(VERSION_FACTS, 19)).toBe("17");
+    });
+
+    test("a series with its own range gets it", () => {
+        expect(pgVersionsFor(VERSION_FACTS, 20)).toEqual(["16", "17", "18"]);
+    });
+
+    test("before the cards arrive the picker is never empty", () => {
+        expect(pgVersionsFor({}, 19)).toEqual(["17"]);
+        expect(pgDefaultFor({}, 19)).toBe("17");
+        expect(pgVersionsFor(VERSION_FACTS, 6.1)).toEqual(["14", "15", "16", "17", "18"]);
+    });
+});
+
+describe("InstanceDetail — a new form's series is the newest offered", () => {
+    test("the last series the backend serves", () => {
+        expect(newestSeries(VERSION_FACTS)).toBe(20);
+    });
+
+    test("a panel whose pin stops below 20.0 serves up to 19.0", () => {
+        const { "20.0": _twenty, ...upTo19 } = VERSION_FACTS;
+        expect(newestSeries(upTo19)).toBe(19);
+    });
+
+    test("none before the cards arrive", () => {
+        expect(newestSeries({})).toBe(undefined);
+        expect(newestSeries(undefined)).toBe(undefined);
+    });
+});
+
+describe("InstanceDetail — timeAgo", () => {
+    test("returns empty string for falsy input", () => {
+        expect(timeAgo(null)).toBe("");
+        expect(timeAgo("")).toBe("");
+        expect(timeAgo(undefined)).toBe("");
+    });
+
+    test("returns 'just now' for a date within the last minute", () => {
+        const now = new Date();
+        expect(timeAgo(now.toISOString())).toBe("just now");
+    });
+
+    test("returns minutes ago", () => {
+        const d = new Date(Date.now() - 5 * 60 * 1000);
+        expect(timeAgo(d.toISOString())).toBe("5m ago");
+    });
+
+    test("returns hours ago", () => {
+        const d = new Date(Date.now() - 3 * 60 * 60 * 1000);
+        expect(timeAgo(d.toISOString())).toBe("3h ago");
+    });
+
+    test("returns days ago", () => {
+        const d = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+        expect(timeAgo(d.toISOString())).toBe("2d ago");
+    });
+});
+
+describe("InstanceDetail — formatDate", () => {
+    test("returns empty string for falsy input", () => {
+        expect(formatDate(null)).toBe("");
+        expect(formatDate("")).toBe("");
+    });
+
+    test("formats a known date correctly", () => {
+        // formatDate uses local time via getHours/getMinutes — pass a
+        // string and verify structure, not exact hour (timezone-dependent).
+        const result = formatDate("2025-01-05T09:07:00Z");
+        expect(result).toMatch(/^2025-01-05 \d{2}:\d{2}$/);
+    });
+
+    test("pads single-digit months and days", () => {
+        const result = formatDate("2024-03-03T04:05:00Z");
+        expect(result).toMatch(/^2024-03-03 \d{2}:\d{2}$/);
+    });
+});
+
+describe("InstanceDetail — isActiveJob", () => {
+    test("queued is active: it waits in the instance's queue", () => {
+        expect(isActiveJob("queued")).toBe(true);
+    });
+
+    test("pending is active", () => {
+        expect(isActiveJob("pending")).toBe(true);
+    });
+
+    test("enqueued is active", () => {
+        expect(isActiveJob("enqueued")).toBe(true);
+    });
+
+    test("started is active", () => {
+        expect(isActiveJob("started")).toBe(true);
+    });
+
+    test("wait_dependencies is active", () => {
+        expect(isActiveJob("wait_dependencies")).toBe(true);
+    });
+
+    test("done is not active", () => {
+        expect(isActiveJob("done")).toBe(false);
+    });
+
+    test("failed is not active", () => {
+        expect(isActiveJob("failed")).toBe(false);
+    });
+
+    test("cancelled is not active", () => {
+        expect(isActiveJob("cancelled")).toBe(false);
+    });
+
+    test("blocked is not active", () => {
+        expect(isActiveJob("blocked")).toBe(false);
+    });
+});
+
+describe("InstanceDetail — Cancel and Retry follow who may use them", () => {
+    const proto = InstanceDetail.prototype;
+
+    test("a job of a type the reader may ask for offers both", () => {
+        expect(proto.canCancelJob({state: "queued", may_control: true})).toBe(true);
+        expect(proto.canCancelJob({state: "blocked", may_control: true})).toBe(true);
+        expect(proto.canRetryJob({state: "failed", may_control: true})).toBe(true);
+    });
+
+    test("a job of a higher role's type offers neither", () => {
+        expect(proto.canCancelJob({state: "queued", may_control: false})).toBe(false);
+        expect(proto.canCancelJob({state: "blocked", may_control: false})).toBe(false);
+        expect(proto.canRetryJob({state: "failed", may_control: false})).toBe(false);
+    });
+
+    test("the state still decides which one", () => {
+        expect(proto.canCancelJob({state: "done", may_control: true})).toBe(false);
+        expect(proto.canRetryJob({state: "started", may_control: true})).toBe(false);
+    });
+});
+
+describe("InstanceDetail — jobIcon mapping", () => {
+    test("deploy_instance maps to fa-rocket", () => {
+        expect(jobIcon("deploy_instance")).toBe("fa-rocket");
+    });
+
+    test("rebuild_instance maps to fa-wrench", () => {
+        expect(jobIcon("rebuild_instance")).toBe("fa-wrench");
+    });
+
+    test("restart_instance maps to fa-refresh", () => {
+        expect(jobIcon("restart_instance")).toBe("fa-refresh");
+    });
+
+    test("stop_instance maps to fa-stop", () => {
+        expect(jobIcon("stop_instance")).toBe("fa-stop");
+    });
+
+    test("start_instance maps to fa-play", () => {
+        expect(jobIcon("start_instance")).toBe("fa-play");
+    });
+
+    test("export_instance maps to fa-download", () => {
+        expect(jobIcon("export_instance")).toBe("fa-download");
+    });
+
+    test("delete_instance maps to fa-trash-o", () => {
+        expect(jobIcon("delete_instance")).toBe("fa-trash-o");
+    });
+
+    test("restore_instance maps to fa-database", () => {
+        expect(jobIcon("restore_instance")).toBe("fa-database");
+    });
+
+    test("unknown code falls back to fa-cog", () => {
+        expect(jobIcon("something_else")).toBe("fa-cog");
+        expect(jobIcon("")).toBe("fa-cog");
+    });
+});
+
+describe("InstanceDetail — jobStateClass mapping", () => {
+    test("done maps to jst-done", () => {
+        expect(jobStateClass("done")).toBe("jst-done");
+    });
+
+    test("failed maps to jst-failed", () => {
+        expect(jobStateClass("failed")).toBe("jst-failed");
+    });
+
+    test("cancelled maps to jst-cancelled", () => {
+        expect(jobStateClass("cancelled")).toBe("jst-cancelled");
+    });
+
+    test("started maps to jst-running", () => {
+        expect(jobStateClass("started")).toBe("jst-running");
+    });
+
+    test("pending maps to jst-pending", () => {
+        expect(jobStateClass("pending")).toBe("jst-pending");
+    });
+
+    test("enqueued maps to jst-pending", () => {
+        expect(jobStateClass("enqueued")).toBe("jst-pending");
+    });
+
+    test("blocked maps to jst-blocked", () => {
+        expect(jobStateClass("blocked")).toBe("jst-blocked");
+    });
+
+    test("queued maps to jst-queued", () => {
+        expect(jobStateClass("queued")).toBe("jst-queued");
+    });
+
+    test("unknown state falls back to jst-pending", () => {
+        expect(jobStateClass("mystery")).toBe("jst-pending");
+    });
+});
+
+describe("InstanceDetail — envLabel mapping", () => {
+    test("staging maps to Staging", () => {
+        expect(envLabel("staging")).toBe("Staging");
+    });
+
+    test("production maps to Production", () => {
+        expect(envLabel("production")).toBe("Production");
+    });
+
+    test("unknown env returns the raw string", () => {
+        expect(envLabel("dev")).toBe("dev");
+        expect(envLabel("custom")).toBe("custom");
+    });
+});
+
+describe("InstanceDetail — statusLabel getter logic", () => {
+    test("returns empty string when inst is null", () => {
+        expect(statusLabel(null)).toBe("");
+    });
+
+    test("returns 'Building...' while the deploy job runs", () => {
+        expect(statusLabel({ state: "deploying", status: "ok", deployed: false, running: false })).toBe("Building...");
+    });
+
+    test("returns 'Removing...' while the teardown job runs", () => {
+        expect(statusLabel({ state: "deleting", status: "ok", deployed: true, running: true })).toBe("Removing...");
+    });
+
+    test("returns 'Not deployed' when deployed is false", () => {
+        expect(statusLabel({ state: "draft", status: "ok", deployed: false, running: false })).toBe("Not deployed");
+    });
+
+    test("returns 'Running' when running is true", () => {
+        expect(statusLabel({ state: "deployed", status: "ok", deployed: true, running: true })).toBe("Running");
+    });
+
+    test("returns 'Error' when status is error", () => {
+        expect(statusLabel({ state: "deployed", status: "error", deployed: true, running: false })).toBe("Error");
+    });
+
+    test("returns 'Stopped' as fallback for deployed, non-running instance", () => {
+        expect(statusLabel({ state: "deployed", status: "ok", deployed: true, running: false })).toBe("Stopped");
+    });
+});
+
+describe("InstanceDetail — statusClass getter logic", () => {
+    test("returns empty string when inst is null", () => {
+        expect(statusClass(null)).toBe("");
+    });
+
+    test("returns st-provisioning for both in-flight states", () => {
+        expect(statusClass({ state: "deploying", status: "ok", deployed: false, running: false })).toBe("st-provisioning");
+        expect(statusClass({ state: "deleting", status: "ok", deployed: true, running: true })).toBe("st-provisioning");
+    });
+
+    test("returns st-pending when not deployed", () => {
+        expect(statusClass({ state: "draft", status: "ok", deployed: false, running: false })).toBe("st-pending");
+    });
+
+    test("returns st-running when running", () => {
+        expect(statusClass({ state: "deployed", status: "ok", deployed: true, running: true })).toBe("st-running");
+    });
+
+    test("returns st-error when status is error", () => {
+        expect(statusClass({ state: "deployed", status: "error", deployed: true, running: false })).toBe("st-error");
+    });
+
+    test("returns st-stopped as fallback", () => {
+        expect(statusClass({ state: "deployed", status: "ok", deployed: true, running: false })).toBe("st-stopped");
+    });
+});
+
+describe("InstanceDetail — hasUnsavedChanges concept", () => {
+    test("detects changes via JSON.stringify comparison", () => {
+        const original = { name: "test", host_id: 1 };
+        const savedForm = JSON.stringify(original);
+
+        // No change
+        expect(JSON.stringify(original) !== savedForm).toBe(false);
+
+        // With change
+        const modified = { ...original, name: "changed" };
+        expect(JSON.stringify(modified) !== savedForm).toBe(true);
+    });
+
+    test("null savedForm means no unsaved changes detected", () => {
+        const savedForm = null;
+        const form = { name: "test" };
+        // The getter: this._savedForm && JSON.stringify(this.state.form) !== this._savedForm
+        const result = savedForm && JSON.stringify(form) !== savedForm;
+        expect(result).toBe(null); // falsy — no unsaved changes
+    });
+});
+
+// ── Pip requirements helpers ────────────────────────────────────────────────
+
+describe("InstanceDetail — _parseReqLine", () => {
+    test("parses simple package name", () => {
+        const r = _parseReqLine("requests==2.28.0");
+        expect(r.name).toBe("requests");
+        expect(r.raw).toBe("requests==2.28.0");
+        expect(r.key).toBe("requests");
+    });
+
+    test("ignores comments", () => {
+        const r = _parseReqLine("flask>=2.0  # web framework");
+        expect(r.name).toBe("flask");
+        expect(r.raw).toBe("flask>=2.0");
+    });
+
+    test("returns null for blank lines", () => {
+        expect(_parseReqLine("")).toBe(null);
+        expect(_parseReqLine("   ")).toBe(null);
+        expect(_parseReqLine("# just a comment")).toBe(null);
+    });
+
+    test("handles environment markers", () => {
+        const r = _parseReqLine("pywin32>=300; sys_platform == 'win32'");
+        expect(r.name).toBe("pywin32");
+        expect(r.key).toBe("pywin32|sys_platform == 'win32'");
+    });
+
+    test("normalises name to lowercase", () => {
+        const r = _parseReqLine("PyYAML>=6.0");
+        expect(r.name).toBe("pyyaml");
+    });
+});
+
+describe("InstanceDetail — _formatSource", () => {
+    test("extracts GitHub org/repo from HTTPS URL", () => {
+        expect(_formatSource("https://github.com/odoo/odoo.git", "17.0"))
+            .toBe("odoo/odoo (17.0)");
+    });
+
+    test("extracts GitHub org/repo from SSH URL", () => {
+        expect(_formatSource("git@github.com:odoo/enterprise.git", "main"))
+            .toBe("odoo/enterprise (main)");
+    });
+
+    test("handles URL without branch", () => {
+        expect(_formatSource("https://github.com/odoo/odoo.git", ""))
+            .toBe("odoo/odoo");
+    });
+
+    test("handles non-GitHub URL", () => {
+        expect(_formatSource("https://gitlab.com/foo/bar/", "dev"))
+            .toBe("https://gitlab.com/foo/bar (dev)");
+    });
+});
+
+describe("InstanceDetail — _escapeRegex", () => {
+    test("escapes special regex characters", () => {
+        expect(_escapeRegex("a.b+c")).toBe("a\\.b\\+c");
+        expect(_escapeRegex("foo[0]")).toBe("foo\\[0\\]");
+    });
+
+    test("leaves normal strings unchanged", () => {
+        expect(_escapeRegex("requests")).toBe("requests");
+    });
+});
+
+describe("InstanceDetail — mergeRequirements", () => {
+    test("adds new packages to empty text", () => {
+        const { content, conflicts } = mergeRequirements("", "flask>=2.0\nrequests", "https://github.com/a/b.git", "main");
+        expect(content).toInclude("flask>=2.0");
+        expect(content).toInclude("requests");
+        expect(conflicts.length).toBe(0);
+    });
+
+    test("skips exact duplicates", () => {
+        const { content, conflicts } = mergeRequirements("flask>=2.0", "flask>=2.0", "https://github.com/a/b.git", "main");
+        expect(content).toBe("flask>=2.0");
+        expect(conflicts.length).toBe(0);
+    });
+
+    test("creates conflict markers for version mismatch", () => {
+        const { content, conflicts } = mergeRequirements(
+            "flask>=2.0",
+            "flask>=3.0",
+            "https://github.com/a/b.git", "main"
+        );
+        expect(content).toInclude("<<<<<<<");
+        expect(content).toInclude("flask>=2.0");
+        expect(content).toInclude("flask>=3.0");
+        expect(content).toInclude(">>>>>>>");
+        expect(conflicts.length).toBe(1);
+        expect(conflicts[0].name).toBe("flask");
+    });
+
+    test("appends genuinely new packages", () => {
+        const { content, conflicts } = mergeRequirements(
+            "flask>=2.0",
+            "celery>=5.0",
+            "https://github.com/a/b.git", "main"
+        );
+        expect(content).toInclude("flask>=2.0");
+        expect(content).toInclude("celery>=5.0");
+        expect(conflicts.length).toBe(0);
+    });
+});
+
+describe("InstanceDetail — applyPipResolutions", () => {
+    test("resolves conflict markers with chosen spec", () => {
+        const text = "<<<<<<< existing\nflask>=2.0\n=======\nflask>=3.0\n>>>>>>> a/b (main)";
+        const result = applyPipResolutions(text, { flask: "flask>=3.0" });
+        expect(result).toBe("flask>=3.0");
+    });
+
+    test("leaves unmatched conflicts untouched", () => {
+        const text = "<<<<<<< existing\nflask>=2.0\n=======\nflask>=3.0\n>>>>>>> a/b (main)";
+        const result = applyPipResolutions(text, { celery: "celery>=5.0" });
+        expect(result).toInclude("<<<<<<<");
+    });
+
+    test("handles empty text", () => {
+        expect(applyPipResolutions("", {})).toBe("");
+        expect(applyPipResolutions(null, {})).toBe("");
+    });
+});
+
+// ── timelineJobs (mirrored from source) ─────────────────────────────────────
+
+/**
+ * Pure mirror of the InstanceDetail.timelineJobs getter for testing.
+ * @param {Array} active  active jobs (id asc, oldest first)
+ * @param {Array} recent  recent terminal jobs (id desc, newest first)
+ * @param {number} max    visible slots (default 5)
+ * @returns {Array}       ordered job list (top-to-bottom)
+ */
+function buildTimelineJobs(active, recent, max = 5) {
+    if (!active) active = [];
+    if (!recent) recent = [];
+    const result = [];
+    if (active.length <= max) {
+        result.push(...[...active, ...recent].sort((a, b) => b.id - a.id));
+    } else {
+        const visibleCount = max - 2;
+        result.push({
+            _overflow: true,
+            count: active.length - visibleCount - 1,
+        });
+        result.push(...active.slice(1, visibleCount + 1).reverse());
+        result.push(active[0]);
+    }
+    return result;
+}
+
+function j(id, state, name = "job") {
+    return { id, state, name: `${name} ${id}` };
+}
+
+describe("InstanceDetail — timelineJobs (no overflow)", () => {
+    test("one running + four recent → running at top (highest id)", () => {
+        const active = [j(5, "started")];          // id asc
+        const recent = [j(4, "done"), j(3, "done"), j(2, "done"), j(1, "done")]; // id desc
+        const tl = buildTimelineJobs(active, recent);
+        expect(tl.length).toBe(5);
+        expect(tl[0].id).toBe(5);
+        expect(tl[0].state).toBe("started");
+        expect(tl[1].id).toBe(4);
+        expect(tl[2].id).toBe(3);
+        expect(tl[3].id).toBe(2);
+        expect(tl[4].id).toBe(1);
+    });
+
+    test("running job moves to recent → same position, no jump", () => {
+        const activeRunning = [j(5, "started")];
+        const recentRunning = [j(4, "done"), j(3, "done"), j(2, "done"), j(1, "done")];
+        const tlBefore = buildTimelineJobs(activeRunning, recentRunning);
+
+        // Job 5 finishes → now in recent (terminal)
+        const activeDone = [];
+        const recentDone = [j(5, "done"), j(4, "done"), j(3, "done"), j(2, "done"), j(1, "done")];
+        const tlAfter = buildTimelineJobs(activeDone, recentDone);
+
+        expect(tlBefore[0].id).toBe(5);
+        expect(tlAfter[0].id).toBe(5);
+        // Order should be identical for visible items
+        for (let i = 0; i < tlBefore.length; i++) {
+            expect(tlBefore[i].id).toBe(tlAfter[i].id);
+        }
+    });
+
+    test("multiple active → interleaved with recent by id", () => {
+        const active = [j(3, "pending"), j(5, "started")]; // id asc: 3 pending, 5 running
+        const recent = [j(4, "done"), j(2, "done"), j(1, "done")]; // id desc: 4, 2, 1
+        const tl = buildTimelineJobs(active, recent);
+        expect(tl[0].id).toBe(5);  // running
+        expect(tl[1].id).toBe(4);  // recent, higher than 3
+        expect(tl[2].id).toBe(3);  // pending
+        expect(tl[3].id).toBe(2);
+        expect(tl[4].id).toBe(1);
+    });
+
+    test("five active, zero recent → all active in desc id", () => {
+        const active = [j(1, "started"), j(2, "pending"), j(3, "pending"), j(4, "pending"), j(5, "pending")];
+        const recent = [];
+        const tl = buildTimelineJobs(active, recent);
+        expect(tl.length).toBe(5);
+        expect(tl[0].id).toBe(5);
+        expect(tl[1].id).toBe(4);
+        expect(tl[2].id).toBe(3);
+        expect(tl[3].id).toBe(2);
+        expect(tl[4].id).toBe(1);
+    });
+
+    test("zero active, three recent → recent in desc id", () => {
+        const active = [];
+        const recent = [j(3, "done"), j(2, "done"), j(1, "done")];
+        const tl = buildTimelineJobs(active, recent);
+        expect(tl.length).toBe(3);
+        expect(tl[0].id).toBe(3);
+        expect(tl[1].id).toBe(2);
+        expect(tl[2].id).toBe(1);
+    });
+
+    test("empty inputs → empty result", () => {
+        expect(buildTimelineJobs([], []).length).toBe(0);
+    });
+});
+
+describe("InstanceDetail — timelineJobs (overflow)", () => {
+    test("eight active → overflow slot + next 3 + running bottom", () => {
+        const active = [
+            j(1, "started"),
+            j(2, "pending"),
+            j(3, "pending"),
+            j(4, "pending"),
+            j(5, "pending"),
+            j(6, "pending"),
+            j(7, "pending"),
+            j(8, "pending"),
+        ];
+        const tl = buildTimelineJobs(active, []);
+        expect(tl.length).toBe(5);
+        // Overflow first
+        expect(tl[0]._overflow).toBe(true);
+        expect(tl[0].count).toBe(8 - 3 - 1); // 4 pending
+        // Next 3 in queue (ascending from running, displayed desc)
+        expect(tl[1].id).toBe(4);
+        expect(tl[2].id).toBe(3);
+        expect(tl[3].id).toBe(2);
+        // Running at bottom
+        expect(tl[4].id).toBe(1);
+        expect(tl[4].state).toBe("started");
+    });
+
+    test("six active → overflow shows correct count", () => {
+        const active = [
+            j(10, "started"),
+            j(11, "pending"),
+            j(12, "pending"),
+            j(13, "pending"),
+            j(14, "pending"),
+            j(15, "pending"),
+        ];
+        const tl = buildTimelineJobs(active, []);
+        expect(tl[0]._overflow).toBe(true);
+        expect(tl[0].count).toBe(6 - 3 - 1); // 2 pending
+        expect(tl[4].id).toBe(10);  // running bottom
+    });
+});
+
+// ── Connect-as gate ─────────────────────────────────────────────────────────
+
+describe("InstanceDetail — connect-as gate", () => {
+    /**
+     * Build a bare component bound to the real prototype so the gate under
+     * test is the shipped one, not a copy. Mirroring it here would let the
+     * source drift while the tests stay green — unacceptable for a
+     * permission check.
+     *
+     * @param {string} environment instance environment
+     * @param {object} permissions env.permissions payload
+     * @returns {InstanceDetail} object exposing the real getters
+     */
+    function gate(environment, permissions) {
+        const comp = Object.create(InstanceDetail.prototype);
+        comp.env = { permissions };
+        comp.state = { inst: { environment } };
+        return comp;
+    }
+
+    const STAKEHOLDER = { can_connect_as: true };
+    const DEVELOPER = { can_connect_as: true, can_connect_production: true };
+    const MANAGER = {
+        can_connect_as: true,
+        can_connect_production: true,
+        can_connect_production_admin: true,
+    };
+
+    test("no cloud role at all cannot connect anywhere", () => {
+        expect(gate("staging", {}).canConnectAs).toBe(false);
+        expect(gate("production", {}).canConnectAs).toBe(false);
+    });
+
+    test("stakeholder keeps the staging floor", () => {
+        expect(gate("staging", STAKEHOLDER).canConnectAs).toBe(true);
+    });
+
+    test("stakeholder is locked out of production", () => {
+        expect(gate("production", STAKEHOLDER).canConnectAs).toBe(false);
+    });
+
+    test("developer may connect to production", () => {
+        expect(gate("production", DEVELOPER).canConnectAs).toBe(true);
+    });
+
+    test("normal target users are never restricted", () => {
+        const user = { id: 7, is_admin: false };
+        expect(gate("production", DEVELOPER).canConnectAsTarget(user)).toBe(true);
+        expect(gate("staging", STAKEHOLDER).canConnectAsTarget(user)).toBe(true);
+    });
+
+    test("instance admin on staging stays open to stakeholders", () => {
+        const admin = { id: 2, is_admin: true };
+        expect(gate("staging", STAKEHOLDER).canConnectAsTarget(admin)).toBe(true);
+    });
+
+    test("instance admin on production is denied to a developer", () => {
+        const admin = { id: 2, is_admin: true };
+        expect(gate("production", DEVELOPER).canConnectAsTarget(admin)).toBe(false);
+    });
+
+    test("instance admin on production is allowed to a manager", () => {
+        const admin = { id: 2, is_admin: true };
+        expect(gate("production", MANAGER).canConnectAsTarget(admin)).toBe(true);
+    });
+
+    test("missing permissions payload denies instead of crashing", () => {
+        const comp = Object.create(InstanceDetail.prototype);
+        comp.env = {};
+        comp.state = { inst: { environment: "production" } };
+        expect(comp.canConnectAs).toBe(false);
+        expect(comp.canConnectAsTarget({ is_admin: true })).toBe(false);
+    });
+});
+
+describe("InstanceDetail — what the form offers is what the server takes", () => {
+    /**
+     * A detail page as the template reads it.
+     *
+     * @param {object} opts
+     * @param {number} [opts.instanceId] the instance shown, none on create
+     * @param {string} [opts.state] its lifecycle state
+     * @param {object} [opts.permissions] the reader's ``env.permissions``
+     * @returns {InstanceDetail}
+     */
+    function page({ instanceId = 7, state = "draft", permissions = {} } = {}) {
+        const comp = Object.create(InstanceDetail.prototype);
+        comp.props = { instance_id: instanceId };
+        comp.env = { permissions };
+        comp.state = { inst: { state } };
+        return comp;
+    }
+
+    test("past draft, the host is moved, not chosen", () => {
+        for (const state of ["deploying", "deployed", "deleting"]) {
+            expect(page({ state }).hostLocked).toBe(true);
+        }
+    });
+
+    test("a draft, or a new instance, has its host chosen", () => {
+        expect(page({ state: "draft" }).hostLocked).toBe(false);
+        expect(page({ instanceId: undefined, state: undefined }).hostLocked).toBe(false);
+    });
+
+    test("only who manages backups chooses where they are kept", () => {
+        expect(page({ permissions: { can_manage_backups: true } }).backupBackendLocked).toBe(false);
+        expect(page({ permissions: { can_manage_backups: false } }).backupBackendLocked).toBe(true);
+        expect(page({ permissions: {} }).backupBackendLocked).toBe(true);
+    });
+});
+
+describe("InstanceDetail — the backups tab is for who manages backups", () => {
+    /**
+     * A stand-in of an instance's page on the shipped getter.
+     *
+     * @param {object} inst the instance's ``deployed`` and ``environment``
+     * @param {boolean} manages whether the reader may manage backups
+     * @returns {object}
+     */
+    const page = (inst, manages) => {
+        const comp = Object.create(InstanceDetail.prototype);
+        comp.props = { instance_id: 7, project_id: 1 };
+        comp.state = { inst, form: { environment: inst.environment } };
+        comp.env = { permissions: { can_manage_backups: manages } };
+        return comp;
+    };
+
+    test("a deployed instance shows it to a developer, not to a consultant", () => {
+        const inst = { deployed: true, environment: "staging" };
+        expect(page(inst, true).canShowBackups).toBe(true);
+        expect(page(inst, false).canShowBackups).toBe(false);
+    });
+
+    test("a staging not deployed shows it to nobody", () => {
+        expect(page({ deployed: false, environment: "staging" }, true).canShowBackups).toBe(false);
+    });
+
+    test("a production not deployed shows it, to choose the destination", () => {
+        const inst = { deployed: false, environment: "production" };
+        expect(page(inst, true).canShowBackups).toBe(true);
+        expect(page(inst, false).canShowBackups).toBe(false);
+    });
+
+    test("the open tab lists the backups once the first deploy ends, and only then", async () => {
+        const routes = [];
+        let deployed = false;
+        patchWithCleanup(rpc, {
+            _rpc: (route) => {
+                routes.push(route);
+                if (route === "/cloud/list_backups") {
+                    return Promise.resolve({ ok: true, result: { backups: [], total: 0 } });
+                }
+                return Promise.resolve({ id: 7, deployed, environment: "production" });
+            },
+        });
+        const comp = page({ deployed: false, environment: "production" }, true);
+        Object.assign(comp.state, {
+            tab: "backups", backupsData: null, backupsLoading: false, backupsOffset: 0,
+        });
+        comp.env.projectStore = null;
+        InstanceDetail.prototype.setTab.call(comp, "backups");
+        await InstanceDetail.prototype._silentRefresh.call(comp);
+        expect(routes).toEqual(["/cloud/get_instance"]);
+        deployed = true;
+        await InstanceDetail.prototype._silentRefresh.call(comp);
+        for (let i = 0; i < 5; i++) {
+            await Promise.resolve();
+        }
+        expect(routes).toEqual(["/cloud/get_instance", "/cloud/get_instance", "/cloud/list_backups"]);
+        expect(comp.state.backupsData).toEqual({ backups: [], total: 0 });
+        await InstanceDetail.prototype._silentRefresh.call(comp);
+        expect(routes.filter((r) => r === "/cloud/list_backups")).toHaveLength(1);
+    });
+});
+
+// ── Monitoring tab: Recent requests ─────────────────────────────────────────
+
+describe("InstanceDetail — Recent requests table", () => {
+    /**
+     * A response shaped like ``/cloud/instance/access_log``: 120 lines,
+     * oldest first as the proxy writes them. Every third is a 404 on
+     * ``/wp-login.php`` from one IP, every tenth a 500, the rest 200s.
+     */
+    const response = {
+        ok: true,
+        entries: Array.from({ length: 120 }, (_, i) => ({
+            time: `2026-11-03T08:${String(i % 60).padStart(2, "0")}:00Z`,
+            ClientHost: i % 3 === 0 ? "216.73.216.191" : "66.249.66.12",
+            RequestMethod: i % 5 === 0 ? "POST" : "GET",
+            RequestPath: i % 3 === 0 ? "/wp-login.php" : `/shop/item-${i}`,
+            DownstreamStatus: i % 3 === 0 ? 404 : i % 10 === 1 ? 500 : 200,
+        })),
+    };
+
+    const build = () => {
+        const cmp = Object.create(InstanceDetail.prototype);
+        cmp.state = {
+            accessLog: {
+                entries: response.entries, q: "", cls: "all", offset: 0,
+            },
+        };
+        cmp.requestsBoxRef = { el: { scrollTop: 99 } };
+        return cmp;
+    };
+
+    test("shows newest first and no more than a page", () => {
+        const cmp = build();
+        expect(cmp.recentRequests.length).toBe(120);
+        expect(cmp.pagedRequests.length).toBe(50);
+        expect(cmp.pagedRequests[0]).toBe(response.entries[119]);
+    });
+
+    test("the last page holds the remainder", () => {
+        const cmp = build();
+        cmp.requestsGoPage(100);
+        expect(cmp.pagedRequests.length).toBe(20);
+    });
+
+    test("changing page scrolls the box back to the top", () => {
+        const cmp = build();
+        cmp.requestsGoPage(50);
+        expect(cmp.state.accessLog.offset).toBe(50);
+        expect(cmp.requestsBoxRef.el.scrollTop).toBe(0);
+    });
+
+    test("the search matches path, client, method and status, ignoring case", () => {
+        const cmp = build();
+        cmp.onRequestsSearch({ target: { value: "WP-LOGIN" } });
+        expect(cmp.filteredRequests.length).toBe(40);
+        cmp.onRequestsSearch({ target: { value: "66.249" } });
+        expect(cmp.filteredRequests.length).toBe(80);
+        cmp.onRequestsSearch({ target: { value: "post" } });
+        expect(cmp.filteredRequests.every((r) => r.RequestMethod === "POST")).toBe(true);
+        cmp.onRequestsSearch({ target: { value: "500" } });
+        expect(cmp.filteredRequests.every((r) => r.DownstreamStatus === 500)).toBe(true);
+        cmp.onRequestsSearch({ target: { value: "no-such-thing" } });
+        expect(cmp.filteredRequests.length).toBe(0);
+    });
+
+    test("searching goes back to the first page", () => {
+        const cmp = build();
+        cmp.requestsGoPage(100);
+        cmp.onRequestsSearch({ target: { value: "shop" } });
+        expect(cmp.state.accessLog.offset).toBe(0);
+    });
+
+    test("the status chips count what the search left and filter the table", () => {
+        const cmp = build();
+        const counts = () =>
+            Object.fromEntries(cmp.requestChips.map((c) => [c.key, c.count]));
+        expect(counts()).toEqual({ all: 120, 2: 72, 3: 0, 4: 40, 5: 8 });
+        cmp.onRequestsSearch({ target: { value: "wp-login" } });
+        expect(counts()).toEqual({ all: 40, 2: 0, 3: 0, 4: 40, 5: 0 });
+        cmp.onRequestsSearch({ target: { value: "" } });
+        cmp.requestsGoPage(50);
+        cmp.setRequestsClass("4");
+        expect(cmp.state.accessLog.offset).toBe(0);
+        expect(cmp.filteredRequests.length).toBe(40);
+        expect(cmp.pagedRequests.length).toBe(40);
+    });
+
+    test("the count says N, or N of M once something is filtered out", () => {
+        allowTranslations();
+        const cmp = build();
+        expect(String(cmp.requestsCountLabel)).toBe("120 requests");
+        cmp.setRequestsClass("5");
+        expect(String(cmp.requestsCountLabel)).toBe("8 of 120 requests");
+    });
+
+    test("a single request is counted in the singular", () => {
+        allowTranslations();
+        const cmp = build();
+        cmp.state.accessLog.entries = response.entries.slice(0, 1);
+        expect(String(cmp.requestsCountLabel)).toBe("1 request");
+        cmp.setRequestsClass("5");
+        expect(String(cmp.requestsCountLabel)).toBe("0 of 1 request");
+    });
+
+    test("the hit is split out for <mark>, never turned into markup", () => {
+        const cmp = build();
+        cmp.onRequestsSearch({ target: { value: "<B>" } });
+        expect(cmp.highlightRequest("/a<b>c")).toEqual(["/a", "<b>", "c"]);
+        expect(cmp.highlightRequest("/nothing")).toEqual(["/nothing", "", ""]);
+        cmp.onRequestsSearch({ target: { value: "" } });
+        expect(cmp.highlightRequest(404)).toEqual(["404", "", ""]);
+    });
+
+    test("a status outside 2xx-5xx belongs to no chip", () => {
+        const cmp = build();
+        expect(cmp.requestClass({ DownstreamStatus: 0 })).toBe("");
+        expect(cmp.requestClass({})).toBe("");
+        expect(cmp.requestClass({ DownstreamStatus: 301 })).toBe("3");
+    });
+});
+
+describe("InstanceDetail — save", () => {
+    /**
+     * A stand-in for a saved instance's form, as the component holds it.
+     *
+     * @returns {object} the stand-in; ``toasts`` collects what it showed
+     */
+    function formOf() {
+        const comp = Object.create(InstanceDetail.prototype);
+        comp.toasts = [];
+        comp.props = { instance_id: 7 };
+        comp.state = {
+            saving: false,
+            form: { name: "after", smtp_relay_port: "587", repos: [] },
+            pipDeps: [],
+            aptDeps: [],
+            selectedTags: [],
+            inst: { id: 7, name: "before", config_dirty: false },
+        };
+        comp.validator = { validate: () => ({ isValid: true, firstError: "" }) };
+        comp.env = {
+            toast: {
+                success: (text) => comp.toasts.push(text),
+                warning: (text) => comp.toasts.push(text),
+                error: (text) => comp.toasts.push(text),
+            },
+        };
+        return comp;
+    }
+
+    test("a save that leaves changes to deploy lights the pill at once", async () => {
+        patchWithCleanup(rpc, {
+            _rpc: () => Promise.resolve({ ok: true, config_dirty: true }),
+        });
+        const comp = formOf();
+        await InstanceDetail.prototype.save.call(comp);
+        expect(comp.state.inst.name).toBe("after");
+        expect(comp.state.inst.config_dirty).toBe(true);
+    });
+
+    /**
+     * Save a production's form and return the values the panel sent.
+     *
+     * @param {object} fields what the form holds besides the saved basics
+     * @returns {Promise<object>} the ``vals`` of the save request
+     */
+    async function sentOnSave(fields) {
+        let sent = null;
+        patchWithCleanup(rpc, {
+            _rpc: (route, params) => {
+                sent = params.vals;
+                return Promise.resolve({ ok: true });
+            },
+        });
+        const comp = formOf();
+        Object.assign(comp.state.form, { environment: "production" }, fields);
+        await InstanceDetail.prototype.save.call(comp);
+        return sent;
+    }
+
+    test("a password typed before choosing OAuth2 is not sent by the save", async () => {
+        const vals = await sentOnSave({
+            smtp_relay_auth: "oauth2_microsoft",
+            smtp_relay_password: "typed-password",
+            smtp_relay_oauth_client_secret: "typed-secret",
+        });
+        expect(vals.smtp_relay_password).toBe("");
+        expect(vals.smtp_relay_oauth_client_secret).toBe("typed-secret");
+    });
+
+    test("a client secret typed before going back to Password is not sent by the save", async () => {
+        const vals = await sentOnSave({
+            smtp_relay_auth: "password",
+            smtp_relay_password: "typed-password",
+            smtp_relay_oauth_client_secret: "typed-secret",
+        });
+        expect(vals.smtp_relay_password).toBe("typed-password");
+        expect(vals.smtp_relay_oauth_client_secret).toBe("");
+    });
+
+    test("a save whose answer says nothing keeps the pill as it was", async () => {
+        patchWithCleanup(rpc, { _rpc: () => Promise.resolve({ ok: true }) });
+        const comp = formOf();
+        comp.state.inst.config_dirty = true;
+        await InstanceDetail.prototype.save.call(comp);
+        expect(comp.state.inst.config_dirty).toBe(true);
+    });
+});
+
+describe("InstanceDetail — the save bar", () => {
+    /**
+     * A validator that takes only the call Discard makes, and logs it.
+     *
+     * @returns {object} the double
+     */
+    const strictValidator = () => ({ clearErrors: () => expect.step("clearErrors") });
+
+    /**
+     * A stand-in for a saved instance with two saved repositories and a
+     * new row, taken as saved.
+     *
+     * @returns {object} the stand-in
+     */
+    function withRepos() {
+        const comp = Object.create(InstanceDetail.prototype);
+        comp.props = { instance_id: 7 };
+        comp.state = {
+            saving: false,
+            form: {
+                name: "web",
+                repos: [
+                    { id: 4, url: "https://x/a.git", branch: "19.0", commit_sha: "" },
+                    { id: 5, url: "https://x/b.git", branch: "19.0", commit_sha: "" },
+                    { id: null, url: "https://x/c.git", branch: "19.0", commit_sha: "" },
+                ],
+            },
+            selectedTags: [],
+            pipDeps: "",
+            aptDeps: "",
+            langs: [],
+            inst: { id: 7, name: "web" },
+        };
+        comp.validator = strictValidator();
+        comp._savedForm = JSON.stringify(comp._editedValues());
+        return comp;
+    }
+
+    test("tags and dependencies count, and Discard puts the page back", () => {
+        const comp = Object.create(InstanceDetail.prototype);
+        comp.state = {
+            form: { name: "web", domains: [{ name: "a.example" }] },
+            selectedTags: [],
+            pipDeps: "",
+            aptDeps: "",
+            langs: [],
+        };
+        comp.validator = strictValidator();
+        comp._savedForm = JSON.stringify(comp._editedValues());
+        expect(comp.unsavedCount).toBe(0);
+        comp.state.form.domains.push({ name: "b.example" });
+        comp.state.selectedTags.push({ id: 3 });
+        comp.state.aptDeps = "curl";
+        expect(comp.unsavedCount).toBe(3);
+        const form = comp.state.form;
+        comp.discard();
+        expect(comp.state.form).toBe(form);
+        expect(form.domains).toEqual([{ name: "a.example" }]);
+        expect(comp.state.selectedTags).toEqual([]);
+        expect(comp.state.aptDeps).toBe("");
+        expect(comp.hasUnsavedChanges).toBe(false);
+        expect.verifySteps(["clearErrors"]);
+    });
+
+    test("a pin the server stored is not unsaved, and Discard keeps it", () => {
+        const comp = withRepos();
+        // RepoEditor froze a saved repository on the server.
+        comp.onRepoChange(0, "commit_sha", "abc123");
+        expect(comp.unsavedCount).toBe(0);
+        expect(comp.hasUnsavedChanges).toBe(false);
+        // A new row's pin is only on the page until a save.
+        comp.onRepoChange(2, "commit_sha", "fff000");
+        expect(comp.unsavedCount).toBe(1);
+        comp.state.form.name = "web2";
+        comp.discard();
+        expect(comp.state.form.name).toBe("web");
+        expect(comp.state.form.repos[0].commit_sha).toBe("abc123");
+        expect(comp.state.form.repos[2].commit_sha).toBe("");
+        // Unfrozen on the server: not unsaved either.
+        comp.onRepoChange(0, "commit_sha", "");
+        expect(comp.unsavedCount).toBe(0);
+        expect.verifySteps(["clearErrors"]);
+    });
+
+    test("Freeze all and Unfreeze all write on the server: nothing is left unsaved", async () => {
+        const calls = [];
+        patchWithCleanup(rpc, {
+            _rpc: (route, params) => {
+                calls.push([route, params.repo_ids]);
+                return Promise.resolve(
+                    route === "/cloud/freeze_all_repos"
+                        ? { ok: true, results: { 4: "aaa111", 5: "bbb222" } }
+                        : { ok: true }
+                );
+            },
+        });
+        const comp = withRepos();
+        await comp.freezeAllRepos();
+        expect(comp.state.form.repos.map((r) => r.commit_sha)).toEqual(["aaa111", "bbb222", ""]);
+        expect(comp.unsavedCount).toBe(0);
+        comp.discard();
+        expect(comp.state.form.repos[1].commit_sha).toBe("bbb222");
+        await comp.unfreezeAllRepos();
+        expect(comp.unsavedCount).toBe(0);
+        expect(calls).toEqual([
+            ["/cloud/freeze_all_repos", [4, 5]],
+            ["/cloud/unfreeze_all_repos", [4, 5]],
+        ]);
+        expect.verifySteps(["clearErrors"]);
+    });
+
+    test("an edit made while the save is out stays unsaved", async () => {
+        const answer = new Deferred();
+        patchWithCleanup(rpc, { _rpc: () => answer });
+        const comp = withRepos();
+        comp.validator = { validate: () => ({ isValid: true, firstError: "" }) };
+        comp.env = { toast: { success: () => expect.step("saved") } };
+        comp.state.form.name = "web2";
+        const saving = comp.save();
+        comp.state.form.name = "web3";
+        answer.resolve({ ok: true });
+        await saving;
+        expect.verifySteps(["saved"]);
+        expect(comp.unsavedCount).toBe(1);
+        expect(JSON.parse(comp._savedForm).name).toBe("web2");
+    });
+
+    test("requirements fetched after Discard leave the dependencies as saved", async () => {
+        const answer = new Deferred();
+        patchWithCleanup(rpc, { _rpc: () => answer });
+        const comp = withRepos();
+        comp.state.form.name = "web2";
+        const fetching = comp._fetchAndMergeRequirements("https://x/a.git", "19.0");
+        comp.discard();
+        answer.resolve({ ok: true, found: true, content: "lxml\n" });
+        await fetching;
+        expect(comp.state.pipDeps).toBe("");
+        expect(comp.unsavedCount).toBe(0);
+        expect.verifySteps(["clearErrors"]);
+    });
+});

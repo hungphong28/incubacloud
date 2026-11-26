@@ -1,0 +1,441 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates>
+
+    <t t-name="incubacloud.AppHeader">
+        <header class="ic-header">
+
+            <!-- Menu toggle: hidden on desktop by CSS, the only way to
+                 reach the navigation on narrow viewports (the sidebar
+                 sits off-canvas there). -->
+            <button class="ic-sidebar-burger"
+                    type="button"
+                    aria-label="Toggle navigation"
+                    t-att-aria-expanded="props.sidebarOpen ? 'true' : 'false'"
+                    t-on-click="() => env.toggleSidebar()">
+                <span class="ic-burger-bar"/>
+                <span class="ic-burger-bar"/>
+                <span class="ic-burger-bar"/>
+            </button>
+
+            <!-- Logo -->
+            <div class="ic-header-logo" t-on-click="goHome">
+                <svg class="ic-header-logo-icon" viewBox="0 0 48 48" fill="none" width="26" height="26">
+                    <mask id="ic-logo-mask">
+                        <path d="M15.5 34.5h17.6a8.3 8.3 0 0 0 .9-16.55A10.4 10.4 0 0 0 13.6 21 7.2 7.2 0 0 0 15.5 34.5Z" fill="#fff"/>
+                        <rect x="18.4" y="27.7" width="13.4" height="2.7" rx="1.35" fill="#000"/>
+                        <rect x="20.4" y="23.8" width="9.4" height="2.7" rx="1.35" fill="#000"/>
+                        <rect x="22.4" y="19.9" width="5.4" height="2.7" rx="1.35" fill="#000"/>
+                    </mask>
+                    <rect width="48" height="48" fill="#2fc78c" mask="url(#ic-logo-mask)"/>
+                </svg>
+                <span class="ic-header-logo-text">Incuba<i class="ic-logo-accent">Cloud</i></span>
+            </div>
+
+            <!-- Breadcrumb / Project switcher -->
+            <div class="ic-header-breadcrumb">
+                <t t-if="insideProject">
+                    <span class="ic-header-crumb ic-header-crumb--link"
+                          t-on-click="goProjects">Projects</span>
+                    <span class="ic-header-crumb-sep">›</span>
+                    <div class="ic-header-switcher-wrap">
+                        <button class="ic-header-crumb ic-header-crumb--active"
+                                t-on-click="toggleProjectSwitcher"
+                                t-att-aria-expanded="state.showProjectSwitcher ? 'true' : 'false'"
+                                aria-haspopup="listbox">
+                            <t t-esc="currentProjectName || 'Project'"/>
+                            <span class="ic-header-chevron" aria-hidden="true">▾</span>
+                        </button>
+                        <t t-if="state.showProjectSwitcher">
+                            <div class="ic-header-switcher-dropdown">
+                                <input type="text"
+                                       class="ic-header-switcher-search"
+                                       placeholder="Search projects..."
+                                       aria-label="Search projects"
+                                       t-on-input="onProjectSearch"
+                                       t-att-value="state.projectSearch"/>
+                                <ul class="ic-header-switcher-list">
+                                    <t t-foreach="filteredProjects" t-as="p" t-key="p.id">
+                                        <li class="ic-header-switcher-item"
+                                            t-on-click="() => this.selectProject(p)">
+                                            <span class="ic-header-switcher-name" t-esc="p.name"/>
+                                            <span class="ic-header-switcher-meta">
+                                                <t t-if="p.odoo_version" t-esc="p.odoo_version"/>
+                                            </span>
+                                        </li>
+                                    </t>
+                                    <t t-if="!filteredProjects.length">
+                                        <li class="ic-header-switcher-empty">No projects found</li>
+                                    </t>
+                                </ul>
+                                <t t-if="env.permissions?.can_create_project">
+                                    <div class="ic-header-switcher-footer">
+                                        <button class="ic-header-switcher-create"
+                                                t-on-click="createProject">+ Create new project</button>
+                                    </div>
+                                </t>
+                            </div>
+                        </t>
+                    </div>
+                </t>
+            </div>
+
+            <!-- Global search (Ctrl+K) -->
+            <div class="ic-header-search-wrap">
+                <i class="fa fa-search ic-header-search-icon" aria-hidden="true"/>
+                <input type="text" class="ic-header-search-input"
+                       placeholder="Search instances, hosts, projects, settings…"
+                       t-att-value="state.globalSearch"
+                       t-on-input="onGlobalSearch"
+                       t-on-focus="onSearchFocus"
+                       aria-label="Global search"/>
+                <span class="ic-header-search-kbd" aria-hidden="true">Ctrl K</span>
+                <t t-if="state.showSearch">
+                    <div class="ic-header-search-dropdown">
+                        <t t-set="settingHits" t-value="settingsResults"/>
+                        <t t-if="state.searchLoading and !state.searchResults.length and !settingHits.length">
+                            <div class="ic-header-search-msg">Searching…</div>
+                        </t>
+                        <t t-elif="!state.searchResults.length and !settingHits.length">
+                            <div class="ic-header-search-msg">No results</div>
+                        </t>
+                        <t t-else="">
+                            <t t-foreach="state.searchResults" t-as="r" t-key="r.type + '-' + r_index">
+                                <button class="ic-header-search-item"
+                                        t-on-click="() => this.goToSearchResult(r)">
+                                    <t t-out="env.icon(searchResultIcon(r.type), 15)"/>
+                                    <span class="ic-header-search-label" t-esc="r.label"/>
+                                    <span class="ic-header-search-sub" t-esc="r.sublabel"/>
+                                </button>
+                            </t>
+                            <t t-if="settingHits.length">
+                                <div class="ic-header-search-group">Settings</div>
+                                <t t-foreach="settingHits" t-as="field" t-key="'setting-' + field.id">
+                                    <button class="ic-header-search-item"
+                                            t-on-click="() => this.goToSetting(field)">
+                                        <t t-out="env.icon('settings', 15)"/>
+                                        <span class="ic-header-search-label" t-esc="field.label"/>
+                                        <span class="ic-header-search-sub"><t t-esc="field.sectionTitle"/> › <t t-esc="field.blockTitle"/></span>
+                                    </button>
+                                </t>
+                            </t>
+                        </t>
+                    </div>
+                </t>
+            </div>
+
+            <!-- Spacer -->
+            <div class="ic-header-spacer"/>
+
+            <!-- Jobs slide-over (Consultant+) -->
+            <t t-if="env.permissions?.can_edit_instance">
+                <button class="ic-header-icon-btn" t-on-click="openJobs" title="Job History"
+                        aria-label="Job history">
+                    <t t-out="env.icon('clock', 15)"/>
+                </button>
+            </t>
+
+            <!-- Alerts slide-over (Consultant+) -->
+            <t t-if="env.permissions?.can_edit_instance">
+                <button class="ic-header-icon-btn ic-header-alerts" t-on-click="goToAlerts" title="Alerts"
+                        aria-label="Alerts">
+                    <i class="fa fa-bell-o" aria-hidden="true"/>
+                    <t t-if="props.alertCount > 0">
+                        <span class="ic-header-alert-badge" t-esc="props.alertCount"/>
+                    </t>
+                </button>
+            </t>
+
+            <!-- User menu -->
+            <div class="ic-header-user-wrap">
+                <button class="ic-header-user-btn" t-on-click="toggleUserMenu"
+                        aria-label="User menu"
+                        t-att-aria-expanded="state.showUserMenu ? 'true' : 'false'"
+                        aria-haspopup="menu">
+                    <img t-att-class="'ic-header-avatar-img' + (state.avatarLoaded ? '' : ' ic-hidden')"
+                         t-att-src="state.avatarUrl"
+                         t-on-load="onAvatarLoad"
+                         alt=""/>
+                    <span t-att-class="'ic-header-avatar' + (state.avatarLoaded ? ' ic-hidden' : '')"
+                          t-esc="initials"/>
+                    <span class="ic-header-user-name" t-esc="state.userName"/>
+                    <span class="ic-header-chevron">▾</span>
+                </button>
+                <t t-if="state.showUserMenu">
+                    <div class="ic-header-user-dropdown">
+                        <div class="ic-header-user-info">
+                            <span class="ic-header-user-info-name" t-esc="state.userName"/>
+                            <span class="ic-header-user-info-login" t-esc="state.userLogin"/>
+                        </div>
+                        <div class="ic-header-user-sep"/>
+                        <button class="ic-header-user-action" t-on-click="openNotifModal">
+                            <i class="fa fa-bell-o" aria-hidden="true"/> Notifications
+                        </button>
+                        <button class="ic-header-user-action" t-on-click="goToSessions">
+                            <i class="fa fa-shield" aria-hidden="true"/> Sessions and access
+                        </button>
+                        <button t-if="firstStepsInMenu" class="ic-header-user-action"
+                                t-on-click="() => this.openFirstSteps()">
+                            <i class="fa fa-list-ol" aria-hidden="true"/> First steps
+                        </button>
+                        <div class="ic-header-user-sep"/>
+                        <button class="ic-header-user-action" t-on-click="toggleTheme">
+                            <t t-if="state.theme === 'light'"><i class="fa fa-moon-o" aria-hidden="true"/> Dark theme</t>
+                            <t t-else=""><i class="fa fa-sun-o" aria-hidden="true"/> Light theme</t>
+                        </button>
+                        <div class="ic-header-user-sep"/>
+                        <button class="ic-header-user-action" t-on-click="exitToErp">
+                            <i class="fa fa-sign-out" aria-hidden="true"/> Exit
+                        </button>
+                    </div>
+                </t>
+            </div>
+
+        </header>
+
+        <!-- Notification preferences modal -->
+        <IcModal t-if="state.showNotifModal"
+                 title="'Notification Preferences'"
+                 onClose="() => this.closeNotifModal()">
+            <div class="ic-notif-modal">
+                <p class="ic-confirm-message">
+                    Choose what reaches you and when. Muted projects never
+                    interrupt you (no notifications, no live toasts) but stay
+                    visible in the alerts panel.
+                </p>
+
+                <!-- ══════════════════════════════════════════════════════
+                     General settings — always visible
+                     ══════════════════════════════════════════════════════ -->
+                <div class="ic-notif-card">
+                    <div class="ic-notif-card-header ic-notif-card-header--static">
+                        <span class="ic-notif-card-name">General settings</span>
+                    </div>
+                    <div class="ic-notif-card-body">
+                        <div class="ic-form-row">
+                            <label for="ic-notif-level">What to receive</label>
+                            <RlSelect id="'ic-notif-level'"
+                                      value="state.notifLevel"
+                                      ariaLabel="'What to receive'"
+                                      options="notifLevelOptions"
+                                      onChange="(value) => { state.notifLevel = value; }"/>
+                        </div>
+                        <div class="ic-form-row" t-if="state.notifLevel !== 'none'">
+                            <label for="ic-notif-mode">Delivery mode</label>
+                            <RlSelect id="'ic-notif-mode'"
+                                      value="state.notifMode"
+                                      ariaLabel="'Delivery mode'"
+                                      options="[
+                                          { value: 'immediate',    label: 'Immediate (one notification per event)' },
+                                          { value: 'daily_digest', label: 'Daily digest (severe failures still immediate)' },
+                                      ]"
+                                      onChange="(value) => { state.notifMode = value; }"/>
+                        </div>
+                        <div class="ic-form-row">
+                            <label for="ic-notif-muted">Muted projects</label>
+                            <div t-if="state.notifMuted.length" class="ic-notif-chips">
+                                <t t-foreach="state.notifMuted" t-as="proj" t-key="proj.id">
+                                    <span class="ic-notif-chip">
+                                        <span class="ic-notif-chip-name" t-esc="proj.name"/>
+                                        <button class="ic-notif-chip-x" type="button"
+                                                t-att-aria-label="'Unmute ' + proj.name"
+                                                t-on-click="() => this.removeMutedProject(proj.id)">×</button>
+                                    </span>
+                                </t>
+                            </div>
+                            <SearchSelect id="'ic-notif-muted'"
+                                          options="mutableProjects"
+                                          value="null"
+                                          placeholder.translate="Mute a project…"
+                                          onChange="(value) => this.addMutedProject(value)"/>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ══════════════════════════════════════════════════════
+                     Email
+                     ══════════════════════════════════════════════════════ -->
+                <div class="ic-notif-card">
+                    <div class="ic-notif-card-header"
+                         t-on-click="() => this.toggleSection('email')">
+                        <span t-att-class="emailConfigured ? 'ic-notif-card-dot configured' : 'ic-notif-card-dot empty'"/>
+                        <span class="ic-notif-card-name">Email</span>
+                        <span class="ic-notif-card-sub" t-if="emailConfigured">enabled</span>
+                        <span class="ic-notif-card-sub" t-else="">disabled</span>
+                        <i t-att-class="state.expandedSection === 'email' ? 'fa fa-chevron-up ic-notif-card-chevron' : 'fa fa-chevron-down ic-notif-card-chevron'"/>
+                    </div>
+                    <div class="ic-notif-card-body" t-if="state.expandedSection === 'email'">
+                        <p class="ic-notif-help">
+                            When enabled, notifications are sent to
+                            <strong t-esc="env.userInfo?.email or 'your configured email'"/>
+                            based on your general settings above.
+                        </p>
+                        <p class="ic-notif-help">
+                            Disabling email does not affect other notification
+                            channels — they continue following your general
+                            settings. If you disable email and have no other
+                            channel configured, you will receive no notifications
+                            at all.
+                        </p>
+                        <div class="rl-ftoggle">
+                            <div>
+                                <div class="rl-tl-label">Send email notifications</div>
+                                <div class="rl-th">Toggle off to stop receiving cloud alerts by email</div>
+                            </div>
+                            <button type="button"
+                                    t-att-class="'rl-sw' + (state.emailEnabled ? ' on' : '')"
+                                    role="switch"
+                                    t-att-aria-checked="state.emailEnabled ? 'true' : 'false'"
+                                    aria-label="Toggle email notifications"
+                                    t-on-click="() => { state.emailEnabled = !state.emailEnabled; }"/>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ══════════════════════════════════════════════════════
+                     Telegram
+                     ══════════════════════════════════════════════════════ -->
+                <div class="ic-notif-card">
+                    <div class="ic-notif-card-header"
+                         t-on-click="() => this.toggleSection('telegram')">
+                        <span t-att-class="telegramConfigured ? 'ic-notif-card-dot configured' : 'ic-notif-card-dot empty'"/>
+                        <span class="ic-notif-card-name">Telegram</span>
+                        <span class="ic-notif-card-sub" t-if="telegramConfigured">configured</span>
+                        <span class="ic-notif-card-sub" t-else="">not configured</span>
+                        <i t-att-class="state.expandedSection === 'telegram' ? 'fa fa-chevron-up ic-notif-card-chevron' : 'fa fa-chevron-down ic-notif-card-chevron'"/>
+                    </div>
+                    <div class="ic-notif-card-body" t-if="state.expandedSection === 'telegram'">
+                        <div class="rl-ftoggle">
+                            <div>
+                                <div class="rl-tl-label">Send Telegram notifications</div>
+                                <div class="rl-th">Turning it off deletes the stored bot token and chat ID when you save</div>
+                            </div>
+                            <button type="button"
+                                    t-att-class="'rl-sw' + (state.telegramEnabled ? ' on' : '')"
+                                    role="switch"
+                                    t-att-aria-checked="state.telegramEnabled ? 'true' : 'false'"
+                                    aria-label="Toggle Telegram notifications"
+                                    t-on-click="toggleTelegram"/>
+                        </div>
+                        <t t-if="state.telegramEnabled">
+                            <div t-att-class="'ic-form-row' + (state.notifErrors?.telegramToken ? ' has-error' : '')">
+                                <label for="ic-notif-telegram-token" id="ic-notif-telegram-token-label">Bot token</label>
+                                <PasswordInput id="'ic-notif-telegram-token'"
+                                               ariaInvalid="!!state.notifErrors?.telegramToken"
+                                               ariaDescribedby="state.notifErrors?.telegramToken ? 'ic-notif-err-telegramToken' : undefined"
+                                               value="state._telegramToken"
+                                               hasValue="state.telegramTokenConfigured"
+                                               emptyHint="'Get this from @BotFather on Telegram'"
+                                               onChange="(v) => this.onTelegramTokenChange(v)"/>
+                                <span t-if="state.notifErrors?.telegramToken" class="ic-field-error"
+                                      id="ic-notif-err-telegramToken" t-esc="state.notifErrors.telegramToken"/>
+                            </div>
+                            <div t-att-class="'ic-form-row' + (state.notifErrors?.telegramChatId ? ' has-error' : '')">
+                                <label for="ic-notif-telegram-chat">Chat ID</label>
+                                <div class="ic-notif-inline">
+                                    <input id="ic-notif-telegram-chat"
+                                           class="ic-notif-inline-input"
+                                           type="text"
+                                           t-att-aria-invalid="state.notifErrors?.telegramChatId ? 'true' : undefined"
+                                           t-att-aria-describedby="state.notifErrors?.telegramChatId ? 'ic-notif-err-telegramChatId' : undefined"
+                                           t-att-value="state.telegramChatId"
+                                           t-on-input="(ev) => this.onTelegramChatIdInput(ev.target.value)"
+                                           placeholder="e.g. 123456789 or @channelname"/>
+                                    <button class="ic-notif-inline-btn"
+                                            type="button"
+                                            t-att-disabled="state.telegramDetecting"
+                                            t-on-click="detectChatId">
+                                        <t t-if="state.telegramDetecting">…</t>
+                                        <t t-else="">Detect</t>
+                                    </button>
+                                </div>
+                                <span t-if="state.notifErrors?.telegramChatId" class="ic-field-error"
+                                      id="ic-notif-err-telegramChatId" t-esc="state.notifErrors.telegramChatId"/>
+                            </div>
+                            <button class="ic-notif-test-btn"
+                                    type="button"
+                                    t-att-disabled="state.telegramTesting"
+                                    t-on-click="sendTelegramTest">
+                                <t t-if="state.telegramTesting">Sending…</t>
+                                <t t-else="">
+                                    <i class="fa fa-send"/> Send test message
+                                </t>
+                            </button>
+                        </t>
+                    </div>
+                </div>
+
+                <!-- ══════════════════════════════════════════════════════
+                     External webhook
+                     ══════════════════════════════════════════════════════ -->
+                <div class="ic-notif-card">
+                    <div class="ic-notif-card-header"
+                         t-on-click="() => this.toggleSection('webhook')">
+                        <span t-att-class="webhookConfigured ? 'ic-notif-card-dot configured' : 'ic-notif-card-dot empty'"/>
+                        <span class="ic-notif-card-name">External webhook</span>
+                        <span class="ic-notif-card-sub" t-if="webhookConfigured">configured</span>
+                        <span class="ic-notif-card-sub" t-else="">not configured</span>
+                        <i t-att-class="state.expandedSection === 'webhook' ? 'fa fa-chevron-up ic-notif-card-chevron' : 'fa fa-chevron-down ic-notif-card-chevron'"/>
+                    </div>
+                    <div class="ic-notif-card-body" t-if="state.expandedSection === 'webhook'">
+                        <p class="ic-notif-help">
+                            Receive POST notifications on your own HTTPS endpoint
+                            when jobs change state and when alerts are raised or
+                            resolved. When a signing secret is set,
+                            payloads include an <code>X-IncubaCloud-Signature:
+                            sha256=&lt;hex&gt;</code> header for your endpoint to
+                            verify with HMAC-SHA256.
+                            See <code>docs/webhooks.md</code> for payload format
+                            and verification examples.
+                        </p>
+                        <div class="rl-ftoggle">
+                            <div>
+                                <div class="rl-tl-label">Send webhook notifications</div>
+                                <div class="rl-th">Turning it off deletes the stored URL and signing secret when you save</div>
+                            </div>
+                            <button type="button"
+                                    t-att-class="'rl-sw' + (state.webhookEnabled ? ' on' : '')"
+                                    role="switch"
+                                    t-att-aria-checked="state.webhookEnabled ? 'true' : 'false'"
+                                    aria-label="Toggle webhook notifications"
+                                    t-on-click="toggleWebhook"/>
+                        </div>
+                        <t t-if="state.webhookEnabled">
+                            <div t-att-class="'ic-form-row' + (state.notifErrors?.webhookUrl ? ' has-error' : '')">
+                                <label for="ic-notif-webhook-url">Webhook URL</label>
+                                <input id="ic-notif-webhook-url"
+                                       type="text"
+                                       class="ic-notif-url-input"
+                                       t-att-aria-invalid="state.notifErrors?.webhookUrl ? 'true' : undefined"
+                                       t-att-aria-describedby="state.notifErrors?.webhookUrl ? 'ic-notif-err-webhookUrl' : undefined"
+                                       t-att-value="state.webhookUrl"
+                                       t-on-input="(ev) => this.onWebhookUrlInput(ev.target.value)"
+                                       placeholder="https://hooks.example.com/cloud"/>
+                                <span t-if="state.notifErrors?.webhookUrl" class="ic-field-error"
+                                      id="ic-notif-err-webhookUrl" t-esc="state.notifErrors.webhookUrl"/>
+                            </div>
+                            <div class="ic-form-row">
+                                <label for="ic-notif-webhook-secret" id="ic-notif-webhook-secret-label">Signing secret</label>
+                                <PasswordInput id="'ic-notif-webhook-secret'"
+                                               value="state._webhookSecret"
+                                               hasValue="state.webhookSecretConfigured"
+                                               emptyHint="'Choose a secret and set the same value on your endpoint'"
+                                               onChange="(v) => this.onWebhookSecretChange(v)"/>
+                            </div>
+                        </t>
+                    </div>
+                </div>
+
+            </div>
+            <div class="ic-confirm-actions">
+                <button class="ic-confirm-btn-cancel" t-on-click="closeNotifModal">Cancel</button>
+                <button class="ic-confirm-btn-ok"
+                        t-att-disabled="state.notifSaving"
+                        t-on-click="saveNotifPrefs">
+                    <t t-if="state.notifSaving">Saving…</t>
+                    <t t-else="">Save</t>
+                </button>
+            </div>
+        </IcModal>
+    </t>
+
+</templates>

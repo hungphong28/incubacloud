@@ -1,0 +1,79 @@
+.ic-pitr-panel {
+    margin-bottom: 12px;
+
+    .ic-pitr-head {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 10px;
+    }
+
+    .ic-pitr-tz {
+        margin-left: auto;
+        font-size: 11px;
+        color: var(--rl-muted);
+    }
+
+    .ic-pitr-muted { color: var(--rl-muted); }
+
+    // Facts on the left, the objective and the actions on the right:
+    // the one thing to set and the two things to do stand apart from
+    // what is only read.
+    .ic-pitr-body {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 12px 32px;
+        align-items: start;
+
+        @media (max-width: 720px) {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    .ic-pitr-facts {
+        display: grid;
+        grid-template-columns: max-content minmax(0, 1fr);
+        gap: 6px 14px;
+        margin: 0;
+
+        dt {
+            font-family: var(--rl-fm);
+            font-size: 10.5px;
+            letter-spacing: .05em;
+            text-transform: uppercase;
+            color: var(--rl-muted);
+            padding-top: 2px;
+        }
+
+        dd { margin: 0; }
+    }
+
+    .ic-pitr-side {
+        min-width: 220px;
+
+        .rl-frow { margin-block-end: 10px; }
+    }
+
+    .ic-pitr-actions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+}
+
+.ic-pitr-restore-note {
+    margin: 0;
+    color: var(--rl-muted);
+}
+
+.ic-pitr-range {
+    margin-top: 4px;
+    font-size: 12px;
+}
+
+// The name to type, as it is: the label around it is upper-cased.
+.ic-pitr-confirm-name {
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 12px;
+}

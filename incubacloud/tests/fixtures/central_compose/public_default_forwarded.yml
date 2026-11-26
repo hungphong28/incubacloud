@@ -1,0 +1,75 @@
+services:
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.102.0
+    restart: unless-stopped
+    command:
+      - '-retentionPeriod=90d'
+      - '-storageDataPath=/vmdata'
+      - '-httpListenAddr=:8428'
+      # Bound to the compose network only — see the header.
+    volumes:
+      - vmdata:/vmdata
+
+  loki:
+    image: grafana/loki:2.9.8
+    restart: unless-stopped
+    command: ['-config.file=/etc/loki/local-config.yaml']
+    volumes:
+      - /root/observability-central/loki.yaml:/etc/loki/local-config.yaml:ro
+      - lokidata:/loki
+    # No host port, same as VictoriaMetrics: the account
+    # boundary is imposed by vmauth, and anything able to reach
+    # Loki directly would bypass it.
+
+  vmauth:
+    image: victoriametrics/vmauth:v1.102.0
+    restart: unless-stopped
+    # Listen on 8428 (not vmauth's 8427 default) so every
+    # address of this stack — the panel's, the health check,
+    # the agents' URLs — speaks one port.
+    command:
+      - '-auth.config=/etc/vmauth/auth.yml'
+      - '-httpListenAddr=:8428'
+    volumes:
+      - /root/observability-central/vmauth/auth.yml:/etc/vmauth/auth.yml:ro
+    ports:
+      - "172.17.0.1:8428:8428"
+    # Published under its own name through this host's Traefik,
+    # which reaches it over the shared network. The same routes
+    # as the hand-written gateway of a central next to its panel
+    # (docs/observability-operations.md, «Publishing the central»): the
+    # account prefixes for everyone (vmauth asks each for its
+    # credential), the operator's deletion route for the
+    # addresses in ``ic_operator_sources`` only.
+    networks:
+      - default
+      - inverseproxy_shared
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: inverseproxy_shared
+      traefik.http.services.ic-central-gateway.loadbalancer.server.port: "8428"
+      traefik.http.routers.ic-central-data.rule: "Host(`metrics-central.example.test`) && (PathPrefix(`/w/`)
+        || PathPrefix(`/r/`) || PathPrefix(`/lw/`) || PathPrefix(`/lr/`))"
+      traefik.http.routers.ic-central-data.entrypoints: https
+      traefik.http.routers.ic-central-data.service: ic-central-gateway
+      traefik.http.routers.ic-central-data.priority: "10"
+      traefik.http.routers.ic-central-delete.rule: "Host(`metrics-central.example.test`) && PathPrefix(`/admin-d/`)"
+      traefik.http.routers.ic-central-delete.entrypoints: https
+      traefik.http.routers.ic-central-delete.service: ic-central-gateway
+      traefik.http.routers.ic-central-delete.priority: "30"
+      traefik.http.routers.ic-central-delete.middlewares: ic-central-delete-sources
+      traefik.http.middlewares.ic-central-delete-sources.ipwhitelist.sourcerange: "127.0.0.1/32"
+      traefik.http.middlewares.ic-central-delete-sources.ipwhitelist.ipstrategy.depth: "1"
+      traefik.http.routers.ic-central-data.tls: "true"
+      traefik.http.routers.ic-central-delete.tls: "true"
+    depends_on:
+      - victoriametrics
+      - loki
+
+networks:
+  inverseproxy_shared:
+    external: true
+
+volumes:
+  vmdata:
+  lokidata:

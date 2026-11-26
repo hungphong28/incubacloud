@@ -1,0 +1,1303 @@
+"""
+Tests for the transport abstraction layer.
+
+Covers:
+  - BaseTransport ABC contract
+  - SSHTransport.execute() — streaming stdout/stderr via callbacks
+  - SSHTransport.run() — captured output
+  - SSHTransport file operations — upload/download delegate to SFTP
+  - AbstractExecutor.after_commands hook — called on success, not on failure
+  - BackupCreateExecutor.after_commands — download + cleanup for non-prod
+  - BackupDownloadExecutor.after_commands — calls _download_zip
+"""
+
+import asyncio
+import logging
+import shlex
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import asyncssh
+
+from odoo.tests.common import BaseCase, tagged
+
+from odoo.addons.incubacloud.restore_space import RESERVE_BYTES
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _split_env(argv):
+    """Split the ``NAME=value`` words ``run_script`` puts before ``bash``.
+
+    :param list argv: a command as ``shlex.split`` returns it.
+    :return: ``(env dict, the argv without them)``
+    """
+    env = {}
+    while argv and "=" in argv[0] and argv[0].split("=", 1)[0].isidentifier():
+        name, value = argv.pop(0).split("=", 1)
+        env[name] = value
+    return env, argv
+
+
+def _run(coro):
+    """Run a coroutine in a fresh event loop."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _async_iter(lines):
+    """Return an async iterator that yields the given lines."""
+
+    async def _gen():
+        for line in lines:
+            yield line
+
+    return _gen()
+
+
+# ---------------------------------------------------------------------------
+# 1. BaseTransport is abstract
+# ---------------------------------------------------------------------------
+
+
+class TestBaseTransportIsAbstract(BaseCase):
+    def test_cannot_instantiate_directly(self):
+        from odoo.addons.incubacloud.models.transport import BaseTransport
+
+        with self.assertRaises(TypeError):
+            BaseTransport()
+
+    def test_ssh_transport_implements_all_abstract_methods(self):
+        from odoo.addons.incubacloud.models.transport import (
+            BaseTransport,
+            SSHTransport,
+        )
+
+        # All abstract methods must be present on SSHTransport
+        for name in BaseTransport.__abstractmethods__:
+            self.assertTrue(
+                hasattr(SSHTransport, name),
+                f"SSHTransport missing abstract method: {name}",
+            )
+
+    def test_command_result_is_namedtuple(self):
+        from odoo.addons.incubacloud.models.transport import CommandResult
+
+        r = CommandResult(stdout="hello", exit_status=0)
+        self.assertEqual(r.stdout, "hello")
+        self.assertEqual(r.exit_status, 0)
+
+
+class TestTheCommandsStayOutOfTheLog(BaseCase):
+    """asyncssh logs every command it runs, whole, at INFO."""
+
+    def test_a_command_asyncssh_logs_reaches_no_handler(self):
+        """A channel's ``Command:`` line, as asyncssh writes it, is dropped
+        before any handler, the root logger's at INFO included."""
+        from odoo.addons.incubacloud.models import transport  # noqa: F401
+
+        seen = []
+
+        class _Keep(logging.Handler):
+            """Keep every record that reaches the handler."""
+
+            def emit(self, record):
+                """Record *record*'s message."""
+                seen.append(record.getMessage())
+
+        handler = _Keep(level=logging.DEBUG)
+        pkg = logging.getLogger("asyncssh")
+        pkg.addHandler(handler)
+        try:
+            channel = asyncssh.logger.get_child("channel", "chan=0")
+            channel.info("  Command: %s", "bash push.sh not-for-the-log")
+            channel.warning("a warning still reaches the log")
+        finally:
+            pkg.removeHandler(handler)
+        self.assertEqual(seen, ["[chan=0] a warning still reaches the log"])
+        self.assertFalse(pkg.isEnabledFor(logging.INFO))
+
+
+# ---------------------------------------------------------------------------
+# 2. SSHTransport.execute()
+# ---------------------------------------------------------------------------
+
+
+def _collector():
+    """An async line callback, as ``SSHTransport.execute`` awaits, and
+    the list of lines it was given."""
+    lines = []
+
+    async def collect(line):
+        """Record *line*."""
+        lines.append(line)
+
+    return collect, lines
+
+
+class TestSSHTransportExecute(BaseCase):
+    def _make_process(self, stdout_lines, stderr_lines, exit_status=0):
+        process = MagicMock(spec=asyncssh.SSHClientProcess)
+        process.stdout = _async_iter(stdout_lines)
+        process.stderr = _async_iter(stderr_lines)
+        process.exit_status = exit_status
+        process.wait = AsyncMock()
+        return process
+
+    def test_stdout_lines_collected(self):
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        process = self._make_process(["line1\n", "line2\n"], [])
+        conn = MagicMock(spec=asyncssh.SSHClientConnection)
+        conn.create_process = AsyncMock(return_value=process)
+        transport = SSHTransport(conn)
+
+        collect, captured = _collector()
+        result = _run(transport.execute("cmd", collect, AsyncMock()))
+        self.assertEqual(result.stdout, "line1\nline2")
+        self.assertEqual(captured, ["line1", "line2"])
+
+    def test_stderr_lines_forwarded(self):
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        process = self._make_process([], ["err1\n", "err2\n"])
+        conn = MagicMock(spec=asyncssh.SSHClientConnection)
+        conn.create_process = AsyncMock(return_value=process)
+        transport = SSHTransport(conn)
+
+        collect, stderr_captured = _collector()
+        _run(transport.execute("cmd", AsyncMock(), collect))
+        self.assertEqual(stderr_captured, ["err1", "err2"])
+
+    def test_exit_status_returned(self):
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        process = self._make_process([], [], exit_status=42)
+        conn = MagicMock(spec=asyncssh.SSHClientConnection)
+        conn.create_process = AsyncMock(return_value=process)
+        transport = SSHTransport(conn)
+
+        result = _run(transport.execute("cmd", AsyncMock(), AsyncMock()))
+        self.assertEqual(result.exit_status, 42)
+
+    def test_empty_lines_ignored(self):
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        process = self._make_process(["   \n", "\n", "real\n"], [])
+        conn = MagicMock(spec=asyncssh.SSHClientConnection)
+        conn.create_process = AsyncMock(return_value=process)
+        transport = SSHTransport(conn)
+
+        collect, captured = _collector()
+        _run(transport.execute("cmd", collect, AsyncMock()))
+        # Blank lines stripped — only "real" survives
+        self.assertNotIn("", captured)
+        self.assertIn("real", captured)
+
+
+def _running_process():
+    """A remote process that runs until it is sent TERM, as the spike's did.
+
+    Its output streams stay open until ``terminate()``; then its trap
+    writes one line on stderr and both streams end (8-nov-2026: the
+    boot test's trap took 1.6 s).
+
+    :return: the ``SSHClientProcess`` mock
+    """
+    process = MagicMock(spec=asyncssh.SSHClientProcess)
+    termed = asyncio.Event()
+
+    async def _stdout():
+        await termed.wait()
+        if False:  # pragma: no cover — makes this an async generator
+            yield ""
+
+    async def _stderr():
+        yield "working\n"
+        await termed.wait()
+        yield "trap: put the stack back\n"
+
+    process.stdout = _stdout()
+    process.stderr = _stderr()
+    process.terminate.side_effect = termed.set
+    process.exit_status = None
+
+    async def _wait(*_args, **_kwargs):
+        await termed.wait()
+
+    process.wait.side_effect = _wait
+    return process
+
+
+async def _cancel_after_start(coro):
+    """Run *coro* as a task and cancel it once it is under way.
+
+    :return: whether it raised ``CancelledError`` again
+    :rtype: bool
+    """
+    task = asyncio.ensure_future(coro)
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        return True
+    return False
+
+
+class TestSSHTransportCancel(BaseCase):
+    """A stop sends the remote command TERM (8-nov-2026).
+
+    Cancelled, ``execute`` only closed the connection, which signals
+    nothing: the step went on on the host until it next wrote to its
+    output, or to its end — a boot test copying for half an hour, the
+    update of the live database through.
+    """
+
+    def test_a_cancelled_command_is_sent_term_and_the_stop_goes_on(self):
+        """TERM once, the trap's lines still logged, the stop raised again."""
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        process = _running_process()
+        conn = MagicMock(spec=asyncssh.SSHClientConnection)
+        conn.create_process = AsyncMock(return_value=process)
+        collect, stderr = _collector()
+
+        raised = _run(_cancel_after_start(
+            SSHTransport(conn).execute("cmd", AsyncMock(), collect),
+        ))
+
+        self.assertTrue(raised)
+        process.terminate.assert_called_once_with()
+        self.assertIn(
+            "⚠ Stopped: the command running on the server was sent TERM.",
+            stderr,
+        )
+        self.assertEqual(stderr[-1], "trap: put the stack back")
+
+    def test_a_cancel_while_the_session_opens_signals_nothing(self):
+        """Stopped inside ``create_process``: no process, nothing to send."""
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        async def _opening(*_args, **_kwargs):
+            await asyncio.sleep(30)
+
+        conn = MagicMock(spec=asyncssh.SSHClientConnection)
+        conn.create_process = AsyncMock(side_effect=_opening)
+
+        raised = _run(_cancel_after_start(
+            SSHTransport(conn).execute("cmd", AsyncMock(), AsyncMock()),
+        ))
+
+        self.assertTrue(raised)
+        conn.create_process.assert_awaited_once_with("cmd")
+
+    def test_a_command_that_ignores_term_is_waited_for_a_while_only(self):
+        """A host that drops the signal (root on OpenSSH 8.9, measured)
+        holds the stop for the cap, not for ever."""
+        from odoo.addons.incubacloud.models import transport as transport_mod
+
+        process = _running_process()
+        process.terminate.side_effect = None
+        conn = MagicMock(spec=asyncssh.SSHClientConnection)
+        conn.create_process = AsyncMock(return_value=process)
+
+        with patch.object(transport_mod, "CANCEL_TERM_WAIT_S", 0.1):
+            raised = _run(asyncio.wait_for(_cancel_after_start(
+                transport_mod.SSHTransport(conn).execute(
+                    "cmd", AsyncMock(), AsyncMock(),
+                ),
+            ), timeout=5))
+
+        self.assertTrue(raised)
+        process.terminate.assert_called_once_with()
+
+    def test_the_wait_stays_under_the_reconciliation_and_the_runner(self):
+        """Never long enough to make the job a lost worker."""
+        from odoo.addons.incubacloud.models.transport import (
+            CANCEL_TERM_WAIT_S,
+            DEFAULT_SSH_COMMAND_TIMEOUT,
+        )
+
+        self.assertLess(CANCEL_TERM_WAIT_S, 5 * 60)
+        self.assertLess(CANCEL_TERM_WAIT_S, DEFAULT_SSH_COMMAND_TIMEOUT)
+
+    def test_a_cancelled_run_sends_term_too(self):
+        """``run`` does not go through ``execute``: it stops the same way."""
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        process = _running_process()
+        conn = MagicMock(spec=asyncssh.SSHClientConnection)
+        conn.create_process = AsyncMock(return_value=process)
+
+        raised = _run(_cancel_after_start(SSHTransport(conn).run("cmd")))
+
+        self.assertTrue(raised)
+        process.terminate.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# 3. SSHTransport.run()
+# ---------------------------------------------------------------------------
+
+
+def _conn_answering(stdout, exit_status):
+    """A connection whose process ends at once with *stdout* and status.
+
+    :return: ``(connection mock, process mock)``
+    """
+    process = MagicMock(spec=asyncssh.SSHClientProcess)
+    process.wait = AsyncMock(return_value=MagicMock(
+        spec=asyncssh.SSHCompletedProcess, stdout=stdout, exit_status=exit_status,
+    ))
+    conn = MagicMock(spec=asyncssh.SSHClientConnection)
+    conn.create_process = AsyncMock(return_value=process)
+    return conn, process
+
+
+class TestSSHTransportRun(BaseCase):
+    def test_returns_stdout_and_exit_status(self):
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        conn, _process = _conn_answering("output\n", 0)
+        transport = SSHTransport(conn)
+
+        result = _run(transport.run("uname -s"))
+        self.assertEqual(result.stdout, "output")
+        self.assertEqual(result.exit_status, 0)
+
+    def test_none_stdout_becomes_empty_string(self):
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        conn, _process = _conn_answering(None, 1)
+        transport = SSHTransport(conn)
+
+        result = _run(transport.run("false"))
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.exit_status, 1)
+
+    def test_run_passes_check_false(self):
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        conn, process = _conn_answering("", 0)
+        transport = SSHTransport(conn)
+
+        _run(transport.run("cmd"))
+        conn.create_process.assert_awaited_once_with("cmd")
+        process.wait.assert_awaited_once_with(check=False)
+
+
+class TestSSHTransportRunWithStdin(BaseCase):
+    """A command fed its input whole (the scripts' tar, 16-nov-2026)."""
+
+    def _conn(self, stdout, exit_status, write_error=None):
+        """A connection whose process takes the input and ends at once.
+
+        :param write_error: what writing the input raises, or None
+        :return: ``(connection mock, process mock)``
+        """
+        conn, process = _conn_answering(stdout, exit_status)
+        process.stdin = MagicMock(spec=asyncssh.SSHWriter)
+        if write_error is not None:
+            process.stdin.write.side_effect = write_error
+        return conn, process
+
+    def test_the_input_is_written_whole_and_closed(self):
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        conn, process = self._conn(b"done\n", 0)
+        result = _run(SSHTransport(conn).run_with_stdin("tar -x", b"data"))
+
+        self.assertEqual(result.stdout, "done")
+        self.assertEqual(result.exit_status, 0)
+        process.stdin.write.assert_called_once_with(b"data")
+        process.stdin.write_eof.assert_called_once_with()
+        conn.create_process.assert_awaited_once_with(
+            "tar -x", encoding=None, stderr=asyncssh.STDOUT,
+        )
+        process.wait.assert_awaited_once_with(check=False)
+
+    def test_a_command_that_exits_unread_is_judged_by_its_status(self):
+        """No ``tar`` on the host: the channel closes under the write."""
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        conn, _process = self._conn(
+            b"sh: tar: not found\n", 127, write_error=BrokenPipeError(),
+        )
+        result = _run(SSHTransport(conn).run_with_stdin("tar -x", b"data"))
+
+        self.assertEqual(result.exit_status, 127)
+        self.assertEqual(result.stdout, "sh: tar: not found")
+
+    def test_the_base_transport_does_not_have_it(self):
+        """Not abstract: a transport of a layer still instantiates, and
+        whoever calls it falls back (``_upload_scripts_as_tar``)."""
+        from odoo.addons.incubacloud.models.transport import (
+            BaseTransport,
+            SSHTransport,
+        )
+
+        self.assertNotIn("run_with_stdin", BaseTransport.__abstractmethods__)
+        with self.assertRaises(NotImplementedError):
+            _run(BaseTransport.run_with_stdin(
+                MagicMock(spec=SSHTransport), "cmd", b"",
+            ))
+
+
+# ---------------------------------------------------------------------------
+# 4. SSHTransport file operations
+# ---------------------------------------------------------------------------
+
+
+def _make_sftp_ctx(sftp_mock):
+    """Return an async context manager that yields sftp_mock."""
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=sftp_mock)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    return ctx
+
+
+def _make_file_ctx():
+    """Return an async context manager for sftp.open().
+
+    The ``ctx`` wrapper is a pure context-manager shim (only
+    ``__aenter__``/``__aexit__`` are exercised); the handle the
+    production code actually calls methods on is spec'd against the
+    real asyncssh class.
+    """
+    fh = MagicMock(spec=asyncssh.SFTPClientFile)
+    fh.write = AsyncMock()
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=fh)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    return ctx, fh
+
+
+class TestSSHTransportFileOps(BaseCase):
+    def _transport_with_sftp(self):
+        sftp = MagicMock(spec=asyncssh.SFTPClient)
+        sftp.put = AsyncMock()
+        sftp.get = AsyncMock()
+        conn = MagicMock(spec=asyncssh.SSHClientConnection)
+        conn.start_sftp_client = MagicMock(return_value=_make_sftp_ctx(sftp))
+        from odoo.addons.incubacloud.models.transport import SSHTransport
+
+        return SSHTransport(conn), sftp
+
+    def test_upload_text_files_writes_each_path(self):
+        transport, sftp = self._transport_with_sftp()
+        file_ctx1, fh1 = _make_file_ctx()
+        file_ctx2, fh2 = _make_file_ctx()
+        sftp.open = MagicMock(side_effect=[file_ctx1, file_ctx2])
+
+        _run(
+            transport.upload_text_files(
+                {
+                    "/tmp/a.txt": "content-a",
+                    "/tmp/b.txt": "content-b",
+                }
+            )
+        )
+
+        self.assertEqual(sftp.open.call_count, 2)
+        fh1.write.assert_called_once_with("content-a")
+        fh2.write.assert_called_once_with("content-b")
+        # No mode asked: the server's default, as before, over whatever
+        # is there.
+        path, flags, attrs = sftp.open.call_args_list[0].args
+        self.assertEqual(flags, "w")
+        self.assertIsNone(attrs.permissions)
+        sftp.remove.assert_not_awaited()
+
+    def test_a_secret_is_created_readable_by_its_owner_only(self):
+        """A key staged in /tmp is 0600 from its first byte."""
+        transport, sftp = self._transport_with_sftp()
+        file_ctx, fh = _make_file_ctx()
+        sftp.open = MagicMock(return_value=file_ctx)
+
+        _run(transport.upload_text_files({"/tmp/k.env": "K=v\n"}, mode=0o600))
+
+        path, flags, attrs = sftp.open.call_args.args
+        # Created by this call, never opened over an existing file: the
+        # server applies the mode only to a file it creates.
+        self.assertEqual((path, flags), ("/tmp/k.env", "x"))
+        self.assertEqual(attrs.permissions, 0o600)
+        fh.write.assert_called_once_with("K=v\n")
+
+    def test_a_secret_replaces_what_an_earlier_run_left(self):
+        """A copy left 0644 by a run before the private staging existed
+        is removed first, so the new one does not inherit its mode."""
+        transport, sftp = self._transport_with_sftp()
+        file_ctx, _fh = _make_file_ctx()
+        sftp.open = MagicMock(return_value=file_ctx)
+
+        _run(transport.upload_text_files({"/tmp/k.env": "K=v\n"}, mode=0o600))
+
+        self.assertEqual(
+            [name for name, *_ in sftp.mock_calls[:2]], ["remove", "open"],
+        )
+        sftp.remove.assert_awaited_once_with("/tmp/k.env")
+
+    def test_a_secret_with_nothing_to_replace_is_created(self):
+        """No earlier copy at the path: the removal finds nothing, and
+        the file is created all the same."""
+        transport, sftp = self._transport_with_sftp()
+        sftp.remove.side_effect = asyncssh.SFTPNoSuchFile("No such file")
+        file_ctx, fh = _make_file_ctx()
+        sftp.open = MagicMock(return_value=file_ctx)
+
+        _run(transport.upload_text_files({"/tmp/k.env": "K=v\n"}, mode=0o600))
+
+        fh.write.assert_called_once_with("K=v\n")
+
+    def test_a_path_another_account_holds_is_not_written(self):
+        """In a sticky /tmp a file of another account cannot be removed:
+        the secret is not written into it, and the error names the path
+        and says whose it is."""
+        from odoo.addons.incubacloud.models.transport import StagingPathTaken
+
+        transport, sftp = self._transport_with_sftp()
+        sftp.remove.side_effect = asyncssh.SFTPPermissionDenied("denied")
+
+        with self.assertRaises(StagingPathTaken) as caught:
+            _run(transport.upload_text_files(
+                {"/tmp/k.env": "K=v\n"}, mode=0o600,
+            ))
+        sftp.open.assert_not_called()
+        self.assertIn("/tmp/k.env", str(caught.exception))
+        self.assertIn("another account", str(caught.exception))
+        self.assertIsInstance(
+            caught.exception.__cause__, asyncssh.SFTPPermissionDenied,
+        )
+
+    def test_a_path_taken_between_removal_and_creation_is_named(self):
+        """Another account wins the race between the two: the exclusive
+        create fails, and the error says where and why."""
+        from odoo.addons.incubacloud.models.transport import StagingPathTaken
+
+        transport, sftp = self._transport_with_sftp()
+        sftp.open = MagicMock(side_effect=asyncssh.SFTPFailure("exists"))
+
+        with self.assertRaises(StagingPathTaken) as caught:
+            _run(transport.upload_text_files(
+                {"/tmp/k.env": "K=v\n"}, mode=0o600,
+            ))
+        self.assertIn("/tmp/k.env", str(caught.exception))
+        self.assertIn("another account", str(caught.exception))
+
+    def test_a_public_file_keeps_the_server_s_own_error(self):
+        """Without a mode nothing changes: the SFTP error goes up as is."""
+        transport, sftp = self._transport_with_sftp()
+        sftp.open = MagicMock(side_effect=asyncssh.SFTPPermissionDenied("no"))
+
+        with self.assertRaises(asyncssh.SFTPPermissionDenied):
+            _run(transport.upload_text_files({"/tmp/a.txt": "a"}))
+
+    def test_upload_file_calls_sftp_put(self):
+        transport, sftp = self._transport_with_sftp()
+        _run(transport.upload_file("/local/f.zip", "/remote/f.zip"))
+        sftp.put.assert_called_once_with("/local/f.zip", "/remote/f.zip")
+
+    def test_upload_dir_calls_sftp_put_recurse(self):
+        transport, sftp = self._transport_with_sftp()
+        _run(transport.upload_dir("/local/dir", "/remote/dir"))
+        sftp.put.assert_called_once_with("/local/dir", "/remote/dir", recurse=True)
+
+    def test_download_file_calls_sftp_get(self):
+        transport, sftp = self._transport_with_sftp()
+        _run(transport.download_file("/remote/f.zip", "/local/f.zip"))
+        sftp.get.assert_called_once_with("/remote/f.zip", "/local/f.zip")
+
+
+# ---------------------------------------------------------------------------
+# 5. AbstractExecutor.after_commands hook
+# ---------------------------------------------------------------------------
+
+
+class TestAbstractExecutorAfterCommandsHook(BaseCase):
+    """Verify after_commands is called on success and skipped on failure."""
+
+    def _make_executor(self, commands, parse_errors=None):
+        from odoo.addons.incubacloud.models.abstract_executor import (
+            AbstractExecutor,
+        )
+
+        after_called_with = []
+
+        class _TestExecutor(AbstractExecutor):
+            _job_type = None  # don't register
+
+            def __init_subclass__(cls, **kwargs):
+                pass  # skip registry
+
+            def get_commands(self):
+                return commands
+
+            def parse_results(self, results):
+                return parse_errors or []
+
+            async def after_commands(self, transport, results):
+                after_called_with.append((transport, results))
+
+        # Build a minimal job+host double without Odoo ORM
+        job = MagicMock()
+        job.id = 1
+        job.instance_id = None
+        job.env = MagicMock()
+        job.env.registry.cursor.return_value.__enter__ = MagicMock(
+            return_value=MagicMock()
+        )
+        job.env.registry.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cr_env = MagicMock()
+        cr_env.__getitem__ = MagicMock(
+            return_value=MagicMock(browse=MagicMock(return_value=job))
+        )
+        job.env.__call__ = MagicMock(return_value=cr_env)
+
+        host = MagicMock()
+        host.ip_address = "127.0.0.1"
+        host.port = 22
+        host.user = "root"
+
+        ex = object.__new__(_TestExecutor)
+        AbstractExecutor.__init__(ex, job, host)
+        return ex, after_called_with
+
+    def _fake_transport(self, exit_status=0):
+        from odoo.addons.incubacloud.models.transport import CommandResult
+
+        transport = MagicMock()
+        transport.execute = AsyncMock(
+            return_value=CommandResult(stdout="ok", exit_status=exit_status)
+        )
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=transport)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        return transport, ctx
+
+    def test_after_commands_called_on_success(self):
+        transport, ctx = self._fake_transport(exit_status=0)
+        ex, called = self._make_executor([("step", "echo hi")])
+        ex._host_record.get_transport = MagicMock(return_value=ctx)
+        ex._log_buffer = []
+
+        _run(ex._async_entry())
+
+        self.assertEqual(len(called), 1)
+        self.assertIs(called[0][0], transport)
+
+    def test_after_commands_not_called_on_parse_failure(self):
+        transport, ctx = self._fake_transport(exit_status=0)
+        ex, called = self._make_executor(
+            [("step", "echo hi")],
+            parse_errors=["something went wrong"],
+        )
+        ex._host_record.get_transport = MagicMock(return_value=ctx)
+        ex._log_buffer = []
+
+        with self.assertRaises(RuntimeError):
+            _run(ex._async_entry())
+
+        self.assertEqual(called, [])
+
+    def test_after_commands_not_called_when_command_fails_stop_on_failure(
+        self,
+    ):
+        transport, ctx = self._fake_transport(exit_status=1)
+        ex, called = self._make_executor(
+            [("step", "false", {"stop_on_failure": True})],
+        )
+        ex._host_record.get_transport = MagicMock(return_value=ctx)
+        ex._log_buffer = []
+
+        # No parse errors, but stop_on_failure aborted → after_commands called
+        # (parse_results sees empty results dict or only partial results)
+        # With no parse errors defined, after_commands IS called even after
+        # stop_on_failure; it's the executor's parse_results that decides.
+        _run(ex._async_entry())
+        self.assertEqual(len(called), 1)
+
+
+# ---------------------------------------------------------------------------
+# 5b. AbstractExecutor._async_entry: how a lost connection is logged
+# ---------------------------------------------------------------------------
+
+
+@tagged('post_install', '-at_install')
+class TestAsyncEntryLogsALostConnection(BaseCase):
+    """A probe that will retry does not log its lost connection as an error.
+
+    A host's scheduled reboot refuses connections for a few minutes. A
+    probe retries through it, and if the host stays away the job's
+    terminal state raises ``host_unreachable``. An ERROR per attempt
+    would instead reach the log scraper of whoever reads this database's
+    log, and come back as an ``instance_error_logs`` alert every time a
+    host reboots for its security updates.
+    """
+
+    def _executor(self, executor_cls, error):
+        """An executor of *executor_cls* whose host refuses with *error*.
+
+        Built without ``__init__``: ``_async_entry`` only needs the host
+        record, its address and the log buffer.
+        """
+        from contextlib import AbstractAsyncContextManager
+
+        from odoo.addons.incubacloud.models.cloud_host import CloudHost
+
+        connecting = MagicMock(spec=AbstractAsyncContextManager)
+        connecting.__aenter__.side_effect = error
+        host = MagicMock(spec=CloudHost)
+        host.get_transport.return_value = connecting
+        executor = object.__new__(executor_cls)
+        executor._host_record = host
+        executor.host, executor.port = "192.0.2.10", 22
+        executor._log_buffer = []
+        return executor
+
+    def test_a_probe_that_will_retry_logs_a_warning(self):
+        from odoo.addons.incubacloud.models.host_metrics_executor import (
+            HostMetricsExecutor,
+        )
+
+        executor = self._executor(
+            HostMetricsExecutor, asyncssh.ConnectionLost("Connection lost"),
+        )
+        with self.assertLogs("AbstractExecutor", level="DEBUG") as logs:
+            with self.assertRaises(asyncssh.ConnectionLost):
+                _run(executor._async_entry())
+        levels = {record.levelname for record in logs.records}
+        self.assertIn("WARNING", levels)
+        self.assertNotIn("ERROR", levels)
+        self.assertIn(
+            ("✗ ConnectionLost: Connection lost", "system"),
+            executor._log_buffer,
+        )
+
+    def test_a_job_that_will_not_retry_still_logs_an_error(self):
+        from odoo.addons.incubacloud.models.backup_list_executor import (
+            BackupListExecutor,
+        )
+
+        executor = self._executor(
+            BackupListExecutor, asyncssh.ConnectionLost("Connection lost"),
+        )
+        with self.assertLogs("AbstractExecutor", level="ERROR"):
+            with self.assertRaises(asyncssh.ConnectionLost):
+                _run(executor._async_entry())
+
+    def test_a_probe_that_fails_for_another_reason_still_logs_an_error(self):
+        from odoo.addons.incubacloud.models.host_metrics_executor import (
+            HostMetricsExecutor,
+        )
+
+        executor = self._executor(
+            HostMetricsExecutor,
+            asyncssh.PermissionDenied("Permission denied"),
+        )
+        with self.assertLogs("AbstractExecutor", level="ERROR"):
+            with self.assertRaises(asyncssh.PermissionDenied):
+                _run(executor._async_entry())
+
+
+# ---------------------------------------------------------------------------
+# 6. BackupCreateExecutor.after_commands
+# ---------------------------------------------------------------------------
+
+
+class TestBackupCreateAfterCommands(BaseCase):
+    def _make_executor(self, environment="staging"):
+        from odoo.addons.incubacloud.models.backup_create_executor import (
+            BackupCreateExecutor,
+        )
+
+        inst = SimpleNamespace(
+            odoo_version="19.0",
+            name="myinst",
+            environment=environment,
+            postgres_dbname="prod",
+            deployed=True,
+        )
+        ex = object.__new__(BackupCreateExecutor)
+        ex._inst = lambda: inst
+        ex._inst_dir = lambda i: f"/home/{i.name}"
+        ex._log_buffer = []
+        ex._sys = ex._log_buffer.append
+        ex.job = MagicMock()
+        ex.job.id = 99
+        ex.env = MagicMock()
+        return ex
+
+    def test_non_prod_calls_download_and_cleanup(self):
+        ex = self._make_executor(environment="staging")
+        transport = MagicMock()
+        transport.download_file = AsyncMock()
+        transport.run = AsyncMock(
+            return_value=SimpleNamespace(stdout="", exit_status=0)
+        )
+        ex._download_backup = AsyncMock()
+
+        _run(ex.after_commands(transport, {}))
+
+        ex._download_backup.assert_called_once_with(transport)
+        transport.run.assert_called_once()
+        # cleanup command should reference the remote tmp path
+        cleanup_cmd = transport.run.call_args[0][0]
+        self.assertEqual(cleanup_cmd, f"rm -f {ex._remote_tmp()}")
+
+    def test_production_does_not_download(self):
+        ex = self._make_executor(environment="production")
+        transport = MagicMock()
+        transport.download_file = AsyncMock()
+        transport.run = AsyncMock()
+        ex._download_backup = AsyncMock()
+
+        _run(ex.after_commands(transport, {}))
+
+        ex._download_backup.assert_not_called()
+        transport.run.assert_not_called()
+
+
+class TestBackupCreateGetCommands(BaseCase):
+    """Non-prod backup uses ``docker compose run --rm`` with /tmp bind-
+    mounted so the ZIP lands directly on the host. ``run`` (vs ``exec``)
+    means the backup keeps working when the odoo service is stopped —
+    e.g. after a failed restore — and the bind mount removes the need
+    for a separate ``Copy to host`` step. Production keeps using the
+    backup container's daily jobrunner because that path goes to S3.
+    """
+
+    def _make_executor(self, environment="staging", payload=None):
+        from odoo.addons.incubacloud.models.backup_create_executor import (
+            BackupCreateExecutor,
+        )
+
+        inst = SimpleNamespace(
+            odoo_version="19.0",
+            name="myinst",
+            environment=environment,
+            postgres_dbname="prod",
+        )
+        ex = object.__new__(BackupCreateExecutor)
+        ex._inst = lambda: inst
+        ex._inst_dir = lambda i: f"/home/{i.name}"
+        ex.job = MagicMock()
+        ex.job.id = 77
+        ex.job.payload = payload
+        ex._scripts_requested = False
+        ex._script_overlay_cache = None
+        return ex
+
+    def _live_dump(self, ex):
+        """Return ``(env, argv)`` of the one step *ex* queues."""
+        cmds = ex.get_commands()
+        self.assertEqual(len(cmds), 1)
+        label, cmd, opts = cmds[0]
+        self.assertEqual(label, "Create backup")
+        # Stop the chain on failure so we don't try to download a ZIP
+        # that was never created (the historical bug that surfaced
+        # ``Could not find the file …`` on top of the real error). Apart
+        # on the server (12-nov-2026): a large database dumps for longer
+        # than a request is given.
+        self.assertEqual(opts, {"stop_on_failure": True, "detached": True})
+        env, argv = _split_env(shlex.split(cmd))
+        self.assertEqual(argv[0], "bash")
+        self.assertTrue(argv[1].endswith("/backup_download.sh"), argv[1])
+        self.assertEqual(argv[2:5], ["live-dump", "/home/myinst", "prod"])
+        # Into the job's drop directory, the one the container sees.
+        self.assertEqual(argv[5], f"{ex._drop_dir()}/backup.zip")
+        return env, argv
+
+    def _make_executor_with_payload(self, environment, payload):
+        return self._make_executor(environment=environment, payload=payload)
+
+    def test_non_prod_runs_the_downloads_live_dump(self):
+        """The same script as the download's live dump, with the series'
+        tool named for it: ``run --rm`` out of Traefik, the ZIP landing
+        on the host through the /tmp bind mount, no exec and no cp."""
+        env, argv = self._live_dump(self._make_executor(environment="staging"))
+        self.assertEqual(env, {"IC_DB_TOOL": "click-odoo", "IC_NEUTRALIZE": "odoo"})
+        self.assertEqual(argv[6], "all")
+
+    def test_non_prod_default_payload_includes_filestore(self):
+        # Backwards compatibility: no payload at all → default to a
+        # full backup (DB + filestore), which matches every legacy row.
+        ex = self._make_executor(environment="staging")
+        ex.job.payload = None
+        _env, argv = self._live_dump(ex)
+        self.assertEqual(argv[6], "all")
+
+    def test_non_prod_with_filestore_true_dumps_all(self):
+        ex = self._make_executor_with_payload("staging", {"with_filestore": True})
+        _env, argv = self._live_dump(ex)
+        self.assertEqual(argv[6], "all")
+
+    def test_non_prod_with_filestore_false_dumps_the_db_alone(self):
+        ex = self._make_executor_with_payload("staging", {"with_filestore": False})
+        _env, argv = self._live_dump(ex)
+        self.assertEqual(argv[6], "db")
+
+    def test_non_prod_truthy_string_payload_collapses_to_filestore(self):
+        # Defensive: any truthy JSON-RPC value collapses to True via
+        # ``bool()`` at the executor boundary so the user can never
+        # smuggle an arbitrary string into the dump's invocation.
+        ex = self._make_executor_with_payload(
+            "staging",
+            {"with_filestore": "--malicious; rm -rf /"},
+        )
+        _env, argv = self._live_dump(ex)
+        self.assertEqual(argv[6], "all")
+        self.assertNotIn("rm -rf", ex.get_commands()[0][1])
+        self.assertNotIn("--malicious", ex.get_commands()[0][1])
+
+    def test_production_uses_backup_container_jobrunner(self):
+        cmds = self._make_executor(environment="production").get_commands()
+        self.assertEqual(len(cmds), 1)
+        label, cmd = cmds[0][0], cmds[0][1]
+        self.assertEqual(label, "Create backup")
+        self.assertIn("docker compose exec -T backup", cmd)
+        self.assertIn("/etc/periodic/daily/jobrunner", cmd)
+
+    def test_production_payload_does_not_inject_filestore_flag(self):
+        # Production runs duply (jobrunner) which controls shape.
+        # The kwarg must not leak into the prod command line.
+        ex = self._make_executor_with_payload(
+            "production",
+            {"with_filestore": False},
+        )
+        cmd = ex.get_commands()[0][1]
+        self.assertNotIn("--no-filestore", cmd)
+        self.assertNotIn("--filestore", cmd)
+
+
+# ---------------------------------------------------------------------------
+# 6b. RestoreInstanceExecutor.get_commands — Verify backup file step
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreInstanceVerifyBackupFile(BaseCase):
+    """The ``Verify backup file`` step hands the uploaded zip to
+    ``scripts/restore.sh verify-file``, which makes it readable inside
+    the odoo container (UID discovery + sudo chown/chmod). Here we pin
+    the wiring — the right script operation, in the right order, with
+    ``stop_on_failure`` so a missing/unreadable upload never falls
+    through to ``click-odoo-restoredb --copy --force`` on the live DB.
+    The shell behaviour is covered by ``tests/shell/restore.bats``.
+    """
+
+    def _make_executor(self):
+        from odoo.addons.incubacloud.models.restore_instance_executor import (
+            RestoreInstanceExecutor,
+        )
+
+        inst = SimpleNamespace(
+            odoo_version="19.0",
+            id=42,
+            name="myinst",
+            postgres_username="odoo",
+            postgres_dbname="prod",
+            auto_update=True,
+        )
+        ex = object.__new__(RestoreInstanceExecutor)
+        ex._inst = lambda: inst
+        ex._inst_dir = lambda i: f"/home/{i.name}"
+        ex.job = SimpleNamespace(id=99, instance_id=inst, payload={})
+        ex._scripts_requested = False
+        ex._scripts_uploaded = False
+        ex._script_overlay_cache = None
+        return ex
+
+    def test_verify_step_invokes_restore_verify_file(self):
+        executor = self._make_executor()
+        cmds = executor.get_commands()
+        label, cmd, opts = cmds[0]
+        self.assertEqual(label, "Verify backup file")
+        argv = shlex.split(cmd)
+        self.assertTrue(argv[1].endswith("/restore.sh"), argv[1])
+        self.assertEqual(argv[2], "verify-file")
+        self.assertEqual(argv[3], "/home/myinst")
+        # The archive this job brings lands in its own directory.
+        self.assertEqual(argv[4], executor._job_path("restore.zip"))
+        # Stop the chain on failure: skipping the rest avoids destroying
+        # the live DB when we already know the upload is missing. Apart
+        # on the server (12-nov-2026): an archive of several GB takes
+        # minutes to check.
+        self.assertEqual(opts, {"stop_on_failure": True, "detached": True})
+
+    def test_the_long_steps_run_apart(self):
+        """Phase 3 (12-nov-2026): the check of the archive, the load, the
+        update and the connector's install, which boots an Odoo when the
+        module is missing, run apart; the short steps stay attached."""
+        executor = self._make_executor()
+        # A staging refreshed from production: neutralized, its base URL
+        # reset, its mail sent to the catcher.
+        executor._inst().environment = "staging"
+        executor.job.payload = {"neutralize": True, "reset_base_url": True}
+        executor._base_url = lambda: "https://myinst.example.com"
+        cmds = executor.get_commands()
+        self.assertIn("Neutralize again after the update", [c[0] for c in cmds])
+        self.assertIn("Reset base URL", [c[0] for c in cmds])
+        apart = [label for label, _cmd, *rest in cmds if rest and rest[0].get("detached")]
+        self.assertEqual(apart, [
+            "Verify backup file", "Restore database", "Update changed modules",
+            "Ensure incubacloud_connect",
+        ])
+        opts = {label: rest[0] if rest else {} for label, _cmd, *rest in cmds}
+        self.assertEqual(
+            opts["Restore database"], {"stop_on_failure": True, "detached": True},
+        )
+        self.assertEqual(
+            opts["Update changed modules"],
+            {"stop_on_failure": True, "detached": True},
+        )
+        self.assertEqual(opts["Ensure incubacloud_connect"], {"detached": True})
+
+    def test_restore_and_stop_steps_precede_the_db_restore(self):
+        labels = [t[0] for t in self._make_executor().get_commands()]
+        self.assertLess(
+            labels.index("Verify backup file"),
+            labels.index("Restore database"),
+        )
+        self.assertLess(
+            labels.index("Stop Odoo service"),
+            labels.index("Restore database"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# 7. BackupDownloadExecutor.after_commands
+# ---------------------------------------------------------------------------
+
+
+class TestBackupDownloadAfterCommands(BaseCase):
+    def _make_executor(self):
+        from odoo.addons.incubacloud.models.backup_download_executor import (
+            BackupDownloadExecutor,
+        )
+
+        inst = SimpleNamespace(odoo_version="19.0", name="dl-inst", postgres_dbname="prod")
+        ex = object.__new__(BackupDownloadExecutor)
+        ex._inst = lambda: inst
+        ex._inst_dir = lambda i: f"/home/{i.name}"
+        ex._log_buffer = []
+        ex._sys = ex._log_buffer.append
+        ex.job = MagicMock()
+        ex.job.id = 77
+        ex.job.payload = {"time": "latest", "download_type": "dump"}
+        ex.env = MagicMock()
+        return ex
+
+    def test_after_commands_delegates_to_download_zip(self):
+        ex = self._make_executor()
+        transport = MagicMock()
+        ex._download_zip = AsyncMock()
+
+        _run(ex.after_commands(transport, {}))
+
+        ex._download_zip.assert_called_once_with(transport)
+
+
+# ---------------------------------------------------------------------------
+# 7b. BackupDownloadExecutor.get_commands × environment
+# ---------------------------------------------------------------------------
+
+
+class TestBackupDownloadGetCommands(BaseCase):
+    """``BackupDownloadExecutor`` ships an "exact" backup as a ZIP.
+
+    Production reaches into duplicity/S3 via the ``backup`` container
+    (the historical chain).  Non-production has no snapshot store, so
+    we take a live dump on demand via ``click-odoo-backupdb`` running
+    in the ``odoo`` container — same binary, same pattern as
+    ``BackupCreateExecutor``, just with a different ``--filestore /
+    --no-filestore`` flag depending on the requested mode.
+
+    Before the staging branch existed, this executor unconditionally
+    ran ``docker compose exec backup …`` and bombed on staging with
+    ``service "backup" is not running``.
+    """
+
+    DIR = "/home/dl-inst"
+
+    def _make_executor(self, environment, mode="dump", time="latest"):
+        from odoo.addons.incubacloud.models.backup_download_executor import (
+            BackupDownloadExecutor,
+        )
+
+        inst = SimpleNamespace(
+            odoo_version="19.0",
+            name="dl-inst",
+            environment=environment,
+            postgres_dbname="prod",
+        )
+        ex = object.__new__(BackupDownloadExecutor)
+        ex._inst = lambda: inst
+        ex._inst_dir = lambda i: self.DIR
+        ex.job = MagicMock()
+        ex.job.id = 77
+        ex.job.payload = {"time": time, "download_type": mode}
+        ex._scripts_requested = False
+        ex._script_overlay_cache = None
+        return ex
+
+    def _argv(self, step):
+        """Return the script invocation of *step* as an argv list.
+
+        The script's environment (``NAME=value`` before ``bash``) is
+        left out; :meth:`_env` reads it.
+        """
+        return _split_env(shlex.split(step[1]))[1]
+
+    def _env(self, step):
+        """Return the environment *step* runs its script with."""
+        return _split_env(shlex.split(step[1]))[0]
+
+    def assertScriptCall(self, step, operation, args):
+        argv = self._argv(step)
+        self.assertEqual(argv[0], "bash")
+        self.assertTrue(argv[1].endswith("/backup_download.sh"), argv[1])
+        self.assertEqual(argv[2], operation)
+        self.assertEqual(argv[3], self.DIR)
+        self.assertEqual(argv[4:], args)
+
+    # ── non-production: live dump on demand ───────────────────────────
+
+    def test_non_prod_dump_takes_a_db_only_live_dump(self):
+        ex = self._make_executor("staging", mode="dump")
+        cmds = ex.get_commands()
+        self.assertEqual(len(cmds), 1)
+        self.assertEqual(cmds[0][0], "Create live backup")
+        self.assertScriptCall(
+            cmds[0], "live-dump", ["prod", f"{ex._drop_dir()}/backup.zip", "db"],
+        )
+        # Stop the chain on failure so after_commands does not try to
+        # download a zip that was never created — same defensive
+        # pattern as BackupCreateExecutor. Apart on the server, as the
+        # copy's dump (12-nov-2026).
+        self.assertEqual(cmds[0][2], {"stop_on_failure": True, "detached": True})
+
+    def test_non_prod_all_includes_the_filestore(self):
+        ex = self._make_executor("staging", mode="all")
+        cmds = ex.get_commands()
+        self.assertEqual(len(cmds), 1)
+        self.assertScriptCall(
+            cmds[0], "live-dump", ["prod", ex._tmp_archive(), "all"],
+        )
+
+    def test_the_live_dump_is_told_the_series_tool(self):
+        """The dump runs inside the instance's image, whose tool the
+        series' card names, and leaves the reserve free as every step that
+        writes the archive does; the store's restores run no Odoo tool."""
+        live = self._make_executor("staging", mode="all").get_commands()[0]
+        self.assertEqual(
+            self._env(live), {
+                "IC_DB_TOOL": "click-odoo", "IC_NEUTRALIZE": "odoo",
+                "IC_RESERVE_BYTES": str(RESERVE_BYTES),
+            },
+        )
+        stored = self._make_executor("production", mode="dump").get_commands()[0]
+        self.assertEqual(self._env(stored), {})
+
+    # ── production: restore from the backup store, then package ───────
+
+    def test_prod_dump_restores_only_the_sql(self):
+        ex = self._make_executor("production", mode="dump")
+        cmds = ex.get_commands()
+        self.assertEqual(
+            [c[0] for c in cmds],
+            ["Restore SQL from backup", "Extract and package"],
+        )
+        self.assertScriptCall(cmds[0], "restore-sql", ["prod", "latest"])
+        # Packaged in the job's own directory.
+        self.assertScriptCall(
+            cmds[1], "package-sql",
+            ["prod", ex._job_path("bkdl"), ex._job_path("backup.zip")],
+        )
+
+    def test_prod_all_restores_the_whole_backup(self):
+        ex = self._make_executor("production", mode="all")
+        cmds = ex.get_commands()
+        self.assertEqual(
+            [c[0] for c in cmds],
+            ["Restore full from backup", "Extract and package"],
+        )
+        self.assertScriptCall(cmds[0], "restore-full", ["latest"])
+        self.assertScriptCall(
+            cmds[1], "package-full",
+            ["prod", ex._job_path("bkdl"), ex._job_path("backup.zip")],
+        )
+
+    def test_prod_passes_an_explicit_time_through(self):
+        ex = self._make_executor(
+            "production", mode="dump", time="2026-03-19T02:00:00",
+        )
+        self.assertScriptCall(
+            ex.get_commands()[0],
+            "restore-sql",
+            ["prod", "2026-03-19T02:00:00"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# 7c. BackupDownloadExecutor.before_execute guards
+# ---------------------------------------------------------------------------
+
+
+class TestBackupDownloadBeforeExecute(BaseCase):
+    """Non-prod has no historical snapshot store, so ``time`` must be
+    ``'latest'`` (= live dump).  We reject historical timestamps in
+    ``before_execute`` so the SPA surfaces a clear ``UserError`` toast
+    instead of letting the SSH job bomb downstream.
+    """
+
+    def _make_executor(self, environment, time):
+        from odoo.addons.incubacloud.models.backup_download_executor import (
+            BackupDownloadExecutor,
+        )
+
+        inst = SimpleNamespace(
+            odoo_version="19.0",
+            id=1,
+            name="dl-inst",
+            environment=environment,
+            postgres_dbname="prod",
+        )
+        ex = object.__new__(BackupDownloadExecutor)
+        ex._inst = lambda: inst
+        ex.job = MagicMock()
+        ex.job.payload = {"time": time, "download_type": "dump"}
+        return ex
+
+    def _transport(self):
+        """Return a host link whose commands all succeed."""
+        from odoo.addons.incubacloud.models.transport import (
+            CommandResult,
+            SSHTransport,
+        )
+
+        transport = MagicMock(spec=SSHTransport)
+        transport.run.return_value = CommandResult("", 0)
+        return transport
+
+    def test_non_prod_rejects_historical_timestamp(self):
+        ex = self._make_executor("staging", "2026-03-19T02:00:00")
+        transport = self._transport()
+        with self.assertRaises(ValueError) as ctx:
+            _run(ex.before_execute(transport))
+        self.assertIn("historical", str(ctx.exception).lower())
+        transport.run.assert_not_called()
+
+    def test_non_prod_accepts_latest(self):
+        ex = self._make_executor("staging", "latest")
+        # Should not raise.
+        _run(ex.before_execute(self._transport()))
+
+    def test_prod_accepts_historical_timestamp(self):
+        ex = self._make_executor("production", "2026-03-19T02:00:00")
+        # Should not raise — duplicity will resolve the snapshot.
+        _run(ex.before_execute(self._transport()))

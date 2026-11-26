@@ -1,0 +1,886 @@
+"""
+Full Setup Executor
+-------------------
+Single-pass setup for a new host (or re-run to repair):
+
+  Phase 1 — Compatibility check: OS (Linux) + available disk (≥ 10 GB)
+  Phase 2 — Tool installation: git, Docker CE, Compose V2, pipx,
+             copier, invoke, pre-commit  (all idempotent)
+  Phase 3 — Traefik deployment: upload config files + docker compose up -d
+  Phase 4 — Whitelist: create/update globalwhitelist services
+
+Status transitions:
+  Job started   → checking      (once connected, in before_execute)
+  All phases OK → compatible    (traefik_deployed=True)
+  Linux, under 10 GB free
+                → degraded      (with ``host_low_disk``, as the Check
+                  says it; the job still fails with ``setup_failed``)
+  Any other failure
+                → unsupported (one before 'checking' was set — a refused
+                  check, no connection — leaves the status as it was)
+
+Besides the low disk of its first phase, "degraded" is not set here: the
+Check (``host_probe``) sets it for a disk under 10 GB free or missing
+tools, the disk readings for a disk over ``DISK_CRITICAL_THRESHOLD``.
+
+This executor is the single entry point for host setup. The older
+per-phase executors (``setup_host``, ``setup_traefik``) have been
+retired — their logic (SSH commands + Traefik templating) now lives
+inline below so there's only one codepath for inheriting modules to
+wrap.
+"""
+
+import logging
+import re
+
+import bcrypt as _bcrypt
+
+from odoo import _, fields
+
+from . import acme_store
+from .abstract_executor import AbstractSSHExecutor, JobRefused
+from .cloud_host_direct import (
+    DIRECT_DYNAMIC_FILE,
+    DIRECT_TOKEN_NAME,
+    install_direct_yml_command,
+    install_dns_token_command,
+    publishes_direct_port,
+)
+from .cloud_host_edge_guard import EDGE_GUARD_STAGED, edge_guard_digest
+from .cloud_host_shared_guard import (
+    SHARED_GUARD_ALERT,
+    SHARED_GUARD_SETTLED,
+    SHARED_GUARD_STEP,
+    shared_guard_verdict,
+)
+from .deploy_instance_executor import GIT_HELPER_IMAGE
+from .host_probe_executor import (
+    LOW_DISK_ALERT,
+    MIN_DISK_GB,
+    UNSUPPORTED_ALERT,
+    low_disk_message,
+)
+from .push_edge_guard_executor import EDGE_GUARD_ALERT
+from .setup_whitelist_executor import (
+    _WL_DIR,
+    _WL_FILE,
+    _WL_PROJECT,
+    build_whitelist_compose,
+)
+
+_logger = logging.getLogger(__name__)
+
+_BIN = 'PATH="$HOME/.local/bin:$PATH"'
+
+#: Names, in the job's own directory (``_job_path``), of the direct list and
+#: the DNS token Full Setup and the sync job stage.
+_DIRECT_STAGED = "direct.yml"
+_TOKEN_STAGED = DIRECT_TOKEN_NAME
+
+
+# ── Tool verification (Phase 2) ───────────────────────────────────────
+# The idempotent install catalog moved to the versioned script
+# ``scripts/full_setup_install.sh`` (run as one "Install host tools" step
+# in get_commands). These per-tool checks stay here — as individual
+# labelled commands — so the panel reports each tool separately and
+# ``parse_results`` can judge them one by one.
+VERIFY_COMMANDS = [
+    ("Verify git",        "git --version 2>&1 || echo FAILED"),
+    ("Verify docker",     "docker --version 2>&1 || echo FAILED"),
+    ("Verify compose",    "docker compose version 2>&1 || echo FAILED"),
+    ("Verify copier",     f'{_BIN} copier --version 2>&1 || echo FAILED'),
+    ("Verify invoke",     f'{_BIN} invoke --version 2>&1 || echo FAILED'),
+    ("Verify pre-commit", f'{_BIN} pre-commit --version 2>&1 || echo FAILED'),
+    ("Verify zip",        "zip --version 2>&1 || echo FAILED"),
+]
+
+_VERIFY_LABELS = tuple(label for label, _cmd in VERIFY_COMMANDS)
+
+
+# ── Traefik template helpers (Phase 3) ────────────────────────────────
+# The panel password hash is compatible with ``htpasswd -nB`` (Traefik's
+# basicauth consumes that format). We call ``bcrypt`` directly instead
+# of going through passlib — passlib 1.7.4 doesn't know how to talk to
+# bcrypt >= 5.0 (its backend-probe reads ``bcrypt.__about__`` which is
+# gone) and falls back to a path that still raises on 72-byte inputs.
+# Dollar signs are doubled for docker-compose label escaping.
+
+def _htpasswd_hash(password):
+    """Compose-safe bcrypt hash for ``traefik-admin:<password>``."""
+    # bcrypt has a hard 72-byte input limit — truncate deterministically
+    # on bytes (never on characters, which miscounts multi-byte utf-8).
+    pw_bytes = (password or "").encode("utf-8")[:72]
+    salt = _bcrypt.gensalt(rounds=12)
+    # $2b$ → $2y$: equivalent variants; htpasswd/Traefik expect $2y$.
+    # Double $ for docker-compose label escaping.
+    return "traefik-admin:" + (
+        _bcrypt.hashpw(pw_bytes, salt)
+        .decode("ascii")
+        .replace("$2b$", "$2y$", 1)
+        .replace("$", "$$")
+    )
+
+
+def _build_inverseproxy(content, wildcard_domain, panel_password):
+    """Substitute domain and password hash in inverseproxy.yaml content.
+
+    Both substitutions pass a *function* to ``re.sub`` rather than a
+    replacement string. In a replacement string Python interprets
+    backslashes, so a domain carrying ``\\1`` used to splice in a capture
+    group and one carrying ``\\d`` raised ``re.error: bad escape`` — killing
+    the setup job halfway through, on nothing worse than an operator typo.
+    A function's return value is used verbatim. ``cloud.host`` now refuses
+    such a domain outright; this is the layer that makes it harmless
+    regardless of what reaches it.
+    """
+    traefik_domain = (
+        f"traefik.{wildcard_domain.removeprefix('*.')}"
+        if wildcard_domain else "traefik.localhost"
+    )
+    # Replace the Host() rule
+    content = re.sub(
+        r'Host\(`[^`]+`\)',
+        lambda _match: f"Host(`{traefik_domain}`)",
+        content,
+    )
+    # Replace the basicauth.users label value
+    if panel_password:
+        label_value = _htpasswd_hash(panel_password)
+        content = re.sub(
+            r'traefik\.http\.middlewares\.auth\.basicauth\.users=[^\n"]+',
+            lambda _match: (
+                "traefik.http.middlewares.auth.basicauth.users="
+                f"{label_value}"
+            ),
+            content,
+        )
+    return content
+
+
+#: The proxy as its own ``public`` network knows it. Docker's resolver
+#: answers ``<service>.<network>`` with the container's address on that
+#: one network, so an entrypoint bound to this name listens there and on
+#: no other interface of the proxy — not on ``shared``, which every
+#: instance on the host joins. ``public`` is the proxy's only network with
+#: a way out, the one Docker publishes its ports through, so a port
+#: published on the host's loopback still reaches it; the metrics agent
+#: joins it and nothing else does. The project and network are the ones
+#: Full Setup starts the proxy under. The name has to resolve: Traefik
+#: refuses to start at all when an entrypoint's address does not
+#: (measured on v2.11).
+PROXY_PUBLIC_HOST = "proxy.inverseproxy_public"
+
+
+def _bind_to_proxy_public_network(content, entrypoint):
+    """Return ``traefik.yml`` with *entrypoint* on the ``public`` network.
+
+    Rewrites the entrypoint's address while it is the every-interface
+    form (``":<port>"`` or ``"0.0.0.0:<port>"``) and keeps its port. An
+    address a host chose itself is left as it is, and so is a document
+    without that entrypoint. Idempotent.
+
+    :param str content: a ``traefik.yml`` document.
+    :param str entrypoint: the entrypoint's name, e.g. ``metrics``.
+    :return: the document, rebound where it applies.
+    :rtype: str
+    """
+    if not content:
+        return content
+    return re.sub(
+        rf'^([ \t]+{re.escape(entrypoint)}:[ \t]*\n[ \t]+address:[ \t]*)'
+        r'"?(?:0\.0\.0\.0)?:(\d+)"?[ \t]*$',
+        lambda match: (
+            f'{match.group(1)}"{PROXY_PUBLIC_HOST}:{match.group(2)}"'
+        ),
+        content,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+
+class ProxyStagingMixin:
+    """Stage the host's Traefik documents, for Full Setup and the push.
+
+    Everything goes in the job's own directory. Whether the default
+    certificate and the CDN's authority are installed or removed is
+    decided here, from what this job uploads — never from what a shell
+    finds at a path, which another account could have put there.
+    """
+
+    #: Whether this run stages the host's certificate pair, and the CDN's
+    #: client authority. ``None`` until ``_stage_proxy_documents`` ran.
+    _ships_default_cert = None
+    _ships_cdn_ca = None
+
+    async def _stage_proxy_documents(self, transport, host, private=None):
+        """Upload the documents both jobs install, secrets owner-only.
+
+        The private key travels with its certificate, and the pruned
+        store holds every key the proxy obtained: created 0600, and
+        removed when the job ends whether or not a step moved them.
+
+        :param transport: the job's open transport
+        :param host: the ``cloud.host`` they are rendered for
+        :param dict private: more secret files to stage the same way,
+            ``{remote_path: text}``
+        """
+        cert, key = host._effective_tls_default()
+        files = {
+            self._job_path("traefik.yml"): host._shipped_traefik_yml(),
+            self._job_path("config.yml"): host._shipped_config_yml(),
+            self._job_path("tls.yml"): host._shipped_tls_default_yml(),
+            self._job_path("client-auth.yml"):
+                host._shipped_tls_client_auth_yml(),
+        }
+        private = dict(private or {})
+        self._ships_default_cert = bool(cert and key)
+        if self._ships_default_cert:
+            private[self._job_path("default.crt")] = cert
+            private[self._job_path("default.key")] = key
+        client_ca = host._effective_cdn_client_ca()
+        self._ships_cdn_ca = bool(client_ca)
+        if client_ca:
+            files[self._job_path("cdn-ca.pem")] = client_ca
+        pruned = await self._prepare_acme_prune(transport)
+        if pruned:
+            private[self._acme_local_path()] = pruned
+        await self._upload_files(transport, files)
+        if private:
+            await self._upload_private_files(transport, private)
+
+    def _proxy_ships(self):
+        """Return whether this run installs the certificate and the authority.
+
+        What ``_stage_proxy_documents`` uploaded; for commands built
+        without it (a preview), what the host would ship.
+
+        :return: ``(default certificate, CDN client authority)``
+        :rtype: tuple
+        """
+        host = self.job.host_id
+        cert = self._ships_default_cert
+        if cert is None:
+            cert = all(host._effective_tls_default())
+        ca = self._ships_cdn_ca
+        if ca is None:
+            ca = bool(host._effective_cdn_client_ca())
+        return cert, ca
+
+
+class FullSetupExecutor(
+    ProxyStagingMixin, acme_store.AcmeStorePruneMixin, AbstractSSHExecutor,
+):
+    _job_type = "full_setup"
+    # The free disk in GB its first phase found under ``MIN_DISK_GB`` on
+    # a Linux host (``parse_results``): ``on_failure`` leaves the host
+    # degraded rather than unsupported.
+    _low_disk_gb = None
+
+    def _host(self):
+        return self.job.host_id
+
+    def pre_run_checks(self):
+        """Refuse a direct port the proxy's compose file cannot publish.
+
+        The port goes in after the file's ``- "443:443"`` line. Without
+        that line the proxy would start without the port, and the run
+        would still record it as published.
+
+        :raises JobRefused: saying what to change.
+        """
+        super().pre_run_checks()
+        host = self._host()
+        port = host.direct_port
+        if port and not publishes_direct_port(
+            host._shipped_inverseproxy_yaml(), port,
+        ):
+            message = (
+                f"The proxy's compose file of {host.name} has no "
+                f'- "443:443" line to publish the direct port {port} after: '
+                "write the line that way, or set the direct port to 0."
+            )
+            self._write_system_direct(f"⚠ {message}")
+            raise JobRefused(message)
+
+    async def before_execute(self, transport):
+        # Mark host as 'checking' so the dashboard updates immediately
+        with self._durable_env() as env:
+            env['cloud.host'].browse(
+                self._host().id
+            ).write({'status': 'checking'})
+
+        self._sys("Phase 1/4 — Checking host compatibility...")
+
+        host = self._host()
+
+        # Upload Traefik config files (Phase 3)
+        self._sys("Preparing Traefik configuration files...")
+        inverseproxy = host._shipped_inverseproxy_yaml()
+        private = {self._job_path("inverseproxy.yaml"): inverseproxy}
+        if host._needs_dns01() and host._has_dns01_token():
+            # A file only its owner reads, from the first byte, removed by
+            # the job if no step moves it: the token is never in the
+            # compose file, on a command line or in this log.
+            private[self._job_path(_TOKEN_STAGED)] = (
+                self.env["cloud.settings"].sudo()._get_system()
+                .acme_dns_cloudflare_token
+            )
+        # Rendered, not read straight from the fields: a host that
+        # declares a proxy in front of it ships the matching Traefik
+        # settings here, and they have to be interlocked — the static
+        # file may name a middleware the dynamic file must define.
+        # The compose file is owner-only too: it holds the dashboard's
+        # password hash (and whatever credentials a module adds to the
+        # proxy's environment). Moved, it stays 0600.
+        await self._stage_proxy_documents(transport, host, private=private)
+        if host.direct_port:
+            # Read by the entrypoint's middlewares from the first start:
+            # without it the port serves nothing at all (fail closed).
+            await self._upload_files(
+                transport,
+                {self._job_path(_DIRECT_STAGED): host._shipped_direct_yml()},
+            )
+        if not host._edge_guard_leaves_alone():
+            # The router that refuses Odoo's /website/info, there before
+            # the proxy starts. The same document on every host.
+            await self._upload_files(
+                transport,
+                {self._job_path(EDGE_GUARD_STAGED): host._shipped_edge_guard_yml()},
+            )
+        self._sys("✓ Traefik configuration files uploaded.")
+        if self._job_path(_TOKEN_STAGED) in private:
+            self._sys("✓ DNS token for certificates staged.")
+
+        # Upload whitelist compose file (Phase 4)
+        hostnames = host.whitelist_ids.mapped("hostname")
+        n = len(hostnames)
+        self._sys(
+            f"Preparing whitelist compose file"
+            f" ({n} entr{'y' if n == 1 else 'ies'})…"
+        )
+        await self._upload_files(
+            transport,
+            {self._job_path("whitelist.yaml"): build_whitelist_compose(hostnames)},
+        )
+        self._sys("✓ Whitelist compose file uploaded.")
+
+    def get_commands(self):
+        stage = self._job_path
+        ships_cert, ships_ca = self._proxy_ships()
+        # A host set up by hand may hold the certificate as root: the push
+        # of the proxy settings falls back to sudo the same way, and a Full
+        # Setup without it failed on a production host (1-nov-2026).
+        put = 'ic_put() { mv "$1" "$2" 2>/dev/null || sudo mv "$1" "$2"; };'
+        if ships_cert:
+            install_cert = (
+                f"{put}"
+                " mkdir -p ~/traefik/certs ~/traefik/dynamic"
+                f" && ic_put {stage('default.crt')} ~/traefik/certs/default.crt"
+                f" && ic_put {stage('default.key')} ~/traefik/certs/default.key"
+                " && { chmod 600 ~/traefik/certs/default.key 2>/dev/null"
+                " || sudo chmod 600 ~/traefik/certs/default.key; }"
+                f" && ic_put {stage('tls.yml')} ~/traefik/dynamic/tls-default.yml"
+            )
+        else:
+            install_cert = (
+                "mkdir -p ~/traefik/certs ~/traefik/dynamic"
+                " && { rm -f ~/traefik/dynamic/tls-default.yml 2>/dev/null"
+                " || sudo rm -f ~/traefik/dynamic/tls-default.yml; }"
+                " && { rm -f ~/traefik/certs/default.crt"
+                " ~/traefik/certs/default.key 2>/dev/null"
+                " || sudo rm -f ~/traefik/certs/default.crt"
+                " ~/traefik/certs/default.key; }"
+            )
+        # The authority goes into the same directory as the certificate,
+        # so it takes the same fallback (2-nov-2026).
+        if ships_ca:
+            require_ca = (
+                f"{put}"
+                f" ic_put {stage('cdn-ca.pem')} ~/traefik/certs/cdn-client-ca.pem"
+                f" && ic_put {stage('client-auth.yml')}"
+                " ~/traefik/dynamic/tls-client-auth.yml"
+            )
+        else:
+            require_ca = (
+                "rm -f ~/traefik/dynamic/tls-client-auth.yml"
+                " ~/traefik/certs/cdn-client-ca.pem 2>/dev/null"
+                " || sudo rm -f ~/traefik/dynamic/tls-client-auth.yml"
+                " ~/traefik/certs/cdn-client-ca.pem"
+            )
+        host = self._host()
+        # A direct port taken by anything else makes Docker refuse the
+        # recreated proxy: checked before a single file is replaced.
+        direct_check = [(
+            "Check the direct port",
+            self.run_script("direct_port_check.sh", [str(host.direct_port)]),
+            {"stop_on_failure": True},
+        )] if host.direct_port else []
+        if host.direct_port:
+            direct_steps = [(
+                "Install the direct list for Traefik",
+                install_direct_yml_command(stage(_DIRECT_STAGED)),
+            )]
+        elif host.direct_port_shipped:
+            direct_steps = [
+                (
+                    "Remove the direct list for Traefik",
+                    f"rm -f {DIRECT_DYNAMIC_FILE}",
+                ),
+                (
+                    "Clear the direct path",
+                    self.run_script(
+                        "direct_allowlist.sh",
+                        ["clear", str(host.direct_port_shipped)],
+                    ),
+                ),
+            ]
+        else:
+            direct_steps = []
+        if host._edge_guard_leaves_alone():
+            guard_steps = []
+        else:
+            guard_steps = [(
+                # In the directory before the proxy starts, so it never
+                # serves /website/info. Not mounted yet and not running
+                # yet: the script checks neither (they are the light
+                # job's, push_edge_guard).
+                "Install the edge guard",
+                self.run_script(
+                    "edge_guard.sh",
+                    [
+                        "install", stage(EDGE_GUARD_STAGED),
+                        "--no-mount-check", "--no-probe",
+                    ],
+                ),
+            )]
+        commands = [
+            # ── Phase 1: compatibility ────────────────────────────────
+            ("check:os",   "uname -s"),
+            ("check:disk", "df -B1 --output=avail / | tail -n 1"),
+            # ── Phase 2: tools (versioned script) + per-tool verify ────
+            (
+                # Docker and the packages on a new server: minutes, apart
+                # on the server so a request cut at 900 s (Odoo.sh) does
+                # not cut it (phase 3, 12-nov-2026). Its ``sudo`` asks for
+                # no terminal either way, and what it creates has the
+                # session's umask, as attached. The "Verify *" after it
+                # read what it installed, and stay attached.
+                "Install host tools",
+                self.run_script("full_setup_install.sh", [GIT_HELPER_IMAGE]),
+                {"detached": True},
+            ),
+        ] + VERIFY_COMMANDS + [
+            # ── Phase 3: Traefik ──────────────────────────────────────
+            *direct_check,
+            (
+                "Create traefik directory",
+                "mkdir -p ~/traefik",
+            ),
+            (
+                # What the proxy runs with now, to come back to if Docker
+                # refuses what this run installs.
+                "Keep the running proxy files",
+                self.run_script("proxy_start.sh", ["keep"]),
+            ),
+            (
+                "Move traefik config files",
+                f"mv {stage('inverseproxy.yaml')}"
+                " ~/traefik/inverseproxy.yaml"
+                f" && mv {stage('traefik.yml')} ~/traefik/traefik.yml"
+                f" && mv {stage('config.yml')} ~/traefik/config.yml",
+            ),
+            (
+                # The file provider reads one directory, and config.yml
+                # has to be in it: the middlewares every entrypoint names
+                # are defined there, and a proxy that starts without them
+                # answers nothing.
+                "Copy config.yml to dynamic directory",
+                "mkdir -p ~/traefik/dynamic"
+                " && cp ~/traefik/config.yml ~/traefik/dynamic/config.yml",
+            ),
+            *guard_steps,
+            (
+                # Same interlock as the proxy-settings push: a host with
+                # its own certificate serves it as the default, one
+                # without has the document removed rather than left
+                # pointing at files that are not there. Which one is
+                # decided by what this job staged.
+                "Install the default certificate",
+                install_cert,
+            ),
+            (
+                # Same shape as the default certificate: a host given an
+                # authority requires the CDN's client certificate; one
+                # without has the document removed, so nothing asks a
+                # visitor for a certificate it does not have.
+                "Require the CDN client certificate",
+                require_ca,
+            ),
+            (
+                "Install the DNS token",
+                install_dns_token_command(stage(_TOKEN_STAGED)),
+            ),
+            *direct_steps,
+            (
+                # Before the proxy starts: it writes its access log into
+                # this directory through a bind mount, and the rotation
+                # (30 days) is what keeps that file from filling the disk.
+                "Prepare the proxy access log",
+                self.run_script("proxy_access_log.sh", ["install"]),
+            ),
+            (
+                "Start Traefik",
+                # --remove-orphans: a service dropped from the compose
+                # file keeps running otherwise, so full_setup could add
+                # services but never retire one. That made the run only
+                # half-convergent — the primary host kept serving a
+                # Sablier container long after the file stopped
+                # declaring it. Scoped to the ``inverseproxy`` project,
+                # so nothing else on the host is touched. And when Docker
+                # refuses the new files, the previous three go back and
+                # the proxy starts with them: the proxy serves the whole
+                # host (proxy_start.sh).
+                self.run_script("proxy_start.sh", ["start"]),
+            ),
+            (
+                # Once the proxy runs with its fixed address on ``shared``:
+                # the guard checks that address before it closes anything,
+                # and opens again when it differs (a refused start brought
+                # the previous files back, say). Never fatal: either way
+                # the host serves; ``on_success`` says how it was left.
+                SHARED_GUARD_STEP,
+                self.run_script(
+                    "shared_guard.sh",
+                    ["install" if host.shared_guard else "uninstall"],
+                ),
+            ),
+            # ── Phase 4: Whitelist ────────────────────────────────────
+            (
+                "Create globalwhitelist directory",
+                f"mkdir -p {_WL_DIR}",
+            ),
+            (
+                "Install whitelist compose file",
+                f"mv {stage('whitelist.yaml')} {_WL_FILE}",
+            ),
+            (
+                "Start whitelist services",
+                f"cd {_WL_DIR} && docker compose"
+                f" -p {_WL_PROJECT} -f docker-compose.yaml"
+                " up -d --remove-orphans",
+            ),
+        ]
+        # Immediately before the proxy comes up, so it starts having
+        # forgotten them. Only ever present on a re-run: a host being
+        # set up for the first time has no store to prune, and the read
+        # that decides this cannot reach a proxy that is not running.
+        prune = self._acme_prune_step()
+        if prune:
+            labels = [label for label, *_ in commands]
+            commands.insert(labels.index("Start Traefik"), prune)
+            # And read it back once the proxy is up: the write reports
+            # the exit status of a redirection, not what the store ends
+            # up holding.
+            labels = [label for label, *_ in commands]
+            commands.insert(
+                labels.index("Start Traefik") + 1, self._acme_confirm_step(),
+            )
+        return commands
+
+    def parse_results(self, results):
+        errors = []
+        self._low_disk_gb = None
+
+        check = results.get("Check the direct port")
+        if check is not None and check.get("exit_status", 1) != 0:
+            # The run stopped there: the proxy and its files are untouched.
+            host = self._host()
+            who = (check.get("stdout") or "").replace(
+                "IC_DIRECT_PORT_BUSY", "",
+            ).strip()
+            message = _(
+                "Port %(port)s is already in use on %(host)s; choose another "
+                "direct port.",
+                port=host.direct_port, host=host.name,
+            )
+            return [f"{message} ({who})" if who else message]
+
+        # ── Phase 1: OS ───────────────────────────────────────────────
+        os_out = (
+            results.get("check:os", {}).get('stdout', '').strip()
+        )
+        is_linux = os_out.lower() == 'linux'
+        if is_linux:
+            self._sys(f"✓ OS: {os_out}")
+        else:
+            errors.append(
+                f"Unsupported OS: '{os_out or 'unknown'}'"
+                " (Linux required)"
+            )
+
+        # ── Phase 1: Disk ─────────────────────────────────────────────
+        disk_out = (
+            results.get("check:disk", {}).get('stdout', '').strip()
+        )
+        try:
+            free_gb = int(disk_out) / (1024 ** 3)
+            if free_gb >= MIN_DISK_GB:
+                self._sys(f"✓ Disk: {free_gb:.1f} GB free")
+            else:
+                errors.append(
+                    f"Insufficient disk: {free_gb:.1f} GB free"
+                    f" ({MIN_DISK_GB} GB required)"
+                )
+                if is_linux:
+                    self._low_disk_gb = free_gb
+        except (ValueError, TypeError):
+            errors.append(
+                f"Could not parse disk output: '{disk_out}'"
+            )
+
+        if errors:
+            return errors  # OS/disk failed — skip remaining checks
+
+        # ── Phase 2: tool verifications ───────────────────────────────
+        self._sys("Phase 2/4 — Verifying installed tools...")
+        for label in _VERIFY_LABELS:
+            out = results.get(label, {}).get('stdout', '').strip()
+            tool = label.replace("Verify ", "")
+            if not out or 'FAILED' in out or 'command not found' in out:
+                errors.append(f"{tool} installation failed")
+                self._sys(f"✗ {tool}: installation failed")
+            else:
+                self._sys(f"✓ {tool}: {out.splitlines()[0]}")
+
+        if errors:
+            return errors
+
+        # ── Phase 3: Traefik ──────────────────────────────────────────
+        self._sys("Phase 3/4 — Verifying Traefik deployment...")
+        # The direct path's steps run only on some hosts: each is checked
+        # when it ran. Without the token there is no certificate, without
+        # the list the port serves nothing, without "Keep" a refused start
+        # has no files to fall back to. The edge guard is left out only
+        # on a host it leaves alone; without it every instance serves
+        # Odoo's /website/info, and nothing else would say so (7-nov-2026).
+        ran = [
+            label for label in (
+                "Install the DNS token",
+                "Install the direct list for Traefik",
+                "Keep the running proxy files",
+                "Install the edge guard",
+            ) if label in results
+        ]
+        # The certificate, the CDN's authority and the access log too:
+        # each leaves the proxy other than configured when it fails —
+        # serving an old certificate, taking traffic that did not come
+        # through the CDN, or writing a log nothing rotates — and the job
+        # used to end "fully configured" all the same (a production host, 1-nov).
+        for label in (
+            "Create traefik directory",
+            *ran,
+            "Move traefik config files",
+            "Install the default certificate",
+            "Require the CDN client certificate",
+            "Prepare the proxy access log",
+            "Start Traefik",
+        ):
+            exit_status = results.get(label, {}).get('exit_status', 1)
+            if exit_status != 0:
+                errors.append(
+                    f"Traefik step '{label}' failed"
+                    f" (exit {exit_status})"
+                )
+                self._sys(f"✗ Traefik: {label} failed")
+
+        # ── Phase 4: Whitelist ────────────────────────────────────────
+        self._sys("Phase 4/4 — Verifying whitelist services...")
+        for label in (
+            "Create globalwhitelist directory",
+            "Install whitelist compose file",
+            "Start whitelist services",
+        ):
+            exit_status = results.get(label, {}).get('exit_status', 1)
+            if exit_status != 0:
+                errors.append(
+                    f"Whitelist step '{label}' failed"
+                    f" (exit {exit_status})"
+                )
+                self._sys(f"✗ Whitelist: {label} failed")
+
+        # ── Certificates retired from the store, if any ───────────────
+        # Only ever present on a re-run; the write step reports the exit
+        # status of a redirection, not what the store ends up holding.
+        acme = self._acme_prune_errors(results)
+        for problem in acme:
+            self._sys(f"✗ {problem}")
+        errors += acme
+
+        if results.get("Clear the direct path", {}).get("exit_status", 0) != 0:
+            # Nothing listens on the port any more; rules left behind only
+            # drop what would find nothing.
+            self._sys("⚠ The direct path's firewall rules could not be removed.")
+
+        return errors
+
+    async def on_success(self, results):
+        for code in (
+            'missing_deps', 'setup_failed',
+            'traefik_setup_failed', 'whitelist_setup_failed',
+            # Its first phase found Linux and the disk the Check asks for.
+            LOW_DISK_ALERT, UNSUPPORTED_ALERT,
+            # The proxy this run started mounts the dynamic directory.
+            EDGE_GUARD_ALERT,
+        ):
+            self._resolve_alert(code)
+        host = self._host()
+        # It installed every tool: a missing-tools alert dismissed by hand
+        # is resolved too.
+        host._close_missing_tools_dismissed_by_hand()
+        self._sys("✓ Host is fully configured and ready for deployments.")
+        host.write({
+            'status': 'compatible',
+            'traefik_deployed': True,
+            # What the compose file this run started publishes.
+            'direct_port_shipped': host.direct_port or 0,
+            # This run shipped the rendered Traefik configuration, so the
+            # host is now running the proxy posture the panel intends.
+            'trusted_proxies_shipped':
+                '\n'.join(host._effective_trusted_proxy_ranges()),
+            # Config-drift anchor: this setup just shipped exactly the
+            # current snapshot, so the saved host config is applied.
+            **host._applied_config_vals(),
+        })
+        if not host._edge_guard_leaves_alone():
+            # The guard this run wrote before the proxy started.
+            host.write({
+                'edge_guard_shipped_hash':
+                    edge_guard_digest(host._shipped_edge_guard_yml()),
+                'edge_guard_shipped_at': fields.Datetime.now(),
+            })
+        self._report_shared_guard(results)
+        self._chain_observability()
+        if host.direct_port:
+            # The list and the probes of the port this run published, at
+            # the head of the queue: it is part of this setup.
+            if host._enqueue_direct_sync("host setup", chained=True):
+                self._sys("Queued the direct list for this host.")
+
+    def _report_shared_guard(self, results):
+        """Say how the guard step left the host, and keep its alert in step.
+
+        Guarded as asked, or removed as asked, resolves
+        ``shared_guard_open``. Left open (the proxy without its fixed
+        address, a firewall without the MAC match or without Docker's
+        ``DOCKER-USER``) raises it as a warning: the host serves, and its
+        instances still reach each other. So does a step that did not run
+        to the end, saying that how it left the host is not known. A run
+        without the step (a test, a layer that dropped it) says nothing.
+
+        :param dict results: the run's results, by step label
+        """
+        if SHARED_GUARD_STEP not in (results or {}):
+            return
+        state, reason = shared_guard_verdict(results[SHARED_GUARD_STEP])
+        if state in SHARED_GUARD_SETTLED:
+            self._resolve_alert(SHARED_GUARD_ALERT)
+            self._sys(
+                "✓ The instances on the proxy network are isolated."
+                if state == "ON" else
+                "✓ The guard on the proxy network is off, as set on this host."
+            )
+            return
+        if state == "FAILED":
+            message = (
+                f"The guard on the proxy network did not finish ({reason}): "
+                "whether the instances on this host reach each other is not "
+                "known. The step's log says why; see RB-39."
+            )
+        else:
+            message = (
+                f"The guard on the proxy network was left open ({reason}): "
+                "the instances on this host can reach each other directly. "
+                "Full Setup applies it again; RB-39 says what to check."
+            )
+        self._sys(f"⚠ {message}")
+        self._alert(SHARED_GUARD_ALERT, message, level="warning")
+
+    def _chain_observability(self):
+        """Queue the metrics agents for a freshly prepared host.
+
+        An accelerator, not the mechanism: the reconciliation cron is what
+        guarantees every host ends up enrolled. Chaining here just means a
+        brand-new host is covered in seconds instead of waiting for a
+        tick, and if this attempt fails the cron picks the host up anyway
+        — which is precisely what used to be missing, when this was the
+        only path and a single failure left the host blind for good.
+
+        Deliberately non-fatal: the host IS set up, and a problem
+        installing monitoring must never turn a successful preparation
+        into a failure.
+        """
+        host = self._host()
+        if not host._observability_target():
+            self._sys(
+                "ℹ Observability is not configured yet; this host will be "
+                "enrolled automatically once it is."
+            )
+            return
+        if host._enqueue_observability("host setup"):
+            self._sys("Queued the observability agents for this host.")
+        else:
+            self._sys(
+                "⚠ Could not queue the observability agents now; the "
+                "reconciliation cron will retry."
+            )
+
+    async def on_abort(self, exc):
+        """Close a run that ended before its steps, by the server's state.
+
+        ``before_execute`` marks the server 'checking', and only
+        ``on_failure`` moves it on: stopped after that and before the
+        first step — a person cancelled it, the connection dropped — it
+        stayed there for good. A run that ended before ``before_execute``
+        — refused by ``pre_run_checks``, no connection, cancelled while it
+        connected — never touched the server: one that worked keeps its
+        status and raises no ``setup_failed``, and the failure is only
+        written to the log. Marked ``unsupported`` it was no destination
+        of moves or placements any more (6-nov-2026). The status is read
+        on the hook's durable cursor, which sees what ``before_execute``
+        committed.
+
+        :param Exception exc: what stopped the run
+        """
+        error = f"{type(exc).__name__}: {exc}"
+        if self._host().status == "checking":
+            await self.on_failure({}, [error])
+        else:
+            self._sys(f"✗ {error}")
+
+    async def on_failure(self, results, errors):
+        """Fail the setup and give the host the status of what it found.
+
+        A Linux host short of disk is ``degraded`` with the Check's
+        ``host_low_disk``, as the Check leaves it: its instances run on.
+        Anything else is ``unsupported``. Either way ``setup_failed``.
+
+        :param dict results: what ran.
+        :param list errors: why the setup failed.
+        """
+        self._sys(f"Setup failed with {len(errors)} error(s):")
+        for err in errors:
+            self._sys(f"  ✗ {err}")
+        self._alert(
+            'setup_failed',
+            "Host setup failed. Check the job log for details."
+            " Re-run Setup to retry.",
+            level='critical',
+        )
+        if self._low_disk_gb is not None:
+            self._alert(
+                LOW_DISK_ALERT, low_disk_message(self._low_disk_gb),
+                level='warning',
+            )
+            self._host().write({'status': 'degraded'})
+        else:
+            self._host().write({'status': 'unsupported'})

@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <t t-name="incubacloud.Settings">
+        <div class="ic-set">
+
+            <!-- The menu of sections, grouped, with the search atop it -->
+            <nav class="ic-set-menu" aria-label="Settings sections">
+                <h1 class="ic-set-menu__title">Settings</h1>
+                <SettingsSearch onPickField.bind="onPickField" onPickElsewhere.bind="onPickElsewhere"/>
+                <t t-foreach="menu" t-as="group" t-key="group.id">
+                    <div class="ic-set-menu__cap" t-esc="group.title"/>
+                    <ul class="ic-set-menu__list">
+                        <li t-foreach="group.sections" t-as="item" t-key="item.id">
+                            <a t-att-href="'/cloud/settings/' + item.id"
+                               t-att-class="'ic-set-menu__item' + (item.id === sectionId ? ' ic-set-menu__item--on' : '')"
+                               t-att-aria-current="item.id === sectionId ? 'page' : undefined"
+                               t-on-click.prevent="() => this.openSection(item.id)">
+                                <t t-esc="item.title"/>
+                                <span t-if="item.id === sectionId and isDirty" class="ic-set-dot"
+                                      role="img" aria-label="Unsaved changes" title="Unsaved changes"/>
+                            </a>
+                        </li>
+                    </ul>
+                </t>
+            </nav>
+
+            <div class="ic-set-body">
+                <div class="ic-set-col">
+
+                    <!-- On a phone: the section as a select, the search under it -->
+                    <div class="ic-set-mobile">
+                        <h1 class="ic-set-menu__title">Settings</h1>
+                        <label class="visually-hidden" for="ic-set-section-select">Section</label>
+                        <select id="ic-set-section-select" class="ic-set-msel" t-on-change="onSelectSection">
+                            <t t-foreach="menu" t-as="group" t-key="group.id">
+                                <optgroup t-att-label="group.title">
+                                    <option t-foreach="group.sections" t-as="item" t-key="item.id"
+                                            t-att-value="item.id"
+                                            t-att-selected="item.id === sectionId">
+                                        <t t-esc="group.title"/> › <t t-esc="item.title"/>
+                                    </option>
+                                </optgroup>
+                            </t>
+                        </select>
+                        <SettingsSearch onPickField.bind="onPickField" onPickElsewhere.bind="onPickElsewhere"/>
+                    </div>
+
+                    <t t-if="section">
+                        <div class="ic-set-crumb">Settings › <t t-esc="section.groupTitle"/></div>
+                        <p t-if="state.resultFor" class="ic-set-resultfor">
+                            <i class="fa fa-search" aria-hidden="true"/>
+                            <t t-esc="resultForText"/>
+                            <button type="button" class="ic-set-link" t-on-click="backToResults">Back to results</button>
+                        </p>
+                        <h2 class="ic-set-title" t-esc="section.title"/>
+                        <p t-if="section.description" class="ic-set-desc" t-esc="section.description"/>
+
+                        <div t-if="state.pageError" class="ic-set-alert" role="alert">
+                            <i class="fa fa-exclamation-circle" aria-hidden="true"/>
+                            <t t-esc="state.pageError"/>
+                        </div>
+
+                        <div class="ic-set-page" t-key="sectionId">
+                            <t t-foreach="blocks" t-as="block" t-key="block.key">
+                                <t t-component="block.Component" t-props="block.props || {}"/>
+                            </t>
+                        </div>
+                    </t>
+                </div>
+            </div>
+
+            <!-- The save bar: only with something unsaved on the page -->
+            <SaveBar count="changedCount" errors="errorCount" saving="state.saving"
+                     onSave.bind="save" onDiscard.bind="discard"/>
+
+        </div>
+
+        <IcConfirmDialog t-if="state.confirmDialog"
+                         title="state.confirmDialog.title"
+                         message="state.confirmDialog.message"
+                         confirmLabel="state.confirmDialog.confirmLabel"
+                         isDanger="state.confirmDialog.isDanger"
+                         onConfirm="state.confirmDialog.onConfirm"
+                         onCancel="state.confirmDialog.onCancel"/>
+    </t>
+
+</templates>

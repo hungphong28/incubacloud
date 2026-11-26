@@ -1,0 +1,299 @@
+// ── Project detail (rebuilt to relay grammar) ────────────────────────────────
+//
+// Page chrome (rl-page / rl-phead / rl-crumb / rl-fgrid / rl-frow / rl-formfoot
+// / rl-tabs / rl-stub / rl-ghcard / rl-alert) lives in relay.scss. The deps
+// code editor, repos toolbar and members panel reuse classes defined in
+// sibling components (instance_detail / host_detail / repo_editor). Only the
+// screen-specific bits remain here, prefixed ``ic-pd-*``.
+
+.ic-detail-loading {
+    padding: 24px;
+    color: $text-secondary;
+    font-size: 0.85rem;
+}
+
+// ── Onboarding (no instances) — relay rocket/flask cards ─────────────────────
+
+.ic-pd-onboarding {
+    .ic-pd-onboarding-cards {
+        margin-top: 18px;
+        width: 100%;
+        // Room for two cards of the grid's minimum (280px) and its gap, side
+        // by side; a narrow screen still stacks them.
+        max-width: 600px;
+    }
+}
+
+// Relay's `:root .rl-ghcard` (align-items: flex-start) outranks a lone class:
+// this one outranks it, and the card's icon and text are centred.
+.ic-pd-onboarding .rl-ghcard.ic-pd-onboard-card {
+    cursor: pointer;
+    text-align: center;
+    align-items: center;
+    flex-direction: column;
+
+    .rl-ghi { color: $text-secondary; transition: color 0.2s; }
+
+    &.env-production:hover .rl-ghi { color: $state-ok; }
+    &.env-staging:hover .rl-ghi { color: $primary-blue; }
+
+    // Staging before there is a production to copy: it explains, it
+    // does not open the form.
+    &.is-disabled {
+        cursor: default;
+        opacity: 0.6;
+        box-shadow: none;
+
+        &:hover .rl-ghi { color: $text-secondary; }
+    }
+}
+
+// ── Body wrapper ─────────────────────────────────────────────────────────────
+
+.ic-pd-body {
+    margin-top: 4px;
+}
+
+// ── Tab count bubble ─────────────────────────────────────────────────────────
+
+.ic-tab-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: rgba(var(--rl-line-rgb), 0.5);
+    font-size: 10px;
+    font-weight: 700;
+    color: $text-secondary;
+    margin-left: 5px;
+    vertical-align: middle;
+}
+
+.rl-tab.active .ic-tab-count {
+    background: rgba(var(--rl-green-rgb), 0.2);
+    color: $primary-blue;
+}
+
+// ── Repositories empty state ─────────────────────────────────────────────────
+
+.ic-repos-empty {
+    padding: 20px 0;
+    font-size: 13px;
+    color: $text-secondary;
+    font-style: italic;
+    text-align: center;
+}
+
+// ── Members panel ────────────────────────────────────────────────────────
+
+.ic-members-add {
+    margin-bottom: 12px;
+
+    input {
+        width: 100%;
+        padding: 8px 12px;
+        background: $surface-light;
+        border: 1px solid rgba(var(--rl-line-rgb), 0.4);
+        border-radius: 6px;
+        color: $text-primary;
+        font-size: 13px;
+
+        &::placeholder { color: $text-secondary; opacity: 0.6; }
+        &:focus { outline: none; border-color: $primary-blue; }
+    }
+}
+
+.ic-members-results {
+    background: $surface-light;
+    border: 1px solid rgba(var(--rl-green-rgb), 0.2);
+    border-radius: 6px;
+    margin-bottom: 12px;
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.ic-member-result {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    cursor: pointer;
+    color: $text-secondary;
+
+    &:hover { background: rgba(var(--rl-green-rgb), 0.08); color: $text-primary; }
+
+    i { color: $primary-blue; }
+    small { margin-left: auto; opacity: 0.6; }
+}
+
+.ic-members-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.ic-member-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: $surface-light;
+    border-radius: 6px;
+
+    i { color: $text-secondary; }
+}
+
+.ic-member-name {
+    color: $text-primary;
+    flex: 1;
+}
+
+.ic-member-remove {
+    background: none;
+    border: none;
+    color: $text-secondary;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+
+    &:hover { color: var(--rl-red); background: rgba(var(--rl-red-rgb), 0.1); }
+}
+
+// ── Archived instances tab ───────────────────────────────────────────────────
+// A row is three claims side by side — what it was, what its copy is, and
+// where that copy lives — because an archived instance is only worth what
+// its chain is worth, and hiding the destination would make "Present" an
+// unverifiable statement.
+.ic-archived-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.ic-archived-intro {
+    margin: 0;
+    font-size: 0.8125rem;
+    color: var(--rl-muted);
+    max-width: 70ch;
+}
+
+.ic-archived-error {
+    padding: 12px 16px;
+    background: rgba(var(--rl-red-rgb), 0.1);
+    border: 1px solid rgba(var(--rl-red-rgb), 0.3);
+    border-radius: 8px;
+    color: var(--rl-red);
+    font-size: 0.8125rem;
+}
+
+.ic-archived-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ic-archived-row {
+    display: grid;
+    grid-template-columns: minmax(220px, 1.4fr) minmax(180px, 1fr) minmax(200px, 1.2fr) auto;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    background: var(--rl-surf);
+    border: 1px solid var(--rl-line);
+    border-radius: var(--rl-r);
+}
+
+@media (max-width: 900px) {
+    .ic-archived-row { grid-template-columns: 1fr; }
+}
+
+// The row's columns shrink below their content (the grid's 1fr tracks
+// would otherwise grow with an unbreakable name), and the name, the host
+// it came from and the check time break anywhere instead of overflowing.
+.ic-archived-main,
+.ic-archived-copy {
+    min-width: 0;
+}
+
+.ic-archived-main {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.ic-archived-name {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-weight: 600;
+    font-size: 0.875rem;
+}
+
+.ic-archived-when,
+.ic-archived-checked {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: 0.6875rem;
+    color: var(--rl-muted);
+}
+
+.ic-archived-copy {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.ic-archived-size {
+    font-family: var(--rl-fm);
+    font-size: 0.6875rem;
+    color: var(--rl-muted);
+}
+
+.ic-archived-where {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.ic-archived-backend {
+    font-size: 0.6875rem;
+    color: var(--rl-muted);
+}
+
+.ic-archived-dst {
+    font-family: var(--rl-fm);
+    font-size: 0.625rem;
+    color: var(--rl-faint);
+    overflow-wrap: anywhere;
+}
+
+.ic-archived-actions {
+    display: flex;
+    justify-content: flex-end;
+}
+
+// ── Revive modal ─────────────────────────────────────────────────────────────
+.ic-revive-sub {
+    margin: 0 0 14px;
+    font-size: 0.8125rem;
+    color: var(--rl-muted);
+}
+
+.ic-revive-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 16px;
+
+    label { @include rl-field-label; }
+}
+
+.ic-revive-loading {
+    font-size: 0.8125rem;
+    color: var(--rl-muted);
+}

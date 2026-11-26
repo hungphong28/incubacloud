@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!-- The assistant's button, before the user menu, for whom it is on. -->
+    <t t-inherit="incubacloud.AppHeader" t-inherit-mode="extension">
+        <xpath expr="//div[hasclass('ic-header-user-wrap')]" position="before">
+            <AssistantButton/>
+        </xpath>
+    </t>
+
+</templates>

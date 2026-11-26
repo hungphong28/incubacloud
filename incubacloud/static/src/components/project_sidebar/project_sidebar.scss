@@ -1,0 +1,119 @@
+// ── Project context sidebar (rebuilt to relay rl-ctx-* grammar) ──────────────
+//
+// The rail primitives (rl-ctx-back / rl-ctx-proj / rl-ctx-sec / rl-ctx-sech /
+// rl-ctx-add / rl-ctx-item / rl-ctx-name / rl-ctx-ver / rl-ctx-clone /
+// rl-ctx-empty) live in relay.scss. Only the richer features the prototype
+// lacks (search box, PR badge, instance tags, skeleton) and the rail padding
+// remain here.
+
+.ic-psidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 12px 10px 24px;
+}
+
+// Staging's add button before the project has a production to copy.
+.ic-psidebar .rl-ctx-add:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+
+  &:hover { background: none; color: var(--rl-muted); }
+}
+
+.ic-psidebar-loading {
+  padding: 16px;
+  color: $text-secondary;
+  font-size: 0.8rem;
+}
+
+// ── Search input ─────────────────────────────────────────────────
+.ic-psidebar-search {
+  padding: 4px 9px 8px;
+
+  input {
+    width: 100%;
+    background: $surface-light;
+    border: 1px solid $border;
+    color: $text-primary;
+    padding: 5px 10px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+
+    &::placeholder { color: $text-secondary; }
+    &:focus { outline: none; border-color: $primary-blue; }
+  }
+}
+
+// ── Tag chips (inside a rl-ctx-item) ─────────────────────────────
+.ic-psidebar-tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex-basis: 100%;
+  padding-left: 22px; // align with the instance name (pill + gap)
+}
+
+.ic-psidebar-tag-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 600;
+  white-space: nowrap;
+
+  .ic-tag-dot {
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+}
+
+// Allow tag chips to wrap onto a new line beneath the item row.
+.rl-ctx-item { flex-wrap: wrap; }
+
+// ── PR badge ─────────────────────────────────────────────────────
+.ic-pr-badge {
+  font-size: 0.625rem;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(var(--rl-green-rgb), 0.15);
+  color: $primary-blue;
+  border: 1px solid rgba(var(--rl-green-rgb), 0.3);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+// ── Expiry badge ─────────────────────────────────────────────────
+// Shown only from the first warning on. Amber while there is time to
+// react, red over the last three days — the same two-step the alerts
+// use, so the list and the alert panel never disagree about urgency.
+.ic-expiry-badge {
+  font-size: 0.625rem;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(var(--rl-amber-rgb), 0.15);
+  color: var(--rl-amber-ink);
+  border: 1px solid rgba(var(--rl-amber-rgb), 0.3);
+  flex-shrink: 0;
+  white-space: nowrap;
+
+  &.urgent {
+    background: rgba(var(--rl-red-rgb), 0.15);
+    color: var(--rl-red);
+    border-color: rgba(var(--rl-red-rgb), 0.3);
+  }
+}
+
+// ── Project › Settings cog ───────────────────────────────────────
+.ic-psidebar-icon {
+  width: 14px;
+  text-align: center;
+  font-size: 0.8rem;
+  opacity: 0.7;
+}

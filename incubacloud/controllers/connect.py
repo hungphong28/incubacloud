@@ -1,0 +1,710 @@
+import json
+import logging
+import re
+import shlex
+import urllib.request
+
+import asyncssh
+
+from odoo import http, _
+from odoo.exceptions import AccessError
+from odoo.http import request
+
+from ..net.outbound import OutboundError, validate_url
+
+from ._rate_limit import Rule, rate_gate_json
+from .async_utils import run_async
+
+_CONTAINER_ID_RE = re.compile(r'^[a-f0-9]{12,64}$')
+# The longest webhook secret or Telegram token a user may store.
+_MAX_USER_SECRET_CHARS = 1024
+
+_logger = logging.getLogger(__name__)
+
+
+def _typed_or_stored(typed, stored):
+    """Return the token typed in a form, or else the stored one, trimmed.
+
+    A token pasted with a space or a newline at an end would otherwise
+    make a URL that ``urllib`` refuses.
+
+    :param typed: what the request carried; anything but a string with
+        more than spaces counts as nothing typed
+    :param stored: a callable returning the stored token
+    :return: the token, or ``False`` when there is none
+    """
+    if isinstance(typed, str) and typed.strip():
+        return typed.strip()
+    return (stored() or '').strip() or False
+
+
+def _without_token(exc, token):
+    """Return the text of *exc* with *token* masked, fit for the log.
+
+    ``urllib`` quotes the URL it refuses, and the bot token is in its
+    path.
+
+    :param exc: the exception a call to Telegram raised
+    :param token: the bot token in the URL called
+    :return: the exception's type and text, the token replaced by ``***``
+    """
+    return f'{type(exc).__name__}: {str(exc).replace(token, "***")}'
+
+
+def _telegram_refused():
+    """Return the refusal of a Telegram check to an account it is not for.
+
+    The preferences' checks are the internal users', as the save is.
+
+    :return: the answer, or None when the caller may run them
+    """
+    if request.env.user._is_internal():
+        return None
+    return {'ok': False, 'error': 'Not available for this account'}
+
+
+# ── Python scripts executed inside the Odoo container via docker exec ─────────
+
+# Flags a target user as an administrator of the instance's database: uid 2
+# (Odoo's built-in admin) or explicit membership of base.group_system /
+# base.group_erp_manager. The relation table and the ir_model_data rows
+# are stable across Odoo 7 → 20, so the same SQL works on every instance
+# version we support. Over-flagging is harmless: it only raises the
+# required panel role to Manager.
+# It is kept on a single line because it is interpolated inside a
+# double-quoted string literal of the generated script.
+_IS_ADMIN_SQL = (
+    "(u.id = 2 OR EXISTS (SELECT 1 FROM res_groups_users_rel r "
+    "JOIN ir_model_data d ON d.model = 'res.groups' AND d.res_id = r.gid "
+    "WHERE r.uid = u.id AND d.module = 'base' "
+    "AND d.name IN ('group_system', 'group_erp_manager')))"
+)
+
+# Both scripts run on Python 2 too: 8.0 to 10.0 images have no python3
+# (``_CONTAINER_PYTHON``). Hence the coding line (a login may not be
+# ASCII), and nothing newer than 2.7 has.
+_GET_USERS_SCRIPT = """\
+# -*- coding: utf-8 -*-
+import json
+try:
+    import psycopg2
+    conn = psycopg2.connect(host='db', dbname={db!r}, user={user!r}, password={password!r})
+    cur = conn.cursor()
+    # res_users.share is base's from 9.0; on 8.0 only the share module adds
+    # it, and an internal user is one of base.group_user, which is what
+    # share computes later.
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'res_users' AND column_name = 'share'"
+    )
+    if cur.fetchone():
+        internal = "u.share = false"
+    else:
+        internal = (
+            "EXISTS (SELECT 1 FROM res_groups_users_rel r "
+            "JOIN ir_model_data d ON d.model = 'res.groups' "
+            "AND d.res_id = r.gid WHERE r.uid = u.id "
+            "AND d.module = 'base' AND d.name = 'group_user')"
+        )
+    cur.execute(
+        "SELECT u.id, p.name, u.login, {is_admin_sql} FROM res_users u "
+        "JOIN res_partner p ON p.id = u.partner_id "
+        "WHERE u.active = true AND " + internal + " ORDER BY p.name"
+    )
+    print(json.dumps({{'ok': True, 'users': [
+        {{'id': r[0], 'name': r[1], 'login': r[2], 'is_admin': bool(r[3])}}
+        for r in cur.fetchall()
+    ]}}))
+    conn.close()
+except Exception as e:
+    print(json.dumps({{'ok': False, 'error': str(e)}}))
+"""
+
+_INJECT_SESSION_SCRIPT = """\
+# -*- coding: utf-8 -*-
+import binascii, errno, json, time, os
+try:
+    import psycopg2
+    conn = psycopg2.connect(host='db', dbname={db!r}, user={user!r}, password={password!r})
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT u.id, {is_admin_sql} FROM res_users u "
+        "WHERE u.id = %s AND u.active = true",
+        ({uid},)
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        print(json.dumps({{'ok': False, 'error': 'User not found or inactive'}}))
+    elif row[1] and not {allow_admin!r}:
+        print(json.dumps({{'ok': False, 'is_admin': True, 'error':
+            'Connecting as an administrator of a production instance '
+            'requires the Manager role.'}}))
+    else:
+        token_dir = '/tmp/ic_tokens'
+        try:
+            os.makedirs(token_dir, 0o700)
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
+        os.chmod(token_dir, 0o700)
+        ic_token = binascii.hexlify(os.urandom(16)).decode('ascii')
+        token_path = os.path.join(token_dir, ic_token)
+        fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as tf:
+            json.dump({{'uid': {uid}, 'db': {db!r}, 'ts': time.time(),
+                        'by': {by!r}}}, tf)
+        print(json.dumps({{'ok': True, 'token': ic_token}}))
+except Exception as e:
+    print(json.dumps({{'ok': False, 'error': str(e)}}))
+"""
+
+
+# ── SSH helpers ────────────────────────────────────────────────────────────────
+
+
+async def _get_container_id(conn, inst_dir, yaml_file):
+    """Return the container ID of the odoo service, or empty string."""
+    # ~ must stay outside quotes for shell expansion; only quote the subpath.
+    if inst_dir.startswith('~/'):
+        safe_dir = '~/' + shlex.quote(inst_dir[2:])
+    else:
+        safe_dir = shlex.quote(inst_dir)
+    result = await conn.run(
+        f"cd {safe_dir} && docker compose -f {shlex.quote(yaml_file)} ps -q odoo"
+        " 2>/dev/null | head -1",
+        check=False,
+    )
+    cid = (result.stdout or '').strip()
+    # Validate: Docker container IDs are hex strings (short 12-char or full 64-char)
+    if not _CONTAINER_ID_RE.fullmatch(cid):
+        return ''
+    return cid
+
+
+#: The interpreter the scripts run with inside the odoo container: the
+#: one that has psycopg2, Odoo's own. python3 from 11.0 on; 8.0 to 10.0
+#: images have Python 2 alone (doodba, QA of the series, 7-nov-2026).
+_CONTAINER_PYTHON = (
+    "sh -c 'if python3 -c \"import psycopg2\" 2>/dev/null;"
+    " then exec python3 -; else exec python -; fi'"
+)
+
+
+async def _run_in_container(conn, container_id, script):
+    """Run a Python script inside the container via docker exec -i.
+
+    With ``_CONTAINER_PYTHON``, whichever Python the series' image has.
+    """
+    result = await conn.run(
+        f"docker exec -i {container_id} {_CONTAINER_PYTHON}",
+        input=script,
+        check=False,
+    )
+    return (result.stdout or '').strip()
+
+
+# ── Controller ─────────────────────────────────────────────────────────────────
+
+class InstanceConnectController(http.Controller):
+
+    def _inst_dir(self, inst):
+        return inst.get_remote_dir()
+
+    def _yaml_file(self, inst):
+        return 'prod.yaml' if inst.environment == 'production' else 'test.yaml'
+
+    # ── Rate limiting ─────────────────────────────────────────────────────────
+    # Shared gate (decision log P13): the hit/log/deny block lives in
+    # ``_rate_limit``; this wrapper only declares connect's two windows.
+
+    def _connect_rate_limited(self, instance_id):
+        """Return an error dict when the caller is over a connect-as cap.
+
+        Two tumbling windows: one per panel user (a compromised account
+        minting tokens in bulk) and one per instance (several operators
+        hammering the same instance). Returns ``None`` when allowed.
+        """
+        uid = request.env.user.id
+        return rate_gate_json(
+            Rule(
+                f'connect_user:{uid}',
+                _(
+                    'Too many connect-as requests recently. '
+                    'Try again in a minute.'
+                ),
+                cap_key='rate_limit_connect_user_per_min',
+                log_tag=f'connect user={uid}',
+            ),
+            Rule(
+                f'connect_instance:{instance_id}',
+                _(
+                    'Too many connect-as requests against this instance. '
+                    'Try again in a minute.'
+                ),
+                cap_key='rate_limit_connect_per_min',
+                log_tag=f'connect instance={instance_id}',
+            ),
+        )
+
+    def _resolve_instance(self, instance_id):
+        """Browse *instance_id* as the caller and return it, or an error dict.
+
+        Browsing without sudo first is deliberate: the record rules on
+        ``cloud.instance`` scope visibility per project, and a user who
+        cannot read the instance must not learn it exists.
+        """
+        inst = request.env['cloud.instance'].browse(instance_id)
+        if not inst.exists():
+            return None, {'ok': False, 'error': _('Instance not found')}
+        try:
+            inst.check_access('read')
+        except AccessError:
+            return None, {'ok': False, 'error': _('Instance not found')}
+        inst = inst.sudo()
+        if not inst.host_id:
+            return None, {
+                'ok': False,
+                'error': _('Instance not found or has no host'),
+            }
+        if not inst.deployed or not inst.running:
+            return None, {'ok': False, 'error': _('Instance is not running')}
+        return inst, None
+
+    # ── Get users ─────────────────────────────────────────────────────────────
+
+    @http.route(['/cloud/get_instance_users'], type='jsonrpc', auth='user')
+    def get_instance_users(self, instance_id):
+        """List the instance's internal users, flagging its administrators.
+
+        The instance is resolved before the permission check because the
+        required role depends on its environment: listing the users of a
+        production instance is already a Developer-level action.
+        """
+        inst, err = self._resolve_instance(instance_id)
+        if err:
+            return err
+        request.env['cloud.security.mixin']._check_can_connect_as_user(
+            instance=inst,
+        )
+        limited = self._connect_rate_limited(instance_id)
+        if limited:
+            return limited
+
+        host = inst.host_id
+        inst_dir = self._inst_dir(inst)
+        yaml_file = self._yaml_file(inst)
+
+        script = _GET_USERS_SCRIPT.format(
+            db=inst.postgres_dbname or 'prod',
+            user=inst.postgres_username or 'odoo',
+            password=inst.postgres_password or '',
+            is_admin_sql=_IS_ADMIN_SQL,
+        )
+
+        async def _run():
+            async with asyncssh.connect(**host.ssh_connect_kwargs()) as conn:
+                container_id = await _get_container_id(
+                    conn, inst_dir, yaml_file
+                )
+                if not container_id:
+                    return {
+                        'ok': False,
+                        'error': _('Odoo container not found or not running'),
+                    }
+                output = await _run_in_container(conn, container_id, script)
+                if not output:
+                    return {'ok': False, 'error': _('No output from container')}
+                return json.loads(output)
+
+        try:
+            result = run_async(_run())
+        except Exception:
+            _logger.exception(
+                "Error getting instance users for %s", instance_id
+            )
+            return {'ok': False, 'error': _('An internal error occurred. Check server logs.')}
+
+        if result.get('ok'):
+            request.env['cloud.audit.log'].sudo().create({
+                'action': 'List instance users',
+                'instance_id': inst.id,
+            })
+        return result
+
+    # ── Prepare session ────────────────────────────────────────────────────────
+
+    @http.route(['/cloud/prepare_instance_connect'], type='jsonrpc', auth='user')
+    def prepare_instance_connect(self, instance_id, user_id, user_name=None):
+        """Inject a pre-authenticated session into the instance and return
+        a one-time URL pointing to the instance's /ic/login endpoint.
+
+        The incubacloud_connect module must be installed on the instance.
+        It provides /ic/login which reads the token file written here and
+        sets the session cookie from the instance's own domain, avoiding
+        cross-domain cookie restrictions entirely.
+
+        Whether the target user is an administrator of the instance is
+        decided inside the instance's database, not by the caller: the panel
+        passes ``allow_admin`` and the script refuses to mint a token for
+        an admin when it is False. A client that lies about ``user_name``
+        (a display label only) therefore cannot widen its own access.
+        """
+        sec = request.env['cloud.security.mixin']
+
+        if not isinstance(user_id, int) or user_id <= 0:
+            return {'ok': False, 'error': _('Invalid user_id')}
+
+        inst, err = self._resolve_instance(instance_id)
+        if err:
+            return err
+        # Floor check for this environment: connecting as a *normal* user.
+        # The admin case is enforced below, once the instance tells us
+        # whether the target is one.
+        sec._check_can_connect_as_user(instance=inst)
+        limited = self._connect_rate_limited(instance_id)
+        if limited:
+            return limited
+        if not inst.domain:
+            return {'ok': False, 'error': _('Instance has no domain configured')}
+
+        allow_admin = (
+            inst.environment != 'production'
+            or sec._has_cloud_group('group_cloud_manager')
+        )
+
+        host = inst.host_id
+        inst_dir = self._inst_dir(inst)
+        yaml_file = self._yaml_file(inst)
+
+        script = _INJECT_SESSION_SCRIPT.format(
+            db=inst.postgres_dbname or 'prod',
+            user=inst.postgres_username or 'odoo',
+            password=inst.postgres_password or '',
+            uid=user_id,
+            is_admin_sql=_IS_ADMIN_SQL,
+            allow_admin=allow_admin,
+            by=request.env.user.login,
+        )
+
+        async def _run():
+            async with asyncssh.connect(**host.ssh_connect_kwargs()) as conn:
+                container_id = await _get_container_id(
+                    conn, inst_dir, yaml_file
+                )
+                if not container_id:
+                    return {'ok': False, 'error': _('Odoo container not found')}
+                output = await _run_in_container(conn, container_id, script)
+                if not output:
+                    return {'ok': False, 'error': _('No output from container')}
+                return json.loads(output)
+
+        try:
+            result = run_async(_run())
+        except Exception:
+            _logger.exception(
+                "Error injecting session for instance %s", instance_id
+            )
+            return {'ok': False, 'error': _('An internal error occurred. Check server logs.')}
+
+        if not result.get('ok'):
+            if result.get('is_admin'):
+                _logger.warning(
+                    "connect_as_admin_denied user=%s instance=%s target_uid=%s",
+                    request.env.user.login, inst.id, user_id,
+                )
+            return result
+
+        domain = inst.domain.strip()
+        ic_token = result.get('token', '')
+        if not ic_token:
+            return {'ok': False, 'error': _('No token returned from instance')}
+
+        # Audit trail: record the connect-as action
+        label = user_name or str(user_id)
+        request.env['cloud.audit.log'].sudo().create({
+            'action': 'Connect as user',
+            'instance_id': inst.id,
+            'details': f'{label} [{inst.environment}]',
+        })
+        # Somebody is about to walk into this instance, which is as
+        # direct a use as there is — and it leaves no job behind, so
+        # without this the staging clock would not hear about it.
+        inst._touch_autopurge_clock()
+
+        return {
+            'ok': True,
+            'url': f'https://{domain}/ic/login?t={ic_token}',
+        }
+
+    @http.route('/cloud/get_audit_log', type='jsonrpc', auth='user', methods=['POST'])
+    def get_audit_log(
+        self, instance_id=None, host_id=None, limit=100, offset=0,
+        q=None, action_filter=None, date_from=None, date_to=None,
+    ):
+        return request.env['cloud.job'].get_audit_log(
+            instance_id=instance_id,
+            host_id=host_id,
+            limit=limit,
+            offset=offset,
+            q=q,
+            action_filter=action_filter,
+            date_from=date_from,
+            date_to=date_to,
+        )
+
+    @http.route('/cloud/purge_audit_logs', type='jsonrpc', auth='user', methods=['POST'])
+    def purge_audit_logs(self, days=None):
+        if not request.env.user.has_group('incubacloud.group_cloud_manager'):
+            return {'ok': False, 'error': 'Unauthorized'}
+        if days is None:
+            ICP = request.env['ir.config_parameter'].sudo()
+            days = int(ICP.get_param('incubacloud.audit_log_retention_days', '90') or 90)
+        count = request.env['cloud.audit.log']._purge_old(days)
+        return {'ok': True, 'deleted': count}
+
+    @http.route('/cloud/get_user_preferences', type='jsonrpc', auth='user',
+                methods=['POST'])
+    def get_user_preferences(self):
+        user = request.env.user
+        # Names come back through the caller's own env, never through
+        # ``user.cloud_muted_project_ids``: ``env.user`` is sudoed, so
+        # reading the m2m off it hands out the name of every project on
+        # the platform. ``_filtered_access`` drops what the caller may
+        # not read instead of raising, so a membership lost since the
+        # mute was stored quietly disappears from the modal rather than
+        # breaking it.
+        Project = request.env['cloud.project']
+        muted = [
+            {'id': p.id, 'name': p.name}
+            for p in Project.browse(
+                user.cloud_muted_project_ids.ids
+            )._filtered_access('read')
+        ]
+        return {
+            'ok': True,
+            'cloud_notification_level': user.cloud_notification_level or 'failures',
+            'cloud_notification_mode': user.cloud_notification_mode or 'immediate',
+            'cloud_email_enabled': user.cloud_email_enabled,
+            'cloud_muted_projects': muted,
+            'cloud_telegram_configured': bool(
+                user._get_cloud_telegram_bot_token()
+            ),
+            'cloud_telegram_chat_id': user.cloud_telegram_chat_id or '',
+            'cloud_webhook_configured': bool(user._get_cloud_webhook_secret()),
+            'cloud_webhook_url': user.cloud_webhook_url or '',
+        }
+
+    @http.route('/cloud/save_user_preferences', type='jsonrpc', auth='user',
+                methods=['POST'])
+    def save_user_preferences(self, cloud_notification_level=None,
+                              cloud_notification_mode=None,
+                              cloud_muted_project_ids=None,
+                              cloud_email_enabled=None,
+                              cloud_telegram_bot_token=None,
+                              cloud_telegram_chat_id=None,
+                              cloud_webhook_url=None,
+                              cloud_webhook_secret=None):
+        """Persist the caller's notification preferences.
+
+        Muted ids are sanitised to the projects the caller may read;
+        ids beyond that are dropped silently, since muting a project
+        you cannot see has no observable effect anyway.
+        """
+        if not request.env.user._is_internal():
+            # The SPA that owns this form is internal-only (``/cloud``
+            # returns 404 to a share user), so no legitimate caller is
+            # turned away here. What this closes is the direct RPC: a
+            # portal customer could store a webhook URL that only stays
+            # inert because both senders filter ``share = False``
+            # elsewhere. Correct today by accident in another file is
+            # not a property worth keeping on an SSRF sink.
+            return {'ok': False, 'error': 'Not available for this account'}
+        # The field's own choices, so a level added there is accepted
+        # here without a second list to keep in step.
+        valid = {
+            key for key, _label in
+            request.env['res.users']._fields['cloud_notification_level'].selection
+        }
+        if cloud_notification_level not in valid:
+            return {'ok': False, 'error': 'Invalid notification level'}
+        if cloud_notification_mode not in ('immediate', 'daily_digest'):
+            return {'ok': False, 'error': 'Invalid delivery mode'}
+        vals = {
+            'cloud_notification_level': cloud_notification_level,
+            'cloud_notification_mode': cloud_notification_mode,
+        }
+        if cloud_email_enabled is not None:
+            vals['cloud_email_enabled'] = bool(cloud_email_enabled)
+        if cloud_muted_project_ids is not None:
+            try:
+                ids = [int(i) for i in cloud_muted_project_ids]
+            except (TypeError, ValueError):
+                return {'ok': False, 'error': 'Invalid muted project ids'}
+            # Record rules decide what may be muted. Browsing with sudo
+            # accepted any id on the platform, and the read side then
+            # returned its name — the two together were an id-to-name
+            # oracle over every project. ``_filtered_access`` returns the
+            # allowed subset without raising, so a caller with no cloud
+            # ACL at all still saves the rest of the form.
+            projects = (
+                request.env['cloud.project']
+                .browse(ids).exists()._filtered_access('read')
+            )
+            vals['cloud_muted_project_ids'] = [(6, 0, projects.ids)]
+        # Every stored secret is masked in what agents read, and its cost
+        # grows with its length: a secret worth the name fits well within
+        # this, and a huge one would weigh on every call.
+        too_long = _MAX_USER_SECRET_CHARS
+        if cloud_telegram_bot_token and len(cloud_telegram_bot_token) > too_long:
+            return {'ok': False, 'error': _(
+                'The Telegram bot token can be %(max)s characters at most.',
+                max=too_long,
+            )}
+        if cloud_webhook_secret and len(cloud_webhook_secret) > too_long:
+            return {'ok': False, 'error': _(
+                'The webhook secret can be %(max)s characters at most.',
+                max=too_long,
+            )}
+        if isinstance(cloud_telegram_bot_token, str):
+            # Trimmed, as the checks trim it: a pasted newline would make
+            # the URL of every message one ``urllib`` refuses.
+            cloud_telegram_bot_token = cloud_telegram_bot_token.strip()
+        if cloud_telegram_bot_token:
+            vals['cloud_telegram_bot_token'] = cloud_telegram_bot_token
+        if cloud_telegram_chat_id is not None:
+            vals['cloud_telegram_chat_id'] = cloud_telegram_chat_id.strip()
+        if cloud_webhook_url is not None:
+            url = cloud_webhook_url.strip()
+            if url:
+                # Checked here so a typo is reported while the user is
+                # looking at the form. It is not the security boundary:
+                # DNS can change between now and the notification, so
+                # ``post_json`` validates again and pins the address it
+                # approved. See :mod:`..net.outbound`.
+                try:
+                    validate_url(url)
+                except OutboundError as exc:
+                    return {'ok': False, 'error': f'Webhook URL rejected: {exc}'}
+            vals['cloud_webhook_url'] = url
+        if cloud_webhook_secret:
+            vals['cloud_webhook_secret'] = cloud_webhook_secret
+        # A channel is on while its address is saved, which is what its
+        # senders check: the chat ID for Telegram, the URL for the
+        # webhook. A save that leaves the address empty turns the channel
+        # off, and its secret goes with it, a token typed in the same save
+        # included, so no request leaves a secret that nothing uses. The
+        # panel's switch off sends both empty; an empty secret field
+        # alone still keeps the stored one. Decided on 2026-11-14.
+        user = request.env.user
+        if not vals.get('cloud_telegram_chat_id',
+                        user.cloud_telegram_chat_id):
+            vals['cloud_telegram_bot_token'] = False
+            vals['cloud_telegram_chat_id'] = False
+        if not vals.get('cloud_webhook_url', user.cloud_webhook_url):
+            vals['cloud_webhook_secret'] = False
+            vals['cloud_webhook_url'] = False
+        user.sudo().write(vals)
+        return {'ok': True}
+
+    @http.route('/cloud/telegram_detect_chat_id', type='jsonrpc', auth='user',
+                methods=['POST'])
+    def telegram_detect_chat_id(self, bot_token=None):
+        """Poll the user's Telegram bot for the most recent chat_id.
+
+        Calls ``getUpdates`` and returns the chat_id of the last
+        message the bot received. The user must send at least one
+        message to their bot first.
+
+        :param bot_token: a token typed in the preferences and not saved
+            yet; without one, the stored token is used. The preferences
+            save a token only with a chat ID, so the one being set up
+            comes here instead of being saved first.
+        """
+        refused = _telegram_refused()
+        if refused:
+            return refused
+        token = _typed_or_stored(
+            bot_token, request.env.user._get_cloud_telegram_bot_token,
+        )
+        if not token:
+            return {'ok': False, 'error': 'No Telegram bot token configured'}
+        if len(token) > _MAX_USER_SECRET_CHARS:
+            return {'ok': False, 'error': _(
+                'The Telegram bot token can be %(max)s characters at most.',
+                max=_MAX_USER_SECRET_CHARS,
+            )}
+        url = f"https://api.telegram.org/bot{token}/getUpdates"
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 — only Telegram API (HTTPS)
+                data = json.loads(resp.read())
+        except Exception as exc:
+            _logger.warning(
+                'telegram getUpdates failed: %s', _without_token(exc, token),
+            )
+            return {'ok': False, 'error': 'Failed to contact Telegram API'}
+        if not data.get('ok'):
+            return {'ok': False, 'error': data.get('description', 'Unknown error')}
+        updates = data.get('result', [])
+        if not updates:
+            return {'ok': False, 'error': 'No messages received yet. Send any message to your bot first.'}
+        last = updates[-1]
+        chat = (last.get('message', {})
+                .get('chat', {}))
+        chat_id = chat.get('id') or (last.get('channel_post', {})
+                                     .get('chat', {})
+                                     .get('id'))
+        if not chat_id:
+            return {'ok': False, 'error': 'Could not determine chat ID from latest update'}
+        return {'ok': True, 'chat_id': str(chat_id)}
+
+    @http.route('/cloud/telegram_send_test', type='jsonrpc', auth='user',
+                methods=['POST'])
+    def telegram_send_test(self, bot_token=None, chat_id=None):
+        """Send a test message to the user's Telegram chat.
+
+        :param bot_token: a token typed in the preferences and not saved
+            yet; without one, the stored token is used
+        :param chat_id: the chat ID in the preferences, saved or not;
+            without one, the stored chat ID is used
+        """
+        refused = _telegram_refused()
+        if refused:
+            return refused
+        user = request.env.user
+        token = _typed_or_stored(bot_token, user._get_cloud_telegram_bot_token)
+        if isinstance(chat_id, str):
+            chat_id = chat_id.strip()
+        else:
+            chat_id = user.cloud_telegram_chat_id
+        if not token:
+            return {'ok': False, 'error': 'No Telegram bot token configured'}
+        if len(token) > _MAX_USER_SECRET_CHARS:
+            return {'ok': False, 'error': _(
+                'The Telegram bot token can be %(max)s characters at most.',
+                max=_MAX_USER_SECRET_CHARS,
+            )}
+        if not chat_id:
+            return {'ok': False, 'error': 'No Telegram chat ID configured'}
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = json.dumps({
+            'chat_id': chat_id,
+            'text': '\U0001F7E2 IncubaCloud test notification — your Telegram integration is working.',
+            'parse_mode': 'Markdown',
+        }).encode()
+        try:
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={'Content-Type': 'application/json'},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 — only Telegram API (HTTPS)
+                data = json.loads(resp.read())
+        except Exception as exc:
+            _logger.warning(
+                'telegram sendTest failed: %s', _without_token(exc, token),
+            )
+            return {'ok': False, 'error': 'Failed to contact Telegram API'}
+        if not data.get('ok'):
+            return {'ok': False, 'error': data.get('description', 'Unknown error')}
+        return {'ok': True}

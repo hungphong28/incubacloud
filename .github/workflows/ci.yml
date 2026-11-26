@@ -1,0 +1,629 @@
+name: CI
+
+on:
+  push:
+    branches: ["19.0"]
+  pull_request:
+    branches: ["19.0"]
+  # A run lost to an Actions outage cannot be recovered: GitHub keeps
+  # reporting it queued while cancel, rerun and force-cancel all refuse
+  # it as already completed. Without a manual trigger the only way back
+  # to a green check for that commit is pushing another one.
+  workflow_dispatch:
+
+# CN-010: Deny all permissions by default; grant read-only per job.
+# This prevents a compromised step from using GITHUB_TOKEN to push code.
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # queue_job as production runs it (19.0.2.1.6), the commit repos.yaml
+  # pins: the head of OCA's 19.0 moves under a release otherwise.
+  OCA_QUEUE_REF: da2664795eb525698f93dfdd63f6ba5c4c9fccba
+
+jobs:
+  lint:
+    name: Lint (refurb)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      # CN-009: Pinned to commit SHA to prevent mutable-tag supply-chain attacks.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install refurb
+        run: pip install refurb
+
+      - name: Run refurb
+        # Exclude ``migrations/`` — refurb uses mypy internally and two
+        # ``post-migrate.py`` files in sibling version dirs trigger a
+        # "Duplicate module named" error. Skipping them from the style
+        # linter is safe: their *behaviour* is exercised by the
+        # ``upgrade`` job below, which installs the base-ref version and
+        # runs ``-u`` with the new code so pre/post-migrate scripts
+        # actually execute.
+        run: |
+          find incubacloud incubacloud_connect incubacloud_pitr incubacloud_mcp incubacloud_mcp_pitr incubacloud_assistant \
+            -name '*.py' -not -path '*/migrations/*' -print0 \
+            | xargs -0 --no-run-if-empty refurb
+
+      - name: Translation entries name their module
+        # Odoo reads the module of each entry from its ``#. module:``
+        # comment; polib appends entries without it, and updating the
+        # module with Spanish loaded then fails on a None module
+        # (13-nov-2026). No coverage check notices it.
+        run: python3 .github/scripts/check_po_module_line.py .
+
+      - name: No migration above its module's version
+        # Odoo runs a migrations/<version>/ folder only if it is at most
+        # the manifest version; a higher one is never run and nothing
+        # reports it.
+        run: python3 .github/scripts/check_migration_versions.py .
+
+      - name: Mock-spec ratchet
+        # Decision log P18.3: test doubles stand in for real APIs, so
+        # they must be built as ``MagicMock(spec=RealClass)`` — a bare
+        # ``MagicMock()`` answers yes to everything and once shipped a
+        # fake method to production. Blanket-banning would flag the
+        # historical debt at once, so this is a RATCHET: the count may
+        # only go down. Fixed a few? Lower the baseline in this step.
+        run: |
+          count=$(grep -rEo 'MagicMock\(\)' --include='test_*.py' \
+            incubacloud incubacloud_connect incubacloud_pitr incubacloud_mcp incubacloud_mcp_pitr incubacloud_assistant | wc -l)
+          baseline=30
+          echo "bare MagicMock() in tests: $count (baseline: $baseline)"
+          if [ "$count" -gt "$baseline" ]; then
+            echo "::error::A new bare MagicMock() was added. Use MagicMock(spec=RealClass) — see CONTRIBUTING 'Test rules'."
+            exit 1
+          fi
+
+      - name: Every test class runs
+        # Odoo's runner collects BaseCase classes only: one based on
+        # unittest.TestCase directly never runs, and 63 tests sat
+        # unseen that way until 20-oct-2026, 13 of them broken.
+        run: |
+          found=$(grep -rnE '^class \w+\((unittest\.)?TestCase\)' --include='test_*.py' \
+            incubacloud incubacloud_connect incubacloud_pitr incubacloud_mcp incubacloud_mcp_pitr incubacloud_assistant || true)
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::A test class based on unittest.TestCase never runs under Odoo: base it on BaseCase."
+            exit 1
+          fi
+
+  js-syntax:
+    name: Lint (JS syntax)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      # CN-009: Pinned to commit SHA to prevent mutable-tag supply-chain attacks.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Parse every front-end file as an ES module
+        # The panel's JS is bundled by Odoo at runtime, not built here,
+        # so a syntax error surfaces as a blank page with one console
+        # message -- after deployment, with nothing before it failing.
+        # A stray comma between two class methods (valid inside an
+        # object literal, not inside a class body) reached production
+        # exactly that way. Node's parser is the cheapest thing that
+        # would have caught it, and it needs no toolchain: --input-type
+        # is what makes it read `import` as a module rather than a
+        # script, which is the check that was missing.
+        run: |
+          set -euo pipefail
+          failed=0
+          while IFS= read -r -d '' file; do
+            if ! node --input-type=module --check < "$file"; then
+              echo "::error file=$file::does not parse as an ES module"
+              failed=1
+            fi
+          done < <(find . -path ./node_modules -prune -o -name '*.js' -print0)
+          exit "$failed"
+
+  relay-oauth:
+    name: relay-oauth renewer (pytest)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      # CN-009: Pinned to commit SHA to prevent mutable-tag supply-chain attacks.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.13"
+
+      # Here too, not only in relay-oauth-image.yml (which runs when
+      # images/relay-oauth/ changes): one of these tests holds the image's
+      # docker-mailserver to SMTP_RELAY_IMAGE, so moving that constant
+      # without the image fails the build.
+      - name: Run the image's tests
+        run: |
+          pip install --require-hashes -r images/relay-oauth/tests/requirements.txt
+          python -m pytest -p no:cacheprovider images/relay-oauth/tests
+
+  test:
+    name: Tests
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    # CN-011: Pinned to digest to prevent silent image changes.
+    # Update intentionally: docker pull ghcr.io/oca/oca-ci/py3.10-odoo19.0:latest
+    #   then: docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/oca/oca-ci/py3.10-odoo19.0:latest
+    #
+    # Known gap vs runtime: prod/devel run Python 3.12 (Doodba's
+    # 19.0-onbuild image). OCA does not publish a py3.12 variant for
+    # Odoo 19.0 — their build matrix (OCA/oca-ci/.github/workflows/ci.yaml)
+    # tops out at py3.10 for this Odoo version. This is outside our
+    # control; revisit once OCA adds a py3.12-odoo19.0 image.
+    container: ghcr.io/oca/oca-ci/py3.10-odoo19.0@sha256:9147149654ace4f05a16a4b76772a9f5e4021932291fdffcc8918a13ae80446c
+
+    services:
+      postgres:
+        # Match production (postgres-autoconf:18, see common.yaml DB_VERSION).
+        image: postgres:18
+        env:
+          POSTGRES_DB: test_odoo
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PGHOST: postgres
+      PGUSER: odoo
+      PGPASSWORD: odoo
+      PGDATABASE: test_odoo
+      ADDONS_DIR: .
+      # Any Fernet key works for tests — the module refuses to boot
+      # without one, and rotation is exercised by unit tests that set
+      # their own keys explicitly.
+      INCUBACLOUD_SECRET_KEY: ezzIy8RZ5rO9PBHSLpy4PdRW7nUCewcz7JTEDlzTWUI=
+
+    steps:
+      # CN-009: Pinned to commit SHA to prevent mutable-tag supply-chain attacks.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # OpenSSH's own tools: the host-key tests check the panel's
+      # fingerprint and known_hosts entry against what ssh-keygen says,
+      # and fail without it rather than skip (the image has none). And
+      # sshpass, as the panel's image has it: without it the panel
+      # refuses hosts that log in with a password, which many tests make.
+      - name: Install OpenSSH's client (ssh-keygen) and sshpass
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends openssh-client sshpass
+
+      - name: Install extra dependencies
+        # CN-012/CN-020/CN-026: Exact pins match requirements.txt — reproducible CI.
+        #
+        # The OCA CI image ships a stack frozen around cryptography 3.x
+        # and pyOpenSSL 24.x with urllib3 1.26.5. ``asyncssh==2.22``
+        # requires cryptography>=39, which pip resolves to 46.x (bundling
+        # OpenSSL 3.0). Three downstream breaks result:
+        #   1. pyOpenSSL 24 calls ``_lib.OpenSSL_add_all_algorithms`` →
+        #      not in OpenSSL 3.0 → fixed by ``pyopenssl>=25.3``.
+        #   2. pyOpenSSL 24 references ``_lib.X509_V_FLAG_NOTIFY_POLICY``
+        #      → removed → same upgrade fixes it.
+        #   3. urllib3 1.26's ``contrib.pyopenssl`` imports
+        #      ``cryptography.hazmat.backends.openssl.x509._Certificate``
+        #      → moved → upgrading urllib3 to 2.x uses the new
+        #      ``cryptography import x509`` path.
+        #
+        # Bumping all three in-place lines CI up with what the runtime
+        # doodba image pins (requirements.txt, audited by pip-audit).
+        #
+        # requests goes with urllib3: the image's 2.25.1 wants urllib3
+        # 1.x, and with 2.x it cannot send a chunked body at all
+        # (``getresponse(buffering=True)`` → ``ResponseNotReady``). Both
+        # are requirements.txt's, which every Doodba 19 instance built
+        # with this repository installs over Odoo's own pins.
+        #
+        # openupgradelib: transitive dependency of OCA ``queue_job``,
+        # which now declares it in ``external_dependencies``. Without it
+        # ``oca_init_test_database`` fails to install queue_job. Not
+        # pinned/audited — pip-audit excludes it (git URL in pip.txt)
+        # and it never executes in our tests.
+        run: pip install --upgrade 'asyncssh==2.24.0' 'boto3==1.42.91' 'PyYAML==6.0.3' 'bcrypt==5.0.0' 'pyopenssl>=25.3' 'urllib3==2.8.0' 'requests==2.34.2' 'openupgradelib' 'joserfc==1.7.7' 'packaging==26.3'
+
+      - name: Fetch OCA dependencies
+        run: |
+          git init -q /opt/odoo/addons-oca/queue
+          git -C /opt/odoo/addons-oca/queue fetch -q --depth 1 \
+            https://github.com/OCA/queue.git "$OCA_QUEUE_REF"
+          git -C /opt/odoo/addons-oca/queue checkout -q FETCH_HEAD
+          ln -s /opt/odoo/addons-oca/queue/queue_job /opt/odoo/addons/queue_job
+
+      - name: Install addons
+        run: oca_install_addons
+
+      - name: Initialize test database
+        run: oca_init_test_database
+
+      - name: Run tests
+        run: oca_run_tests
+
+  upgrade:
+    name: Test (upgrade path)
+    # The test job installs CLEAN, so migration scripts never execute
+    # there — yet the module ships *mandatory* pre-migrates (1.0.13,
+    # 1.0.17…) without which existing databases fail to boot. This job
+    # installs the addons at the push/PR BASE revision, then switches
+    # the working tree to the new code and runs ``-u``, which is the
+    # exact path a real deployment takes.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    container: ghcr.io/oca/oca-ci/py3.10-odoo19.0@sha256:9147149654ace4f05a16a4b76772a9f5e4021932291fdffcc8918a13ae80446c
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: test_odoo
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PGHOST: postgres
+      PGUSER: odoo
+      PGPASSWORD: odoo
+      PGDATABASE: test_odoo
+      ADDONS_DIR: .
+      INCUBACLOUD_SECRET_KEY: ezzIy8RZ5rO9PBHSLpy4PdRW7nUCewcz7JTEDlzTWUI=
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          # Full history: this job needs to check out the BASE revision.
+          fetch-depth: 0
+
+      - name: Resolve base revision
+        id: base
+        # PR → the target branch tip; push → the previous tip. A manual
+        # run (workflow_dispatch) and a branch's first push name none:
+        # the parent commit stands in, the step a push would have taken.
+        # Never skipped: green here means the upgrade really ran.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base" 2>/dev/null; then
+            base="$(git rev-parse --verify --quiet HEAD^ || true)"
+            echo "No previous tip: upgrading from the parent commit ($base)."
+          fi
+          if [ -z "$base" ]; then
+            echo "::error::No revision to upgrade from: this is the first commit."
+            exit 1
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Install extra dependencies
+        # Same pins as the test job (see rationale there).
+        run: pip install --upgrade 'asyncssh==2.24.0' 'boto3==1.42.91' 'PyYAML==6.0.3' 'bcrypt==5.0.0' 'pyopenssl>=25.3' 'urllib3==2.8.0' 'requests==2.34.2' 'openupgradelib' 'joserfc==1.7.7' 'packaging==26.3'
+
+      - name: Fetch OCA dependencies
+        run: |
+          git init -q /opt/odoo/addons-oca/queue
+          git -C /opt/odoo/addons-oca/queue fetch -q --depth 1 \
+            https://github.com/OCA/queue.git "$OCA_QUEUE_REF"
+          git -C /opt/odoo/addons-oca/queue checkout -q FETCH_HEAD
+          ln -s /opt/odoo/addons-oca/queue/queue_job /opt/odoo/addons/queue_job
+
+      - name: Install addons at the BASE revision
+        # POSIX sh on purpose: this container ships no bash, so GitHub
+        # runs the step with ``sh -e``. No ``pipefail``, no ``${var//,/ }``.
+        run: |
+          git checkout -f "${{ steps.base.outputs.base }}"
+          oca_install_addons
+          # ``oca_init_test_database`` installs the addons' DEPENDENCIES
+          # (``manifestoo list-depends``) and nothing else, so the addons
+          # under test stay uninstalled. Without the explicit ``-i`` below
+          # the ``-u`` step finds nothing installed to upgrade, skips every
+          # migration and still exits 0 -- which is what this job did from
+          # the day it was written until 2026-08-21.
+          oca_init_test_database
+          # Discovered rather than hardcoded so that adding an addon does
+          # not silently drop it out of the upgrade exercise.
+          addons=$(
+            for dir in */; do
+              if [ -f "${dir}__manifest__.py" ]; then printf '%s\n' "${dir%/}"; fi
+            done | sort | tr '\n' ',' | sed 's/,$//'
+          )
+          echo "Installing at the base revision: $addons"
+          echo "$addons" > /tmp/base-addons.txt
+          odoo -d "$PGDATABASE" -i "$addons" \
+            --stop-after-init --workers=0 --max-cron-threads=0
+
+      - name: Upgrade to the new code
+        # ``-u`` against the database installed above runs every
+        # pre/post-migrate between the two revisions — red here means a
+        # real deployment would have failed to boot.
+        run: |
+          git checkout -f "$GITHUB_SHA"
+          addons=$(cat /tmp/base-addons.txt)
+          echo "Upgrading: $addons"
+          # Redirected rather than piped into ``tee``: this shell has no
+          # ``pipefail``, so the pipe would report the exit status of
+          # ``tee`` and a failed upgrade would read as a pass.
+          if ! odoo -d "$PGDATABASE" -u "$addons" \
+              --stop-after-init --workers=0 --max-cron-threads=0 \
+              > /tmp/upgrade.log 2>&1; then
+            cat /tmp/upgrade.log
+            exit 1
+          fi
+          cat /tmp/upgrade.log
+          # Odoo logs "Loading module X" at INFO only when X is actually
+          # being installed or upgraded, and at DEBUG when it is merely
+          # loaded (odoo/modules/loading.py). Its absence therefore proves
+          # the upgrade was a no-op and the migrations never ran, which is
+          # a silent pass -- exactly the failure this job is meant to catch.
+          missing=""
+          for addon in $(echo "$addons" | tr ',' ' '); do
+            if ! grep -q "Loading module $addon " /tmp/upgrade.log; then
+              missing="$missing $addon"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Not upgraded, so their migrations never ran:$missing"
+            exit 1
+          fi
+
+  shellcheck:
+    name: Lint (shellcheck)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # Pinned release tarball rather than the runner's preinstalled
+      # copy (whose version drifts) — same approach as gitleaks below.
+      - name: Install shellcheck
+        run: |
+          curl -fsSL \
+            https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz \
+            -o /tmp/shellcheck.tar.xz
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp shellcheck-v0.10.0/shellcheck
+          sudo install -m 0755 /tmp/shellcheck-v0.10.0/shellcheck /usr/local/bin/shellcheck
+
+      # The versioned scripts under ``incubacloud/scripts/`` are what
+      # executors upload and run on customer hosts (see
+      # AbstractExecutor.run_script) — they get linted like any other
+      # source file.
+      # ``-x`` follows the ``source=`` directives so the shared library
+      # is analysed together with the script that sources it.
+      - name: Run shellcheck
+        run: |
+          find incubacloud incubacloud_connect incubacloud_pitr -name '*.sh' -print0 \
+            | xargs -0 --no-run-if-empty shellcheck -x
+
+  bats:
+    name: Shell tests (bats)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install bats
+        run: |
+          curl -fsSL \
+            https://github.com/bats-core/bats-core/archive/refs/tags/v1.11.1.tar.gz \
+            -o /tmp/bats.tar.gz
+          tar -xzf /tmp/bats.tar.gz -C /tmp
+          sudo /tmp/bats-core-1.11.1/install.sh /usr/local
+
+      # export_starts.bats renders the doodba template, as a host's deploy
+      # does with the copier it installs through pipx (full_setup_install.sh).
+      - name: Install copier
+        run: pipx install copier==9.11.0
+
+      - name: Run bats
+        run: bats incubacloud/tests/shell incubacloud_pitr/tests/shell
+
+  firewall:
+    name: Firewall ruleset (nft -c, every supported OS)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    # The hardening playbook writes one nftables ruleset for every OS its
+    # preflight admits, and each of those ships a different nft. A rule a
+    # newer release accepts can be refused by an older one -- the
+    # fleet's 1.0.2 rejected a ruleset a lab on 1.1.6 had passed
+    # (2026-09-29) -- so every variant the template can render is parsed
+    # by the nft of each supported OS, in that OS's own container. Add
+    # the container here when the preflight's list grows.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04", "debian:12", "debian:13"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Render every variant of the ruleset
+        run: |
+          pip install --quiet 'PyYAML>=6' 'Jinja2>=3'
+          python incubacloud/tests/shell/render_firewall_ruleset.py /tmp/rulesets
+
+      - name: Parse them with this OS's nft
+        run: |
+          docker run --rm --cap-add NET_ADMIN -v /tmp/rulesets:/r:ro "${{ matrix.os }}" sh -euc '
+            apt-get update -qq >/dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables >/dev/null
+            nft --version
+            for f in /r/*.nft; do echo "== $f"; nft -c -f "$f"; done'
+
+  connect-old-python:
+    name: incubacloud_connect compiles (Python 2.7, 3.5)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    # doodba compiles every addon of the image with the series' own
+    # Python: 2.7 on 7.0 to 10.0, 3.5 on 11.0 and 12.0, and one syntax
+    # error stops the image from building. The test job runs 3.10, so
+    # what a deploy ships of incubacloud_connect is compiled here by each
+    # in its official image (QA of the series, 7-nov-2026).
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["python:2.7-slim", "python:3.5-slim"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Compile the module with this Python
+        run: |
+          docker run --rm -v "$PWD:/src:ro" "${{ matrix.python }}" \
+            python /src/incubacloud/tests/shell/compile_connect_module.py \
+            /src/incubacloud_connect
+
+  ansible-lint:
+    name: Lint (ansible-lint)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.12"
+
+      # Pinned to the same ansible-core the panel image ships
+      # (dependencies/pip.txt) so the linter judges the playbooks
+      # against the version that will actually run them.
+      - name: Install ansible-lint
+        run: pip install 'ansible-core==2.21.2' 'ansible-lint==26.6.0'
+
+      - name: Run ansible-lint
+        run: ansible-lint incubacloud/ansible
+
+  ansible-noshm:
+    name: Ansible without /dev/shm (pytest)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.12"
+
+      # The Odoo suite cannot run these: the CI's Odoo image has Python
+      # 3.10, below what ansible-core 2.21 runs on, and no Ansible. Here
+      # the launcher runs playbooks with the ansible-core and
+      # ansible-runner pinned in requirements.txt, which this step
+      # installs from it, on a /dev/shm that a sitecustomize simulates as
+      # read-only (sem_open and shm_open raise EROFS), and the tripwire
+      # compares what they use of multiprocessing with the versions
+      # reviewed. The tests also assert that the installed versions are
+      # requirements.txt's pins.
+      - name: Install ansible-core, ansible-runner and pytest
+        run: |
+          grep -E '^(ansible-core|ansible-runner)==' requirements.txt > ansible-pins.txt
+          pip install -r ansible-pins.txt 'pytest==9.1.1'
+
+      - name: Run the launcher's tests
+        run: python -m pytest -p no:cacheprovider tests/ansible_noshm
+
+  bandit:
+    name: Security (bandit)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      # CN-009: Pinned to commit SHA to prevent mutable-tag supply-chain attacks.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install bandit
+        run: pip install 'bandit==1.8.6'
+
+      # ``-ll -iii`` = medium+ severity, high confidence. Drops the
+      # long tail of low-severity guesses (``assert`` in tests,
+      # ``random`` used for non-crypto, etc.) that bandit flags by
+      # default and that have no security impact in this codebase.
+      - name: Run bandit
+        run: bandit -r incubacloud/ incubacloud_connect/ incubacloud_pitr/ incubacloud_mcp/ incubacloud_mcp_pitr/ incubacloud_assistant/ -ll -iii
+
+  pip-audit:
+    name: Deps audit (pip-audit)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pip-audit
+        run: pip install 'pip-audit==2.9.0'
+
+      # ``--strict`` makes pip-audit fail on ANY finding; the CI
+      # becomes the gate. ``requirements-ci.txt`` mirrors pip.txt
+      # (minus the openupgradelib git URL, which pip-audit cannot
+      # resolve against PyPI).
+      - name: Run pip-audit
+        run: pip-audit --strict -r requirements-ci.txt
+
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          # gitleaks scans history, not just the working tree, so we
+          # need the full commit graph. The shallow default (depth=1)
+          # would hide any secret committed in the past and only
+          # detect re-introductions.
+          fetch-depth: 0
+
+      # CN-009: Using the upstream CLI release instead of the v2 Action,
+      # which requires a paid license key for organization-owned repos
+      # (https://github.com/gitleaks/gitleaks-action#-announcement).
+      # The CLI itself stays MIT-licensed. Pinned to a known-good tag.
+      - name: Install gitleaks
+        run: |
+          curl -fsSL \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+            -o /tmp/gitleaks.tgz
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+
+      - name: Run gitleaks
+        # ``detect`` scans the working tree + the whole history available
+        # under .git; ``--redact`` keeps the logs safe even if a finding
+        # lands in the annotations UI.
+        run: gitleaks detect --source . --redact --verbose

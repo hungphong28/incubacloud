@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+<t t-name="incubacloud_mcp.McpSettingsTab">
+    <div class="ic-mcp-settings">
+        <t t-if="state.loading or state.loadError">
+            <t t-call="incubacloud.SettingsLoadState"/>
+        </t>
+        <t t-else="">
+            <SettingsBlock title.translate="Connection"
+                           how.translate="Without an issuer, agents connect with API keys only. With one, the panel accepts its tokens for the users linked to an enabled OAuth provider with the same issuer.">
+                <p t-if="view.readonly" class="ic-set-block__body ic-set-note">On this panel the platform sets both.</p>
+                <p t-if="conflictNotice" class="ic-set-block__body ic-set-note ic-mcp-conflict" role="status" t-esc="conflictNotice"/>
+                <SettingField id="'mcp_oauth_issuer'" form="state.form" readonly="view.readonly"/>
+                <SettingField id="'mcp_resource'" form="state.form" readonly="view.readonly"/>
+            </SettingsBlock>
+
+            <McpAutoApproval/>
+        </t>
+    </div>
+</t>
+
+</templates>

@@ -1,0 +1,110 @@
+<templates>
+
+    <t t-name="incubacloud.BackupBackendsList">
+        <div class="rl-page ic-backups-dashboard">
+
+            <!-- Header -->
+            <div class="rl-phead">
+                <div class="rl-htext">
+                    <h1 class="rl-ptitle">Backup Destinations</h1>
+                    <p class="rl-psub">
+                        <t t-esc="state.total"/> destination<t t-if="state.total !== 1">s</t>
+                    </p>
+                </div>
+                <div class="rl-pactions">
+                    <button class="rl-btn rl-btn-primary" t-on-click="newBackend">
+                        <t t-out="env.icon('plus', 15)"/> New Backend
+                    </button>
+                </div>
+            </div>
+
+
+            <TruncationBanner truncated="state.truncated"
+                              total="state.total"
+                              limit="state.limit"
+                              label="'backup backends'"/>
+
+            <!-- Loading -->
+            <t t-if="state.loading">
+                <div class="ic-detail-loading">Loading…</div>
+            </t>
+
+            <!-- Empty state -->
+            <t t-elif="state.visible_backends.length === 0">
+                <div class="rl-stub">
+                    <span class="rl-si"><t t-out="env.icon('shield', 46)"/></span>
+                    <h3>No backup destinations configured</h3>
+                    <p>Set up an S3-compatible or SFTP destination to enable automated backups for your instances.</p>
+                </div>
+            </t>
+
+            <!-- Grid of backend cards -->
+            <t t-else="">
+                <div class="rl-grid rl-grid-2 ic-backups-grid">
+                    <t t-foreach="state.visible_backends" t-as="b" t-key="b.id">
+                        <div class="rl-card rl-card-pad ic-backend-card click"
+                             t-on-click="() => this.openBackend(b.id)">
+
+                            <!-- Header: name + type badge -->
+                            <div class="ic-backend-card-head">
+                                <span class="rl-rname" t-esc="b.name"/>
+                                <span class="rl-rspacer"/>
+                                <span class="rl-sb active">
+                                    <span class="rl-d"/><t t-esc="b.backend_type === 'sftp' ? 'SFTP' : 'S3'"/>
+                                </span>
+                            </div>
+
+                            <!-- Destination chip -->
+                            <t t-if="b.backup_dst">
+                                <div class="rl-rmeta rl-mono ic-backend-card-dst">
+                                    <code t-esc="b.backup_dst"/>
+                                </div>
+                            </t>
+
+                            <!-- Usage bar (only with a quota) -->
+                            <t t-if="b.quota_gb &gt; 0">
+                                <div class="rl-mbar">
+                                    <div class="rl-mbar-top">
+                                        <span>Usage</span>
+                                        <span><t t-esc="usageExtraOf(b)"/></span>
+                                    </div>
+                                    <div class="rl-mbar-track">
+                                        <div t-att-class="'rl-mbar-fill ' + mbarClassOf(b)"
+                                             t-att-style="'width:' + usagePctOf(b) + '%'"/>
+                                    </div>
+                                    <div class="ic-mbar-extra">
+                                        <t t-out="usagePctOf(b).toFixed(0)"/>%
+                                    </div>
+                                </div>
+                            </t>
+                            <t t-else="">
+                                <div class="ic-metrics-placeholder">
+                                    <t t-if="b.last_measured_gb &gt; 0">
+                                        <t t-out="b.last_measured_gb.toFixed(2)"/> GB used — set a quota to track %
+                                    </t>
+                                    <t t-else="">
+                                        No usage measured yet
+                                    </t>
+                                </div>
+                            </t>
+
+                            <!-- Instance count -->
+                            <div class="rl-rmeta ic-backend-card-foot">
+                                <t t-esc="b.instance_count"/> instance<t t-if="b.instance_count !== 1">s</t>
+                            </div>
+
+                        </div>
+                    </t>
+                </div>
+            </t>
+
+            <t t-if="state.error">
+                <div class="ic-detail-error-state" role="alert">
+                    <p t-esc="state.error"/>
+                </div>
+            </t>
+
+        </div>
+    </t>
+
+</templates>

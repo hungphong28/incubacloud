@@ -1,0 +1,1037 @@
+"""Tests for ``cloud.instance.refresh_from_production`` and the two
+executor changes it rides on.
+
+The feature adds no executor and no job type: it is the tail of the
+``clone_to_staging`` chain (``backup_download`` on production →
+``restore_instance`` on the staging) without the deploy step. So what is
+worth pinning here is the wiring:
+
+  * the chain shape — codes, hosts per step, exact payloads;
+  * the validations that keep data flowing production → staging only;
+  * the degradation from ``'backup'`` to ``'live'`` when the source has
+    no backup backend;
+  * that ``backup_download`` now takes the live path on production when
+    asked, without disturbing the duplicity path;
+  * that ``restore_instance`` passes ``--neutralize`` and resets the base
+    URL only when told to — and that the host move, which shares the same
+    executor, still does neither;
+  * that a neutralized staging drops the placeholder mail server, so its
+    mail reaches the stack's MailHog, and that a production never does.
+
+The SSH executors themselves are mocked away; the shell they invoke is
+covered by ``tests/shell/restore.bats``.
+"""
+
+import shlex
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from odoo.exceptions import AccessError, UserError
+from odoo.tests.common import BaseCase, TransactionCase
+
+from ..models.transport import CommandResult, SSHTransport
+from .test_cloud_job import _run_after_commit
+from .test_cloud_security import CloudSecurityBase
+
+INSTANCE_DIR = "~/projects/demo-inst"
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _argv(step):
+    """Return a script step's invocation as an argv list.
+
+    The script's environment (``NAME=value`` words ``run_script`` puts
+    before ``bash``) is left out.
+    """
+    argv = shlex.split(step[1])
+    while argv and "=" in argv[0] and argv[0].split("=", 1)[0].isidentifier():
+        argv.pop(0)
+    return argv
+
+
+def _find(cmds, label):
+    return next((c for c in cmds if c[0] == label), None)
+
+
+def _make_restore_executor(payload, domain="staging.example.com",
+                           dbname="prod", pg_user="odoo",
+                           environment="staging", auto_update=True):
+    from odoo.addons.incubacloud.models.restore_instance_executor import (
+        RestoreInstanceExecutor,
+    )
+
+    inst = SimpleNamespace(
+        id=7,
+        name="demo-inst",
+        odoo_version="19.0",
+        domain=domain,
+        postgres_dbname=dbname,
+        postgres_username=pg_user,
+        environment=environment,
+        auto_update=auto_update,
+        # Still to be checked: every restore checks its admin password.
+        admin_password_state=False,
+        admin_password_checked_at=False,
+    )
+    job = SimpleNamespace(id=42, instance_id=inst, payload=payload)
+
+    ex = object.__new__(RestoreInstanceExecutor)
+    ex.job = job
+    ex._inst_dir = lambda i: INSTANCE_DIR
+    ex._scripts_requested = False
+    ex._script_overlay_cache = None
+    return ex
+
+
+def _make_download_executor(environment="production", time="latest",
+                            mode="all"):
+    from odoo.addons.incubacloud.models.backup_download_executor import (
+        BackupDownloadExecutor,
+    )
+
+    inst = SimpleNamespace(
+        id=7,
+        name="demo-inst",
+        odoo_version="19.0",
+        environment=environment,
+        postgres_dbname="prod",
+    )
+    job = SimpleNamespace(
+        id=42,
+        instance_id=inst,
+        payload={"time": time, "download_type": mode},
+    )
+
+    ex = object.__new__(BackupDownloadExecutor)
+    ex.job = job
+    ex._inst_dir = lambda i: INSTANCE_DIR
+    ex._scripts_requested = False
+    ex._script_overlay_cache = None
+    return ex
+
+
+# ── Orchestration ────────────────────────────────────────────────────────────
+
+
+class TestRefreshFromProduction(TransactionCase):
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.env["cloud.project"].create({"name": "refresh-proj"})
+        self.other_project = self.env["cloud.project"].create({"name": "other"})
+        self.host_a = self.env["cloud.host"].create({
+            "name": "host-a", "ip_address": "10.0.0.1", "port": 22,
+            "user": "root", "login_type": "ssh_key",
+            "wildcard_domain": "a.example.com",
+            "status": "compatible", "traefik_deployed": True,
+        })
+        self.host_b = self.env["cloud.host"].create({
+            "name": "host-b", "ip_address": "10.0.0.2", "port": 22,
+            "user": "root", "login_type": "ssh_key",
+            "wildcard_domain": "b.example.com",
+            "status": "compatible", "traefik_deployed": True,
+        })
+        self.backend = self.env["cloud.backup.backend"].create({
+            "name": "refresh-bb",
+            "backend_type": "s3",
+            "s3_bucket": "refresh-bucket",
+        })
+        self.prod = self.env["cloud.instance"].create({
+            "name": "prod-inst", "project_id": self.project.id,
+            "environment": "production", "host_id": self.host_a.id,
+            "state": "deployed", "backup_backend_id": self.backend.id,
+        })
+        self.staging = self.env["cloud.instance"].create({
+            "name": "staging-inst", "project_id": self.project.id,
+            "environment": "staging", "host_id": self.host_a.id,
+            "state": "deployed",
+        })
+
+    def _patch_chain(self):
+        return patch.object(
+            type(self.env["cloud.job"]), "enqueue_chain",
+            return_value=[11, 12],
+        )
+
+    # ── Chain shape ────────────────────────────────────────────────────
+
+    def test_chain_is_download_then_restore(self):
+        with self._patch_chain() as m:
+            res = self.staging.refresh_from_production(self.prod.id)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["job_ids"], [11, 12])
+        steps = m.call_args[0][0]
+        self.assertEqual(
+            [s["job_type_code"] for s in steps],
+            ["backup_download", "restore_instance"],
+        )
+
+    def test_download_runs_on_the_production_instance(self):
+        with self._patch_chain() as m:
+            self.staging.refresh_from_production(self.prod.id)
+        download = m.call_args[0][0][0]
+        self.assertEqual(download["instance_id"], self.prod.id)
+        self.assertEqual(download["host_id"], self.host_a.id)
+        self.assertEqual(
+            download["payload"],
+            {"time": "latest", "download_type": "all", "handoff": "host"},
+        )
+
+    def test_restore_runs_on_the_staging_instance(self):
+        with self._patch_chain() as m:
+            self.staging.refresh_from_production(self.prod.id)
+        restore = m.call_args[0][0][1]
+        self.assertEqual(restore["instance_id"], self.staging.id)
+        self.assertEqual(restore["host_id"], self.host_a.id)
+        self.assertEqual(
+            restore["payload"],
+            {
+                "mode": "from_host",
+                "source_job_id": "__chain_job_0__",
+                "neutralize": True,
+                "reset_base_url": True,
+                # Neutralized: production's secrets are cleared, so the
+                # staging keeps its own key (test_secret_key_escrow).
+                "share_secret_key": False,
+            },
+        )
+
+    def test_hosts_are_per_step_when_they_differ(self):
+        self.staging.host_id = self.host_b
+        with self._patch_chain() as m:
+            self.staging.refresh_from_production(self.prod.id)
+        steps = m.call_args[0][0]
+        self.assertEqual(steps[0]["host_id"], self.host_a.id)
+        self.assertEqual(steps[1]["host_id"], self.host_b.id)
+
+    def test_restore_references_the_download_job(self):
+        with self._patch_chain() as m:
+            self.staging.refresh_from_production(self.prod.id)
+        restore = m.call_args[0][0][1]
+        self.assertEqual(restore["payload"]["source_job_id"], "__chain_job_0__")
+
+    # ── Data source ────────────────────────────────────────────────────
+
+    def test_live_source_asks_for_a_live_dump(self):
+        with self._patch_chain() as m:
+            res = self.staging.refresh_from_production(
+                self.prod.id, source="live",
+            )
+        self.assertEqual(res["source"], "live")
+        self.assertEqual(m.call_args[0][0][0]["payload"]["time"], "live")
+
+    def test_backup_source_without_a_backend_degrades_to_live(self):
+        self.prod.backup_backend_id = False
+        self.env["ir.config_parameter"].sudo().set_param(
+            "incubacloud.backup_backend_id", "0",
+        )
+        self.prod.invalidate_recordset(["effective_backup_backend"])
+        self.assertFalse(self.prod.effective_backup_backend)
+        with self._patch_chain() as m:
+            res = self.staging.refresh_from_production(
+                self.prod.id, source="backup",
+            )
+        self.assertEqual(res["source"], "live")
+        self.assertEqual(m.call_args[0][0][0]["payload"]["time"], "live")
+
+    def test_backup_source_with_a_backend_stays_on_backup(self):
+        with self._patch_chain() as m:
+            res = self.staging.refresh_from_production(
+                self.prod.id, source="backup",
+            )
+        self.assertEqual(res["source"], "backup")
+        self.assertEqual(m.call_args[0][0][0]["payload"]["time"], "latest")
+
+    def test_unknown_source_is_refused(self):
+        with self.assertRaises(UserError):
+            self.staging.refresh_from_production(self.prod.id, source="rsync")
+
+    # ── Neutralize ─────────────────────────────────────────────────────
+
+    def test_neutralize_defaults_to_true(self):
+        with self._patch_chain() as m:
+            self.staging.refresh_from_production(self.prod.id)
+        self.assertTrue(m.call_args[0][0][1]["payload"]["neutralize"])
+
+    def test_neutralize_can_be_switched_off(self):
+        with self._patch_chain() as m:
+            self.staging.refresh_from_production(
+                self.prod.id, neutralize=False,
+            )
+        self.assertFalse(m.call_args[0][0][1]["payload"]["neutralize"])
+
+    # ── Validations ────────────────────────────────────────────────────
+
+    def test_a_production_cannot_be_refreshed(self):
+        # A project holds at most one production (exclusion constraint),
+        # so the second one lives in the other project. The environment
+        # check fires before the same-project one either way.
+        other_prod = self.env["cloud.instance"].create({
+            "name": "prod-two", "project_id": self.other_project.id,
+            "environment": "production", "host_id": self.host_a.id,
+            "state": "deployed",
+        })
+        with self.assertRaises(UserError):
+            other_prod.refresh_from_production(self.prod.id)
+
+    def test_target_must_be_deployed(self):
+        draft = self.env["cloud.instance"].create({
+            "name": "draft-inst", "project_id": self.project.id,
+            "environment": "staging", "host_id": self.host_a.id,
+        })
+        with self.assertRaises(UserError):
+            draft.refresh_from_production(self.prod.id)
+
+    def test_target_must_have_a_host(self):
+        self.staging.host_id = False
+        with self.assertRaises(UserError):
+            self.staging.refresh_from_production(self.prod.id)
+
+    def test_missing_source_is_refused(self):
+        with self.assertRaises(UserError):
+            self.staging.refresh_from_production(999999)
+
+    def test_source_must_be_production(self):
+        sibling = self.env["cloud.instance"].create({
+            "name": "sibling-staging", "project_id": self.project.id,
+            "environment": "staging", "host_id": self.host_a.id,
+            "state": "deployed",
+        })
+        with self.assertRaises(UserError):
+            self.staging.refresh_from_production(sibling.id)
+
+    def test_source_must_be_deployed(self):
+        # ``state`` is only writable through _transition(), and the only
+        # way off 'deployed' is via 'deleting'.
+        self.prod._transition("deleting")
+        self.prod._transition("draft")
+        self.assertFalse(self.prod.deployed)
+        with self.assertRaises(UserError):
+            self.staging.refresh_from_production(self.prod.id)
+
+    def test_source_must_have_a_host(self):
+        self.prod.host_id = False
+        with self.assertRaises(UserError):
+            self.staging.refresh_from_production(self.prod.id)
+
+    def test_cross_project_refresh_is_refused(self):
+        foreign = self.env["cloud.instance"].create({
+            "name": "foreign-prod", "project_id": self.other_project.id,
+            "environment": "production", "host_id": self.host_a.id,
+            "state": "deployed",
+        })
+        with self.assertRaises(UserError):
+            self.staging.refresh_from_production(foreign.id)
+
+    def test_a_running_job_makes_the_refresh_wait(self):
+        # Inherited from the staging's job queue: a smoke test, since
+        # cloud.job owns the behaviour.
+        self.registry_enter_test_mode()
+        job_type = self.env["cloud.job.type"].search(
+            [("code", "=", "deploy_instance")], limit=1,
+        )
+        job = self.env["cloud.job"].create({
+            "host_id": self.host_a.id,
+            "instance_id": self.staging.id,
+            "job_type_id": job_type.id,
+            "name": "Blocking job",
+            "state": "started",
+        })
+        result = self.staging.refresh_from_production(self.prod.id)
+        chain = self.env["cloud.job"].browse(result["job_ids"])
+        self.assertEqual(set(chain.mapped("state")), {"queued"})
+        job.write({"state": "done"})
+        _run_after_commit(self.env)
+        self.assertEqual(chain.mapped("state"), ["pending", "wait_dependencies"])
+
+
+# ── clone_to_staging now neutralizes ─────────────────────────────────────────
+
+
+class TestCloneNeutralizes(TransactionCase):
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.env["cloud.project"].create({"name": "clone-proj"})
+        self.host = self.env["cloud.host"].create({
+            "name": "clone-host", "ip_address": "10.0.0.3", "port": 22,
+            "user": "root", "login_type": "ssh_key",
+            "wildcard_domain": "c.example.com",
+            "status": "compatible", "traefik_deployed": True,
+        })
+        self.prod = self.env["cloud.instance"].create({
+            "name": "clone-prod", "project_id": self.project.id,
+            "environment": "production", "host_id": self.host.id,
+            "state": "deployed",
+        })
+
+    def test_clone_restore_step_neutralizes_and_resets_the_base_url(self):
+        with patch.object(
+            type(self.env["cloud.job"]), "enqueue_chain",
+            return_value=[1, 2, 3],
+        ) as m:
+            self.prod.clone_to_staging("clone-staging")
+        restore = m.call_args[0][0][2]
+        self.assertEqual(restore["job_type_code"], "restore_instance")
+        self.assertTrue(restore["payload"]["neutralize"])
+        self.assertTrue(restore["payload"]["reset_base_url"])
+
+    def test_clone_still_chains_deploy_download_restore(self):
+        with patch.object(
+            type(self.env["cloud.job"]), "enqueue_chain",
+            return_value=[1, 2, 3],
+        ) as m:
+            self.prod.clone_to_staging("clone-staging-2")
+        self.assertEqual(
+            [s["job_type_code"] for s in m.call_args[0][0]],
+            ["deploy_instance", "backup_download", "restore_instance"],
+        )
+
+    def test_clone_without_backend_takes_a_live_dump(self):
+        # Previously the download step hardcoded 'latest', so cloning a
+        # production with no backup destination failed mid-chain on the
+        # duplicity path, leaving the fresh staging deployed but empty.
+        self.env["ir.config_parameter"].sudo().set_param(
+            "incubacloud.backup_backend_id", "0",
+        )
+        self.prod.invalidate_recordset(["effective_backup_backend"])
+        self.assertFalse(self.prod.effective_backup_backend)
+        with patch.object(
+            type(self.env["cloud.job"]), "enqueue_chain",
+            return_value=[1, 2, 3],
+        ) as m:
+            self.prod.clone_to_staging("clone-live")
+        download = m.call_args[0][0][1]
+        self.assertEqual(download["job_type_code"], "backup_download")
+        self.assertEqual(download["payload"]["time"], "live")
+
+    def test_clone_with_backend_takes_a_live_dump_too(self):
+        """A backend does not mean a backup exists yet.
+
+        Production, 2026-10-03: a staging cloned from a production
+        created that morning failed on the download — no nightly backup
+        had run yet — and was left deployed but empty.
+        """
+        backend = self.env["cloud.backup.backend"].create({
+            "name": "clone-bb", "backend_type": "s3", "s3_bucket": "clone-bkt",
+        })
+        self.prod.backup_backend_id = backend
+        with patch.object(
+            type(self.env["cloud.job"]), "enqueue_chain",
+            return_value=[1, 2, 3],
+        ) as m:
+            self.prod.clone_to_staging("clone-latest")
+        download = m.call_args[0][0][1]
+        self.assertEqual(download["payload"]["time"], "live")
+
+
+class TestRefreshGate(CloudSecurityBase):
+    """Both methods are public and therefore reachable over RPC
+    (call_kw), where the controller's Developer gate never runs, so the
+    gate must hold on the model itself. su callers (tests, the GitHub
+    webhook's sudo'd PR previews) bypass inside ``_check_cloud_group``.
+
+    Extends ``CloudSecurityBase`` for its ``new_test_user`` workaround
+    (NOT NULL partner columns added by optional modules).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.env["cloud.project"].create({"name": "gate-proj"})
+        self.host = self.env["cloud.host"].create({
+            "name": "gate-host", "ip_address": "10.0.2.1", "port": 22,
+            "user": "root", "login_type": "ssh_key",
+            "wildcard_domain": "g.example.com",
+            "status": "compatible", "traefik_deployed": True,
+        })
+        self.prod = self.env["cloud.instance"].create({
+            "name": "gate-prod", "project_id": self.project.id,
+            "environment": "production", "host_id": self.host.id,
+            "state": "deployed",
+        })
+        self.staging = self.env["cloud.instance"].create({
+            "name": "gate-staging", "project_id": self.project.id,
+            "environment": "staging", "host_id": self.host.id,
+            "state": "deployed",
+        })
+        self.consultant = self._create_user(
+            "gate-consultant", "group_cloud_consultant",
+        )
+        self.developer = self._create_user(
+            "gate-developer", "group_cloud_developer",
+        )
+
+    def test_a_consultant_cannot_refresh_over_rpc(self):
+        with self.assertRaises(AccessError):
+            self.staging.with_user(
+                self.consultant,
+            ).refresh_from_production(self.prod.id)
+
+    def test_a_consultant_cannot_clone_over_rpc(self):
+        with self.assertRaises(AccessError):
+            self.prod.with_user(self.consultant).clone_to_staging("gate-x")
+
+    def test_a_developer_clones_production_to_a_staging(self):
+        """The clone is a new staging, not production relabelled (QA,
+        30-oct-2026: the creation was checked as a write of production)."""
+        with patch.object(
+            type(self.env["cloud.job"]), "enqueue_chain",
+            return_value=[21, 22, 23],
+        ):
+            res = self.prod.with_user(self.developer).clone_to_staging("gate-clone")
+        staging = self.env["cloud.instance"].browse(res["staging_id"])
+        self.assertEqual(staging.environment, "staging")
+        self.assertEqual(self.prod.environment, "production")
+
+    def test_over_rpc_a_developer_cannot_pick_the_comment_s_installation(self):
+        """Only the webhook, as the platform, says which installation of
+        the GitHub App writes a preview's comment: over RPC the caller
+        would choose whose token writes it."""
+        with patch.object(
+            type(self.env["cloud.job"]), "enqueue_chain",
+            return_value=[31, 32, 33],
+        ), self.assertRaisesRegex(AccessError, "pr_installation_id"):
+            self.prod.with_user(self.developer).clone_to_staging(
+                "gate-pr", pr_number=8, pr_repo="owner/repo",
+                pr_head_branch="feature-x", pr_installation_id="777",
+            )
+
+    def test_a_developer_passes_the_gate(self):
+        with patch.object(
+            type(self.env["cloud.job"]), "enqueue_chain",
+            return_value=[11, 12],
+        ):
+            res = self.staging.with_user(
+                self.developer,
+            ).refresh_from_production(self.prod.id)
+        self.assertTrue(res["ok"])
+
+
+class TestMoveDoesNotNeutralize(TransactionCase):
+    """A move is the same production instance changing machines.
+
+    Neutralizing there would silently kill the customer's crons and
+    outgoing mail, so the move chain must never carry the flag.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.env["cloud.project"].create({"name": "move-proj"})
+        self.source = self.env["cloud.host"].create({
+            "name": "move-src", "ip_address": "10.0.1.1", "port": 22,
+            "user": "root", "login_type": "ssh_key",
+            "wildcard_domain": "src.example.com",
+            "status": "compatible", "traefik_deployed": True,
+        })
+        self.target = self.env["cloud.host"].create({
+            "name": "move-tgt", "ip_address": "10.0.1.2", "port": 22,
+            "user": "root", "login_type": "ssh_key",
+            "wildcard_domain": "tgt.example.com",
+            "status": "compatible", "traefik_deployed": True,
+        })
+        self.backend = self.env["cloud.backup.backend"].create({
+            "name": "move-bb", "backend_type": "s3", "s3_bucket": "move-bkt",
+        })
+        self.inst = self.env["cloud.instance"].create({
+            "name": "moving", "project_id": self.project.id,
+            "environment": "production", "host_id": self.source.id,
+            "state": "deployed", "backup_backend_id": self.backend.id,
+        })
+
+    def test_move_restore_step_carries_no_neutralize(self):
+        with patch.object(
+            type(self.env["cloud.job"]), "enqueue_chain",
+            return_value=[1, 2, 3, 4, 5, 6, 7],
+        ) as m:
+            self.inst.move_to_host(self.target)
+        restore = next(
+            s for s in m.call_args[0][0]
+            if s["job_type_code"] == "restore_instance"
+        )
+        self.assertNotIn("neutralize", restore["payload"])
+        self.assertNotIn("reset_base_url", restore["payload"])
+
+
+# ── backup_download: live path on production ─────────────────────────────────
+
+
+class TestBackupDownloadLive(BaseCase):
+
+    def test_production_live_takes_the_live_dump_path(self):
+        cmds = _make_download_executor(
+            environment="production", time="live",
+        ).get_commands()
+        self.assertEqual([c[0] for c in cmds], ["Create live backup"])
+        argv = _argv(cmds[0])
+        self.assertEqual(argv[2], "live-dump")
+
+    def test_production_latest_still_goes_through_duplicity(self):
+        cmds = _make_download_executor(
+            environment="production", time="latest",
+        ).get_commands()
+        self.assertEqual(
+            [c[0] for c in cmds],
+            ["Restore full from backup", "Extract and package"],
+        )
+
+    def test_production_timestamp_still_goes_through_duplicity(self):
+        cmds = _make_download_executor(
+            environment="production", time="12h_ago",
+        ).get_commands()
+        argv = _argv(cmds[0])
+        self.assertEqual(argv[2], "restore-full")
+        self.assertIn("12h_ago", argv)
+
+    def test_non_production_is_unchanged(self):
+        cmds = _make_download_executor(
+            environment="staging", time="latest",
+        ).get_commands()
+        self.assertEqual([c[0] for c in cmds], ["Create live backup"])
+
+    def test_live_dump_scope_follows_download_type(self):
+        cmds = _make_download_executor(
+            environment="production", time="live", mode="all",
+        ).get_commands()
+        self.assertEqual(_argv(cmds[0])[-1], "all")
+        cmds = _make_download_executor(
+            environment="production", time="live", mode="dump",
+        ).get_commands()
+        self.assertEqual(_argv(cmds[0])[-1], "db")
+
+
+class TestBackupDownloadValidation(BaseCase):
+
+    def _run_before_execute(self, ex):
+        """Run *ex*'s checks against a host link whose commands succeed."""
+        import asyncio
+        transport = MagicMock(spec=SSHTransport)
+        transport.run.return_value = CommandResult("", 0)
+        return asyncio.run(ex.before_execute(transport))
+
+    def test_non_production_accepts_live(self):
+        ex = _make_download_executor(environment="staging", time="live")
+        self._run_before_execute(ex)  # must not raise
+
+    def test_non_production_accepts_latest(self):
+        ex = _make_download_executor(environment="staging", time="latest")
+        self._run_before_execute(ex)  # must not raise
+
+    def test_non_production_still_refuses_timestamps(self):
+        ex = _make_download_executor(environment="staging", time="12h_ago")
+        with self.assertRaises(ValueError):
+            self._run_before_execute(ex)
+
+    def test_production_accepts_live(self):
+        ex = _make_download_executor(environment="production", time="live")
+        self._run_before_execute(ex)  # must not raise
+
+
+# ── restore_instance: neutralize + base URL ──────────────────────────────────
+
+
+class TestRestoreNeutralize(BaseCase):
+
+    def _restore_step(self, payload):
+        return _find(
+            _make_restore_executor(payload).get_commands(),
+            "Restore database",
+        )
+
+    def test_neutralize_flag_reaches_the_script(self):
+        argv = _argv(self._restore_step({
+            "mode": "from_job", "neutralize": True,
+        }))
+        self.assertEqual(argv[2], "restore-db")
+        self.assertEqual(argv[-2], "1")
+
+    def test_without_the_flag_the_script_is_told_not_to(self):
+        argv = _argv(self._restore_step({"mode": "from_job"}))
+        self.assertEqual(argv[-2], "0")
+
+    def test_explicit_false_is_not_neutralized(self):
+        argv = _argv(self._restore_step({
+            "mode": "from_job", "neutralize": False,
+        }))
+        self.assertEqual(argv[-2], "0")
+
+    def test_a_restore_loads_a_copy_unless_told_it_is_a_move(self):
+        argv = _argv(self._restore_step({"mode": "from_job"}))
+        self.assertEqual(argv[-1], "copy")
+
+    def _moving_restore_step(self, payload, moving_to, runs_on):
+        """The restore step of an instance moving to host *moving_to*.
+
+        :param dict payload: the restore's payload.
+        :param moving_to: id of the host the instance moves to, or None
+            when it is not moving.
+        :param int runs_on: id of the host the restore runs on.
+        """
+        ex = _make_restore_executor(payload)
+        ex.job.instance_id.move_target_host_id = (
+            SimpleNamespace(id=moving_to) if moving_to else None
+        )
+        ex.job.host_id = SimpleNamespace(id=runs_on)
+        return _find(ex.get_commands(), "Restore database")
+
+    def test_a_move_loads_the_database_as_moved(self):
+        # A copy regenerates database.secret (the links it signed) and
+        # database.uuid, and sets web.base.url to localhost.
+        argv = _argv(self._moving_restore_step(
+            {"mode": "from_job", "as_move": True}, moving_to=3, runs_on=3,
+        ))
+        self.assertEqual(argv[2:], [
+            "restore-db", INSTANCE_DIR, "prod",
+            argv[5], "0", "move",
+        ])
+
+    def test_as_move_without_a_move_loads_a_copy(self):
+        """Queued straight through ``cloud.job.enqueue`` (review M2)."""
+        argv = _argv(self._moving_restore_step(
+            {"mode": "from_job", "as_move": True}, moving_to=None, runs_on=3,
+        ))
+        self.assertEqual(argv[-1], "copy")
+
+    def test_as_move_on_another_host_than_the_move_s_loads_a_copy(self):
+        argv = _argv(self._moving_restore_step(
+            {"mode": "from_job", "as_move": True}, moving_to=4, runs_on=3,
+        ))
+        self.assertEqual(argv[-1], "copy")
+
+
+class TestRestoreMailCatcher(BaseCase):
+    """A neutralized staging sends through its MailHog, not into a void.
+
+    Odoo's neutralization leaves an active placeholder server on host
+    ``invalid``, which Odoo prefers over the stack's ``smtplocal``.
+    """
+
+    _LABEL = "Route mail to the mail catcher"
+
+    def test_a_neutralized_staging_drops_the_placeholder_server(self):
+        step = _find(
+            _make_restore_executor({
+                "mode": "from_job", "neutralize": True,
+            }).get_commands(),
+            self._LABEL,
+        )
+        self.assertIsNotNone(step)
+        self.assertEqual(
+            _argv(step)[2:],
+            ["use-mail-catcher", INSTANCE_DIR, "odoo", "prod"],
+        )
+
+    def test_without_neutralize_there_is_no_step(self):
+        cmds = _make_restore_executor({"mode": "from_job"}).get_commands()
+        self.assertIsNone(_find(cmds, self._LABEL))
+
+    def test_a_production_never_gets_the_step(self):
+        # There ``smtplocal`` is the real relay: removing the placeholder
+        # would let a neutralized copy mail real customers.
+        cmds = _make_restore_executor(
+            {"mode": "from_job", "neutralize": True},
+            environment="production",
+        ).get_commands()
+        self.assertIsNone(_find(cmds, self._LABEL))
+
+    def test_step_runs_after_the_restore_and_before_odoo_boots(self):
+        labels = [c[0] for c in _make_restore_executor({
+            "mode": "from_job", "neutralize": True,
+        }).get_commands()]
+        self.assertGreater(
+            labels.index(self._LABEL), labels.index("Restore database"),
+        )
+        self.assertLess(
+            labels.index(self._LABEL),
+            labels.index("Ensure incubacloud_connect"),
+        )
+
+
+class TestRestoreBaseUrl(BaseCase):
+
+    def test_reset_base_url_adds_the_step(self):
+        cmds = _make_restore_executor({
+            "mode": "from_job", "reset_base_url": True,
+        }).get_commands()
+        step = _find(cmds, "Reset base URL")
+        self.assertIsNotNone(step)
+        argv = _argv(step)
+        self.assertEqual(argv[2], "set-base-url")
+        self.assertEqual(
+            argv[3:],
+            [
+                INSTANCE_DIR, "odoo", "prod",
+                "https://staging.example.com", "http://localhost:8069",
+            ],
+        )
+
+    def test_without_the_flag_there_is_no_step(self):
+        cmds = _make_restore_executor({"mode": "from_job"}).get_commands()
+        self.assertIsNone(_find(cmds, "Reset base URL"))
+
+    def test_no_domain_means_no_step(self):
+        # Writing an empty web.base.url would be worse than leaving the
+        # one that came inside the dump.
+        cmds = _make_restore_executor(
+            {"mode": "from_job", "reset_base_url": True}, domain="",
+        ).get_commands()
+        self.assertIsNone(_find(cmds, "Reset base URL"))
+
+    def test_step_runs_before_the_connect_module_boots_odoo(self):
+        cmds = _make_restore_executor({
+            "mode": "from_job", "reset_base_url": True,
+        }).get_commands()
+        labels = [c[0] for c in cmds]
+        self.assertLess(
+            labels.index("Reset base URL"),
+            labels.index("Ensure incubacloud_connect"),
+        )
+        self.assertGreater(
+            labels.index("Reset base URL"),
+            labels.index("Restore database"),
+        )
+
+    def test_the_rest_of_the_chain_is_untouched(self):
+        cmds = _make_restore_executor({"mode": "from_job"}).get_commands()
+        self.assertEqual(
+            [c[0] for c in cmds],
+            [
+                "Verify backup file",
+                "Stop Odoo service",
+                "Restore database",
+                "Update changed modules",
+                "Ensure incubacloud_connect",
+                "Replace the default admin password",
+                "Start Odoo service",
+                "Remove remote backup file",
+            ],
+        )
+
+    def test_a_quote_in_the_domain_is_sql_escaped(self):
+        argv = _argv(_find(
+            _make_restore_executor(
+                {"mode": "from_job", "reset_base_url": True},
+                domain="it's.example.com",
+            ).get_commands(),
+            "Reset base URL",
+        ))
+        self.assertIn("https://it''s.example.com", argv)
+
+
+#: What ``clone_to_staging`` asks the restore of a pull request preview,
+#: with the archive taken from a job (``from_host`` needs a real chain).
+_PREVIEW = {"mode": "from_job", "neutralize": True, "reset_base_url": True}
+
+
+class TestRestoreUpdatesModules(BaseCase):
+    """A copy restored on an instance gets its modules updated to its code.
+
+    The archive was made by other code: production's branch, for a pull
+    request preview or a staging cloned or refreshed from it. Started as
+    it came, Odoo ran the branch's code over production's schema — a
+    stored field the branch adds has no column — until the first push
+    rebuilt the instance. The update is the rebuild's own
+    (``cron_guard.sh update``), before anything boots an Odoo on the
+    database.
+    """
+
+    _LABEL = "Update changed modules"
+
+    def _labels(self, executor):
+        """Return the labels of *executor*'s steps, in order."""
+        return [c[0] for c in executor.get_commands()]
+
+    def test_a_preview_s_restore_updates_the_modules(self):
+        step = _find(
+            _make_restore_executor(_PREVIEW).get_commands(), self._LABEL,
+        )
+        self.assertIsNotNone(step)
+        argv = _argv(step)
+        self.assertTrue(argv[1].endswith("/cron_guard.sh"))
+        self.assertEqual(argv[2:], ["update", INSTANCE_DIR, "prod", "odoo"])
+        self.assertTrue(step[2].get("stop_on_failure"))
+
+    def test_the_database_and_user_are_the_instance_s(self):
+        step = _find(
+            _make_restore_executor(
+                _PREVIEW, dbname="main", pg_user="erp",
+            ).get_commands(),
+            self._LABEL,
+        )
+        self.assertEqual(_argv(step)[-3:], [INSTANCE_DIR, "main", "erp"])
+
+    def test_the_update_runs_after_the_copy_is_made_safe(self):
+        # Neutralized and its base URL its own before any Odoo runs on
+        # it: an update that calls out must not do it as production.
+        labels = self._labels(_make_restore_executor(_PREVIEW))
+        for before in ("Restore database", "Reset base URL"):
+            self.assertLess(labels.index(before), labels.index(self._LABEL))
+
+    def test_the_copy_is_neutralized_again_after_the_update(self):
+        # The update rewrites what its data files leave unprotected,
+        # scheduled actions and mail servers among them; each
+        # neutralization inserts the placeholder server the mail
+        # catcher's step removes.
+        ex = _make_restore_executor(_PREVIEW)
+        labels = self._labels(ex)
+        again = "Neutralize again after the update"
+        self.assertEqual(labels.index(again), labels.index(self._LABEL) + 1)
+        self.assertLess(
+            labels.index(again), labels.index("Route mail to the mail catcher"),
+        )
+        self.assertLess(
+            labels.index("Route mail to the mail catcher"),
+            labels.index("Start Odoo service"),
+        )
+        step = _find(ex.get_commands(), again)
+        self.assertEqual(_argv(step)[2:], ["neutralize", INSTANCE_DIR, "prod"])
+        self.assertTrue(step[2].get("stop_on_failure"))
+
+    def test_a_copy_not_neutralized_is_not_neutralized_after_either(self):
+        labels = self._labels(_make_restore_executor({"mode": "from_job"}))
+        self.assertIn(self._LABEL, labels)
+        self.assertNotIn("Neutralize again after the update", labels)
+
+    def test_without_the_update_the_copy_is_neutralized_once(self):
+        labels = self._labels(_make_restore_executor(_PREVIEW, auto_update=False))
+        self.assertNotIn("Neutralize again after the update", labels)
+        self.assertIn("Route mail to the mail catcher", labels)
+
+    def test_the_update_runs_before_odoo_boots(self):
+        labels = self._labels(_make_restore_executor(_PREVIEW))
+        for after in ("Ensure incubacloud_connect", "Start Odoo service"):
+            self.assertLess(labels.index(self._LABEL), labels.index(after))
+
+    def test_a_stop_is_refused_by_then(self):
+        # Past the load of the database a stop is refused: the update,
+        # cut halfway, would leave it half updated with nothing to go
+        # back to.
+        ex = _make_restore_executor(_PREVIEW)
+        labels = self._labels(ex)
+        self.assertLess(
+            labels.index(ex._no_return_from), labels.index(self._LABEL),
+        )
+
+    def test_the_update_reads_the_key_the_restore_wrote(self):
+        from odoo.addons.incubacloud.models.secret_key_escrow import (
+            LABEL_WRITE_SECRET_KEY,
+        )
+        ex = _make_restore_executor(_PREVIEW | {"neutralize": False})
+        ex._writes_secret_key = True
+        ex._secret_key_tmp = lambda: "~/.incubacloud-key-42"
+        labels = self._labels(ex)
+        self.assertLess(
+            labels.index(LABEL_WRITE_SECRET_KEY), labels.index(self._LABEL),
+        )
+
+    def test_an_upload_restore_updates_too(self):
+        # An archive from another server: other code, by definition.
+        labels = self._labels(_make_restore_executor({"mode": "from_job"}))
+        self.assertIn(self._LABEL, labels)
+
+    def test_a_move_does_not_update(self):
+        # The same instance on a new host, built from the same code, in a
+        # cutover the customer waits through.
+        ex = _make_restore_executor({"mode": "from_job", "as_move": True})
+        ex.job.instance_id.move_target_host_id = SimpleNamespace(id=3)
+        ex.job.host_id = SimpleNamespace(id=3)
+        self.assertNotIn(self._LABEL, self._labels(ex))
+
+    def test_an_instance_without_auto_update_is_left_alone(self):
+        # Whoever manages its modules on rebuilds manages them here.
+        ex = _make_restore_executor(_PREVIEW, auto_update=False)
+        self.assertNotIn(self._LABEL, self._labels(ex))
+
+
+class TestRestoreModuleUpdateFailure(BaseCase):
+    """A failed update leaves the instance in error, saying why."""
+
+    def _fail(self, results):
+        """Run ``on_failure`` with *results*; return the instance and log."""
+        import asyncio
+
+        from odoo.addons.incubacloud.models.cloud_instance import CloudInstance
+        from odoo.addons.incubacloud.models.restore_instance_executor import (
+            RestoreInstanceExecutor,
+        )
+
+        ex = _make_restore_executor({"mode": "from_job"})
+        inst = MagicMock(spec=CloudInstance)
+        inst.pr_number = 0
+        ex.job.instance_id = inst
+        lines = []
+        with patch.object(
+            RestoreInstanceExecutor, "_sys", autospec=True,
+            side_effect=lambda _self, line: lines.append(line),
+        ):
+            asyncio.run(ex.on_failure(results, ["'step' exited with status 1"]))
+        return inst, lines
+
+    def test_it_says_what_to_do_about_the_alert_and_auto_update(self):
+        _inst, lines = self._fail({
+            "Update changed modules": {"exit_status": 1, "stdout": ""},
+        })
+        said = next(line for line in lines if "could not be updated" in line)
+        self.assertIn("dismiss this job's alert", said)
+        self.assertIn("rebuild the instance", said)
+        self.assertIn("'Auto-update modules on rebuild' off does not update", said)
+
+    def _abort(self, ran, running, exc=None):
+        """Run ``on_abort`` after the steps in *ran*, *running* cut off.
+
+        :return: the instance and the log
+        """
+        import asyncio
+
+        from odoo.addons.incubacloud.models.cloud_instance import CloudInstance
+        from odoo.addons.incubacloud.models.restore_instance_executor import (
+            RestoreInstanceExecutor,
+        )
+
+        ex = _make_restore_executor({"mode": "from_job"})
+        inst = MagicMock(spec=CloudInstance)
+        inst.pr_number = 0
+        ex.job.instance_id = inst
+        ex._step_results = ran
+        ex._running_step = running
+        lines = []
+        with patch.object(
+            RestoreInstanceExecutor, "_sys", autospec=True,
+            side_effect=lambda _self, line: lines.append(line),
+        ):
+            asyncio.run(ex.on_abort(exc or TimeoutError("3600 s")))
+        return inst, lines
+
+    def test_an_update_cut_off_fails_the_restore_saying_so(self):
+        inst, lines = self._abort(
+            {"Restore database": {"exit_status": 0, "stdout": ""}},
+            "Update changed modules",
+        )
+        inst.write.assert_called_once_with({"status": "error"})
+        self.assertTrue(any(
+            "'Update changed modules' did not end" in line for line in lines
+        ))
+        self.assertTrue(any("could not be updated" in line for line in lines))
+
+    def test_a_run_cut_before_its_steps_leaves_the_instance_alone(self):
+        inst, lines = self._abort(None, None, exc=RuntimeError("no host"))
+        inst.write.assert_not_called()
+        self.assertEqual(lines, ["✗ RuntimeError: no host"])
+
+    def test_a_failed_update_says_odoo_was_left_stopped(self):
+        inst, lines = self._fail({
+            "Restore database": {"exit_status": 0, "stdout": ""},
+            "Update changed modules": {"exit_status": 1, "stdout": ""},
+        })
+        inst.write.assert_called_once_with({"status": "error"})
+        said = [line for line in lines if "could not be updated" in line]
+        self.assertEqual(len(said), 1)
+        self.assertIn("Odoo was left stopped", said[0])
+
+    def test_another_failure_says_nothing_of_the_update(self):
+        inst, lines = self._fail({
+            "Restore database": {"exit_status": 1, "stdout": ""},
+        })
+        inst.write.assert_called_once_with({"status": "error"})
+        self.assertFalse([line for line in lines if "could not be updated" in line])

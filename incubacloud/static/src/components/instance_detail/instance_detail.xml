@@ -1,0 +1,3628 @@
+<templates>
+
+    <t t-name="incubacloud.InstanceDetail">
+        <div class="ic-host-detail">
+
+            <!-- Loading -->
+            <t t-if="state.loading">
+                <div class="ic-rl-detail-scroll">
+                    <div class="rl-ovcards">
+                        <div class="ic-skeleton-card" />
+                        <div class="ic-skeleton-card" />
+                    </div>
+                    <div style="margin-top: 16px;">
+                        <div class="ic-skeleton-text ic-skeleton-lg" />
+                        <div class="ic-skeleton-text ic-skeleton-md" />
+                        <div class="ic-skeleton-text ic-skeleton-sm" />
+                    </div>
+                </div>
+            </t>
+
+            <t t-elif="isCreate or state.inst">
+
+                <!-- ═══════════════════════════════════════════════════════════
+                     CREATE MODE — one page (form standard §1): a section per
+                     tab of the instance's page, in its order and with its
+                     name; those whose defaults serve most instances folded
+                     as Advanced. The footer with Create stays in view.
+                     ═══════════════════════════════════════════════════════════ -->
+                <t t-if="isCreate">
+                    <div class="ic-rl-detail-scroll">
+                        <div class="rl-page ic-new-page" t-ref="newPage">
+
+                            <div class="rl-crumb">
+                                <a t-on-click="goBack">Instances</a>
+                                <span class="rl-sep">/</span>
+                                <span class="rl-cur">New instance</span>
+                            </div>
+
+                            <div class="rl-phead">
+                                <div class="rl-htext">
+                                    <h1 class="rl-ptitle">
+                                        New Instance
+                                        <span
+                      t-att-class="'rl-env ' + state.form.environment"
+                      t-esc="envLabel(state.form.environment)"
+                    />
+                                    </h1>
+                                </div>
+                            </div>
+
+                            <t t-foreach="newSections" t-as="sec" t-key="sec.key">
+                                <section
+                                    t-att-class="'ic-new-sec' + (sec.folded ? ' ic-new-sec--fold' : '')"
+                                    t-att-aria-labelledby="'idet-s-' + sec.key"
+                                >
+                                    <h2 t-if="sec.folded" class="ic-new-sec__title">
+                                        <button
+                                            type="button"
+                                            class="ic-new-sec__toggle"
+                                            t-att-id="'idet-s-' + sec.key"
+                                            t-att-aria-expanded="sectionOpen(sec.key) ? 'true' : 'false'"
+                                            t-att-aria-controls="'idet-sb-' + sec.key"
+                                            t-on-click="() => this.toggleSection(sec.key)"
+                                        >
+                                            <i t-att-class="'fa ' + (sectionOpen(sec.key) ? 'fa-chevron-down' : 'fa-chevron-right')" aria-hidden="true"/>
+                                            <span t-esc="sec.label"/>
+                                            <span class="ic-new-sec__adv">Advanced</span>
+                                            <span t-if="sectionChangedCount(sec.key)" class="ic-new-sec__changed" t-esc="sectionChangedText(sec.key)"/>
+                                        </button>
+                                    </h2>
+                                    <h2 t-else="" class="ic-new-sec__title" t-att-id="'idet-s-' + sec.key" t-esc="sec.label"/>
+                                    <div
+                                        class="ic-new-sec__body"
+                                        t-att-id="'idet-sb-' + sec.key"
+                                        t-att-hidden="!sectionOpen(sec.key)"
+                                    >
+                                        <t t-call="incubacloud.InstanceDetail.tabBody">
+                                            <t t-set="section" t-value="sec.key"/>
+                                        </t>
+                                    </div>
+                                </section>
+                            </t>
+
+                            <!-- Footer (create): stays at the bottom of the
+                                 window, and says how many fields need attention
+                                 once Create found some. -->
+                            <div class="rl-formfoot ic-new-foot">
+                                <span t-if="newErrorCount" class="rl-ff-hint ic-new-foot__err">
+                                    <t t-out="env.icon('alert', 14)"/>
+                                    <t t-esc="newErrorText"/>
+                                </span>
+                                <span
+                  t-else=""
+                  class="rl-ff-hint"
+                >Fill in the required fields *</span>
+                                <button
+                  class="rl-btn rl-btn-ghost"
+                  t-on-click="goBack"
+                >Cancel</button>
+                                <button
+                  class="rl-btn rl-btn-primary"
+                  t-att-disabled="state.saving"
+                  t-on-click="save"
+                >
+                                    <t t-if="state.saving">
+                                        <i class="fa fa-spinner fa-spin" /> Creating…
+                                    </t>
+                                    <t t-else="">
+                                        <t
+                      t-out="env.icon('rocket', 15)"
+                    /> Create Instance
+                                    </t>
+                                </button>
+                            </div>
+
+                        </div>
+                    </div>
+                </t>
+
+                <!-- ═══════════════════════════════════════════════════════════
+                     EDIT MODE
+                     ═══════════════════════════════════════════════════════════ -->
+                <t t-else="">
+
+                    <!-- Hero: title + status pill + env + subtitle -->
+                    <div class="rl-phead ic-rl-hero">
+                        <div class="rl-htext">
+                            <h1 class="rl-ptitle">
+                                <t t-esc="state.inst.name" />
+                                <span
+                  t-att-class="'rl-pill ' + (statusClass === 'st-running' ? 'running' : statusClass === 'st-provisioning' ? 'building' : statusClass === 'st-error' ? 'crashed' : statusClass === 'st-pending' ? 'pending' : statusClass === 'st-asleep' ? 'asleep' : 'stopped')"
+                >
+                                    <span class="rl-d" /><t t-esc="statusLabel" />
+                                </span>
+                                <span
+                  t-att-class="'rl-env ' + state.form.environment"
+                  t-esc="envLabel(state.form.environment)"
+                />
+                                <t t-if="isMoving">
+                                    <span class="rl-pill building">
+                                        <t t-out="env.icon('move', 13)" />
+                                        Migrating from <t
+                      t-esc="state.inst.move_origin_host"
+                    />…
+                                    </span>
+                                </t>
+                                <t t-if="isRollingBack">
+                                    <span class="rl-pill building">
+                                        <i class="fa fa-undo fa-spin" />
+                                        Rolling back to <t
+                      t-esc="state.inst.move_origin_host"
+                    />…
+                                    </span>
+                                </t>
+                                <t t-if="state.inst.config_dirty">
+                                    <span
+                      class="rl-pill pending"
+                      title="Saved configuration differs from what the last deploy shipped. Rebuild to apply it."
+                    >
+                                        Changes not deployed
+                                    </span>
+                                </t>
+                                <t t-if="expiryLabel">
+                                    <span
+                      t-att-class="'rl-pill ' + (state.inst.autopurge_days_left &lt;= 3 ? 'crashed' : 'pending')"
+                      title="This staging has had no activity for a while and will be deleted. Nothing in it is backed up. Press Keep to start the window over."
+                    >
+                                        <t t-esc="expiryLabel" />
+                                        <button
+                        type="button"
+                        class="ic-keep-btn"
+                        t-att-disabled="state.keeping"
+                        t-on-click="() => this.keep()"
+                      >Keep</button>
+                                    </span>
+                                </t>
+                            </h1>
+                            <t t-if="state.inst.domain or state.inst.host">
+                                <p class="rl-psub">
+                                    <t t-if="state.inst.domain">
+                                        <a
+                      t-att-href="'https://' + state.inst.domain"
+                      target="_blank"
+                      rel="noopener"
+                      t-esc="state.inst.domain"
+                    />
+                                    </t>
+                                    <t t-if="state.inst.host">
+                                        <t t-if="state.inst.domain"> · </t>
+                                        <t t-esc="state.inst.host" />
+                                    </t>
+                                    <t t-if="state.inst.region"> · <t
+                      t-esc="state.inst.region"
+                    /></t>
+                                </p>
+                            </t>
+                        </div>
+                    </div>
+
+                    <!-- Action bar -->
+                    <div
+            t-att-class="'rl-abar' + (state.actionLoading ? ' ic-action-loading' : '')"
+          >
+                        <!-- Primary: Deploy / Rebuild -->
+                        <t t-if="env.permissions?.can_deploy">
+                            <t t-if="!state.inst.deployed and state.inst.host_id">
+                                <button
+                  class="rl-btn rl-btn-primary"
+                  title="Deploy"
+                  t-att-disabled="state.actionLoading"
+                  t-on-click="() => this.deployInstance()"
+                >
+                                    <i
+                    t-if="state.actionLoading"
+                    class="fa fa-spinner fa-spin"
+                  />
+                                    <t t-else="" t-out="env.icon('rocket', 15)" />
+                                    <t t-if="state.actionLoading">Deploying…</t>
+                                    <t t-else="">Deploy</t>
+                                </button>
+                            </t>
+                            <t t-if="state.inst.deployed and state.inst.host_id">
+                                <button
+                  class="rl-btn rl-btn-primary"
+                  title="Rebuild"
+                  t-att-disabled="state.actionLoading"
+                  t-on-click="() => this.rebuildInstance()"
+                >
+                                    <i
+                    t-if="state.actionLoading"
+                    class="fa fa-spinner fa-spin"
+                  />
+                                    <t t-else="" t-out="env.icon('refresh', 15)" />
+                                    <t t-if="state.actionLoading">Rebuilding…</t>
+                                    <t t-else="">Rebuild</t>
+                                </button>
+                            </t>
+                        </t>
+                        <!-- Ghost: Connect / Logs / Shell -->
+                        <t
+              t-if="state.inst.deployed and state.inst.running and state.inst.domain and this.canConnectAs"
+            >
+                            <button
+                class="rl-btn rl-btn-ghost"
+                title="Connect as user"
+                t-on-click="() => this.openConnectModal()"
+              >
+                                <t t-out="env.icon('login', 15)" /> Connect
+                            </button>
+                        </t>
+                        <t
+              t-if="state.inst.deployed and env.permissions?.can_view_logs"
+            >
+                            <button
+                class="rl-btn rl-btn-ghost"
+                title="Logs"
+                t-on-click="() => this.viewLogs()"
+              >
+                                <t t-out="env.icon('terminal', 15)" /> Logs
+                            </button>
+                        </t>
+                        <t
+              t-if="state.inst.deployed and state.inst.running and env.permissions?.can_use_terminal and state.inst.host_id"
+            >
+                            <button
+                class="rl-btn rl-btn-ghost"
+                title="Shell"
+                t-on-click="() => this.openShellDialog()"
+              >
+                                <t t-out="env.icon('shell', 15)" /> Shell
+                            </button>
+                        </t>
+
+                        <!-- Secondary icon-only group -->
+                        <t t-if="state.inst.deployed">
+                            <span class="rl-asep" />
+                            <t t-if="env.permissions?.can_deploy">
+                                <t t-if="state.inst.running">
+                                    <button
+                    class="rl-iconbtn"
+                    title="Restart"
+                    aria-label="Restart instance"
+                    t-on-click="() => this.instanceAction({ code: 'restart_instance' })"
+                  >
+                                        <t t-out="env.icon('refresh', 15)" />
+                                    </button>
+                                    <button
+                    class="rl-iconbtn"
+                    title="Stop"
+                    aria-label="Stop instance"
+                    t-on-click="() => this.instanceAction({ code: 'stop_instance' })"
+                  >
+                                        <t t-out="env.icon('stop', 15)" />
+                                    </button>
+                                </t>
+                                <t t-if="!state.inst.running">
+                                    <button
+                    class="rl-iconbtn"
+                    title="Start"
+                    aria-label="Start instance"
+                    t-on-click="() => this.instanceAction({ code: 'start_instance' })"
+                  >
+                                        <t t-out="env.icon('play', 15)" />
+                                    </button>
+                                </t>
+                            </t>
+                            <t t-if="env.permissions?.can_manage_backups">
+                                <button
+                  class="rl-iconbtn"
+                  title="Restore Database"
+                  aria-label="Restore database"
+                  t-on-click="() => this.openRestore()"
+                >
+                                    <t t-out="env.icon('db', 15)" />
+                                </button>
+                            </t>
+                            <t t-if="env.permissions?.can_export">
+                                <button
+                  class="rl-iconbtn"
+                  title="Export"
+                  aria-label="Export instance"
+                  t-on-click="() => this.exportInstance()"
+                >
+                                    <t t-out="env.icon('download', 15)" />
+                                </button>
+                            </t>
+                            <t t-if="env.permissions?.can_manage_backups">
+                                <span class="rl-asep" />
+                                <button
+                  class="rl-iconbtn"
+                  title="Create Backup"
+                  aria-label="Create backup"
+                  t-on-click="() => this.openCreateBackupModal()"
+                >
+                                    <t t-out="env.icon('plus', 15)" />
+                                </button>
+                            </t>
+                            <!-- Community / extension actions -->
+                            <t
+                t-if="state.inst.custom_actions?.length and env.permissions?.can_deploy"
+              >
+                                <span class="rl-asep" />
+                                <t
+                  t-foreach="state.inst.custom_actions"
+                  t-as="action"
+                  t-key="action.code"
+                >
+                                    <button
+                    class="rl-btn rl-btn-ghost"
+                    t-att-title="action.name"
+                    t-att-aria-label="action.name"
+                    t-on-click="() => this.instanceAction(action)"
+                  >
+                                        <i
+                      t-att-class="'fa ' + (action.action_icon || 'fa-cog')"
+                    />
+                                        <t t-esc="action.name" />
+                                    </button>
+                                </t>
+                            </t>
+                            <!-- Refresh from production -->
+                            <t t-if="canRefreshFromProd">
+                                <span class="rl-asep" />
+                                <button
+                  class="rl-btn rl-btn-ghost"
+                  title="Refresh from production"
+                  aria-label="Refresh this instance's data from production"
+                  t-on-click="() => this.openRefreshDialog()"
+                >
+                                    <i class="fa fa-refresh" /> Refresh from production
+                                </button>
+                            </t>
+                            <!-- Move to host -->
+                            <t t-if="canMoveHost">
+                                <span class="rl-asep" />
+                                <button
+                  class="rl-btn rl-btn-ghost"
+                  title="Move to host"
+                  aria-label="Move instance to another host"
+                  t-on-click="() => this.openMovePicker()"
+                >
+                                    <t t-out="env.icon('move', 15)" /> Move to host
+                                </button>
+                            </t>
+                            <t t-if="isMoving and env.permissions?.can_manage_hosts">
+                                <span class="rl-asep" />
+                                <button
+                  class="rl-btn rl-btn-danger"
+                  title="Roll back move"
+                  aria-label="Roll back move"
+                  t-on-click="() => this.rollbackMove()"
+                >
+                                    <i class="fa fa-undo" /> Roll back move
+                                </button>
+                            </t>
+                            <t t-if="hasFrozenCopy and env.permissions?.can_manage_hosts">
+                                <span class="rl-asep" />
+                                <button
+                  class="rl-btn rl-btn-ghost"
+                  title="Clean frozen copy now"
+                  aria-label="Remove the copy the last move left on the old host"
+                  t-on-click="() => this.cleanFrozenCopy()"
+                >
+                                    <i class="fa fa-snowflake-o" /> Clean frozen copy now
+                                </button>
+                            </t>
+                            <t t-if="isRollingBack">
+                                <span class="rl-asep" />
+                                <span
+                  class="rl-btn rl-btn-ghost"
+                  style="cursor:default;opacity:0.7;"
+                  title="Rollback in progress"
+                >
+                                    <i class="fa fa-spinner fa-spin" /> Rolling back…
+                                </span>
+                            </t>
+                            <span class="rl-asep" />
+                        </t>
+                        <t
+              t-if="(state.inst.environment === 'production' and env.permissions?.can_delete_production) or (state.inst.environment !== 'production' and env.permissions?.can_edit_instance)"
+            >
+                            <button
+                class="rl-iconbtn danger"
+                title="Delete"
+                aria-label="Delete instance"
+                t-on-click="() => this.deleteInstance()"
+              >
+                                <t t-out="env.icon('trash', 15)" />
+                            </button>
+                        </t>
+                    </div>
+
+                    <!-- Inline move-to-host picker -->
+                    <t t-if="state.movePicker">
+                        <div class="ic-move-picker">
+                            <span class="ic-move-picker-label">Move to:</span>
+                            <SearchSelect
+                options="moveHostOptions"
+                value="state.movePicker.targetHostId"
+                onChange.bind="onMoveTargetChange"
+                placeholder.translate="Type to search hosts…"
+                emptyLabel.translate="— pick a host —"
+                loading="state.movePicker.loading"
+                onOpen="() => this._loadMoveHosts()"
+              />
+                            <button
+                class="rl-btn rl-btn-primary"
+                title="Move"
+                t-att-disabled="!state.movePicker.targetHostId"
+                t-on-click="() => this.confirmMove()"
+              >
+                                <t t-out="env.icon('move', 15)" /> Move
+                            </button>
+                            <button
+                class="rl-btn rl-btn-ghost"
+                title="Cancel"
+                t-on-click="() => this.closeMovePicker()"
+              >
+                                Cancel
+                            </button>
+                        </div>
+                    </t>
+
+                    <!-- Tabs: eight at most in the bar, the rest under «More» -->
+                    <TabBar
+                        tabs="instanceTabs.tabs"
+                        more="instanceTabs.more"
+                        active="state.tab"
+                        marked="markedTabs"
+                        onSelect="(key) => this.setTab(key)"
+                    />
+
+                    <!-- Scrolling body -->
+                    <div class="ic-rl-detail-scroll">
+
+                        <!-- ── Overview ───────────────────────────────────────── -->
+                        <t t-if="state.tab === 'overview'">
+                            <div class="rl-ovcards">
+
+                                <!-- Infrastructure -->
+                                <div class="rl-ovcard">
+                                    <div class="rl-ovtitle">Infrastructure</div>
+                                    <div class="rl-ovrow">
+                                        <span class="rl-l">Host</span>
+                                        <span
+                      class="rl-v"
+                      t-esc="state.inst.host || '—'"
+                    />
+                                    </div>
+                                    <t t-if="hasFrozenCopy">
+                                        <div class="rl-ovrow">
+                                            <span class="rl-l">Frozen copy until</span>
+                                            <span
+                        class="rl-v"
+                        t-att-title="state.inst.move_frozen_until"
+                      >
+                                                <t t-esc="state.inst.move_frozen_until ? formatDate(state.inst.move_frozen_until) : '—'" />
+                                                on <t t-esc="state.inst.move_frozen_source_host" />
+                                            </span>
+                                        </div>
+                                    </t>
+                                    <div class="rl-ovrow">
+                                        <span class="rl-l">Odoo</span>
+                                        <span
+                      class="rl-v"
+                      t-esc="state.form.odoo_version || '—'"
+                    />
+                                    </div>
+                                    <div class="rl-ovrow">
+                                        <span class="rl-l">PostgreSQL</span>
+                                        <span
+                      class="rl-v"
+                      t-esc="state.form.postgres_version || '—'"
+                    />
+                                    </div>
+                                    <div class="rl-ovrow">
+                                        <span class="rl-l">Repos</span>
+                                        <span
+                      class="rl-v"
+                      t-esc="(state.form.repos || []).length"
+                    />
+                                    </div>
+                                    <t t-if="state.inst.last_deploy_date">
+                                        <div class="rl-ovrow">
+                                            <span class="rl-l">Last deploy</span>
+                                            <span class="rl-v">
+                                                <t
+                          t-esc="timeAgo(state.inst.last_deploy_date)"
+                        />
+                                                <t t-if="state.inst.last_deploy_state">
+                                                    <span
+                            t-att-class="'ic-ov-deploy-state ' + jobStateClass(state.inst.last_deploy_state)"
+                            t-esc="jobStateText({state: state.inst.last_deploy_state})"
+                          />
+                                                </t>
+                                            </span>
+                                        </div>
+                                    </t>
+                                    <div class="rl-svc-row">
+                                        <t
+                      t-foreach="state.inst.compose_services || ['odoo', 'db']"
+                      t-as="svc"
+                      t-key="svc"
+                    >
+                                            <div class="rl-svc">
+                                                <span
+                          t-att-class="'rl-sd ' + serviceDotClass(svc)"
+                        />
+                                                <t t-esc="svc" />
+                                            </div>
+                                        </t>
+                                    </div>
+                                </div>
+
+                                <!-- Configuration -->
+                                <div class="rl-ovcard">
+                                    <div class="rl-ovtitle">Configuration</div>
+                                    <div class="rl-ovrow">
+                                        <span class="rl-l">Domain</span>
+                                        <t t-if="state.inst.domain">
+                                            <a
+                        t-att-href="'https://' + state.inst.domain"
+                        target="_blank"
+                        class="rl-v link"
+                        t-esc="state.inst.domain"
+                      />
+                                        </t>
+                                        <t t-else=""><span
+                        class="rl-v muted"
+                      >—</span></t>
+                                    </div>
+                                    <t t-if="(state.form.domains || []).length > 1">
+                                        <div class="rl-ovrow">
+                                            <span class="rl-l">Aliases</span>
+                                            <span
+                        class="rl-v"
+                        t-esc="aliasesLabel(state.form.domains.length - 1)"
+                      />
+                                        </div>
+                                    </t>
+                                    <div class="rl-ovrow">
+                                        <span class="rl-l">SMTP</span>
+                                        <t t-if="state.form.smtp_relay_host">
+                                            <span class="rl-v ok"><t
+                          t-out="env.icon('check', 13)"
+                        /> <t t-esc="state.form.smtp_relay_host" /></span>
+                                        </t>
+                                        <t
+                      t-elif="state.inst.environment !== 'production'"
+                    ><span class="rl-v">captured on this server</span></t>
+                                        <t t-else=""><span
+                        class="rl-v muted"
+                      >not configured</span></t>
+                                    </div>
+                                    <div class="rl-ovrow">
+                                        <span class="rl-l">Proxy</span>
+                                        <span
+                      class="rl-v"
+                      t-esc="state.form.odoo_proxy || 'traefik'"
+                    />
+                                    </div>
+                                    <div class="rl-ovrow">
+                                        <span class="rl-l">Backup</span>
+                                        <t
+                      t-if="state.inst.effective_backup_backend_id"
+                    >
+                                            <span class="rl-v ok">
+                                                <t t-out="env.icon('check', 13)" />
+                                                <t
+                          t-esc="state.inst.effective_backup_backend_name"
+                        />
+                                            </span>
+                                        </t>
+                                        <t t-else=""><span
+                        class="rl-v muted"
+                      >not configured</span></t>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Recent Activity (Consultant+ only) -->
+                            <t t-if="env.permissions?.can_edit_instance">
+                                <p class="rl-tlh">Recent activity</p>
+                                <t t-if="state.jobsLoading and !timelineJobs.length">
+                                    <div class="ic-ov-activity-loading">
+                                        <div class="ic-skeleton-row">
+                                            <div class="ic-skeleton-label" />
+                                            <div class="ic-skeleton-value" />
+                                        </div>
+                                        <div class="ic-skeleton-row">
+                                            <div class="ic-skeleton-label" />
+                                            <div class="ic-skeleton-value" />
+                                        </div>
+                                    </div>
+                                </t>
+                                <t t-elif="!timelineJobs.length">
+                                    <div
+                    class="ic-ov-activity-empty"
+                  >No activity yet.</div>
+                                </t>
+                                <t t-else="">
+                                    <div class="rl-tl">
+                                        <t
+                      t-foreach="timelineJobs"
+                      t-as="job"
+                      t-key="job._overflow ? 'overflow' : job.id"
+                    >
+                                            <t t-if="job._overflow">
+                                                <div
+                          class="rl-tl-item rl-tl-item--static"
+                        >
+                                                    <div class="rl-tl-rail">
+                                                        <span class="rl-tl-dot" />
+                                                        <span class="rl-tl-line" />
+                                                    </div>
+                                                    <div class="rl-tl-content">
+                                                        <span class="rl-tl-overflow">
+                                                            +<t
+                                t-esc="job.count"
+                              /> pending
+                                                        </span>
+                                                    </div>
+                                                </div>
+                                            </t>
+                                            <t t-else="">
+                                                <div
+                          class="rl-tl-item"
+                          t-att-data-job-id="job.id"
+                          t-on-click="() => this.openJobLog(job)"
+                        >
+                                                <div class="rl-tl-rail">
+                                                    <span
+                              t-att-class="'rl-tl-dot ' + jobTone(job.state, job.stopping)"
+                            />
+                                                    <span class="rl-tl-line" />
+                                                </div>
+                                                <div class="rl-tl-content">
+                                                    <div class="rl-tl-head">
+                                                        <span class="rl-tl-icon"><i
+                                  t-att-class="'fa ' + jobIcon(job.job_type_code)"
+                                /></span>
+                                                        <span
+                                class="rl-tl-name"
+                                t-esc="job.name"
+                              />
+                                                        <span
+                                t-att-class="'rl-tl-state ' + jobTone(job.state, job.stopping)"
+                                t-esc="jobStateText(job)"
+                              />
+                                                        <t t-if="job.requires_action">
+                                                            <span class="ic-hold" t-on-click.stop="() => {}" t-on-keydown="onHoldKeydown">
+                                                                <button type="button" class="ic-tl-alert-badge"
+                                                                        t-att-aria-expanded="state.holdOpen === job.id ? 'true' : 'false'"
+                                                                        t-att-aria-describedby="'ic-hold-reason-' + job.id"
+                                                                        t-on-click.stop="() => this.toggleHold(job)">
+                                                                    <t t-out="env.icon('alert', 13)"/> Action required
+                                                                </button>
+                                                                <span t-att-class="'ic-hold-pop' + (state.holdOpen === job.id ? ' open' : '')">
+                                                                    <span class="ic-hold-reason" t-att-id="'ic-hold-reason-' + job.id" t-esc="holdReason(job)"/>
+                                                                    <button type="button" class="ic-hold-link" t-on-click.stop="() => this.openHoldAlert(job)">
+                                                                        <t t-out="env.icon('alert', 12)"/> Open the alert
+                                                                    </button>
+                                                                </span>
+                                                            </span>
+                                                        </t>
+                                                        <span class="rl-tl-loghint"><t
+                                  t-out="env.icon('terminal', 12)"
+                                /> Log</span>
+                                                    </div>
+                                                    <t
+                              t-if="job.trigger === 'webhook' or job.trigger === 'coalesced'"
+                            >
+                                                        <div class="rl-tl-trigger">
+                                                            <i class="fa fa-github" />
+                                                            <span
+                                  class="rl-sha"
+                                  t-esc="job.push_sha"
+                                />
+                                                            <t
+                                  t-esc="job.push_message"
+                                />
+                                                            <span
+                                  class="ic-tl-trigger-by"
+                                > by <t t-esc="job.push_by" /></span>
+                                                        </div>
+                                                    </t>
+                                                    <t t-if="job.last_system_message">
+                                                        <div
+                                class="rl-tl-msg"
+                                t-esc="job.last_system_message"
+                              />
+                                                    </t>
+                                                    <div class="rl-tl-foot">
+                                                        <span class="rl-who">
+                                                            <t t-if="job.user_id">
+                                                                <img
+                                    class="ic-tl-user-avatar"
+                                    t-att-src="'/web/image/res.users/' + job.user_id + '/avatar_128'"
+                                    t-att-alt="job.user_name"
+                                    t-att-title="job.user_name"
+                                  />
+                                                                <span
+                                    t-esc="job.user_name"
+                                  />
+                                                            </t>
+                                                        </span>
+                                                        <span class="rl-when">
+                                                            <t
+                                  t-esc="formatDate(job.create_date)"
+                                />
+                                                            <t
+                                  t-esc="' (' + timeAgo(job.create_date) + ')'"
+                                />
+                                                        </span>
+                                                        <div class="rl-acts">
+                                                            <t
+                                  t-if="canCancelJob(job)"
+                                >
+                                                                <button
+                                    class="rl-tl-abtn"
+                                    t-on-click="(ev) => this.cancelJob(ev, job)"
+                                  >
+                                                                    <t
+                                      t-out="env.icon('x', 11)"
+                                    /> Cancel
+                                                                </button>
+                                                            </t>
+                                                            <t
+                                  t-if="canRetryJob(job)"
+                                >
+                                                                <button
+                                    class="rl-tl-abtn"
+                                    t-on-click="(ev) => this.retryJob(ev, job)"
+                                  >
+                                                                    <t
+                                      t-out="env.icon('refresh', 11)"
+                                    /> Retry
+                                                                </button>
+                                                            </t>
+                                                            <t
+                                  t-if="waitsOnAlert(job)"
+                                >
+                                                                <button
+                                    class="rl-tl-abtn"
+                                    t-on-click="(ev) => this.goResolveAlert(ev)"
+                                  >
+                                                                    <t
+                                      t-out="env.icon('alert', 11)"
+                                    /> Resolve
+                                                                </button>
+                                                            </t>
+                                                            <t
+                                  t-if="job.state === 'done' and job.download_url"
+                                >
+                                                                <a
+                                    class="rl-tl-abtn"
+                                    t-att-href="job.download_url"
+                                    download=""
+                                    t-on-click.stop=""
+                                  >
+                                                                    <t
+                                      t-out="env.icon('download', 11)"
+                                    /> Download
+                                                                </a>
+                                                            </t>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            </t>
+                                        </t>
+                                    </div>
+                                    <t t-if="hasMoreJobs or timelineJobs.length > 5">
+                                        <button
+                      class="rl-btn rl-btn-ghost"
+                      style="margin-top:6px"
+                      t-on-click="viewAllJobs"
+                    >
+                                            View all activity <t
+                        t-out="env.icon('fwd', 15)"
+                      />
+                                        </button>
+                                    </t>
+                                </t>
+                            </t>
+                        </t>
+
+                        <!-- ── Other tabs ─────────────────────────────────────── -->
+                        <t t-else="">
+                            <t t-call="incubacloud.InstanceDetail.tabBody" />
+                        </t>
+
+                    </div>
+
+                    <!-- Footer (hidden for stakeholders) — edit mode, Activity:
+                         purging acts at once. Saving is the save bar's, on
+                         every tab while something is unsaved. -->
+                    <t t-if="env.permissions?.can_edit_instance">
+                        <div t-if="state.tab === 'activity'" class="rl-formfoot">
+                                <button
+                  class="ic-audit-purge-btn"
+                  t-att-disabled="state.auditPurging"
+                  t-att-title="'Delete entries older than the configured retention period'"
+                  t-on-click="purgeAuditLogs"
+                >
+                                    <i
+                    t-att-class="'fa ' + (state.auditPurging ? 'fa-spinner fa-spin' : 'fa-trash-o')"
+                  />
+                                    Purge old logs
+                                </button>
+                        </div>
+                        <SaveBar count="unsavedCount" saving="state.saving"
+                                 onSave.bind="save" onDiscard.bind="discard" reserveSpace="true"/>
+                    </t>
+
+                </t>
+
+            </t>
+
+            <!-- Error state (edit mode only; create mode shows inline) -->
+            <t t-elif="state.error">
+                <div class="ic-detail-error-state" role="alert">
+                    <p t-esc="state.error" />
+                    <button t-on-click="goBack">← Back to Instances</button>
+                </div>
+            </t>
+
+            <!-- ════════════════════════════════════════════════════════════════
+                 MODALS (unchanged components, rl- restyled internals)
+                 ════════════════════════════════════════════════════════════════ -->
+
+            <!-- Pip conflict resolve modal -->
+            <IcModal
+        t-if="state.pipConflictModal"
+        title="'Resolve Pip Conflicts'"
+        boxClass="'ic-confirm-box ah-resolve-box'"
+        onClose="() => this.closePipConflictModal()"
+      >
+                <h3 class="ic-confirm-title">Resolve Pip Conflicts</h3>
+                <p
+          class="ah-resolve-sub"
+        >Choose which version spec to keep for each package:</p>
+                <div class="ah-conflicts-list">
+                    <t
+            t-foreach="state.pipConflictModal.conflicts"
+            t-as="c"
+            t-key="c.name"
+          >
+                        <div class="ah-conflict-row">
+                            <span class="ah-conflict-pkg" t-esc="c.name" />
+                            <div class="ah-conflict-options">
+                                <label class="ah-conflict-opt">
+                                    <input
+                    type="radio"
+                    t-att-name="'conflict_' + c.name"
+                    t-att-checked="state.pipConflictModal.choices[c.name] === c.existing"
+                    t-on-change="() => this.setPipChoice(c.name, c.existing)"
+                  />
+                                    <code t-esc="c.existing" />
+                                    <span
+                    class="ah-conflict-hint"
+                    t-esc="'(' + (c.existingSource || 'existing') + ')'"
+                  />
+                                </label>
+                                <label class="ah-conflict-opt">
+                                    <input
+                    type="radio"
+                    t-att-name="'conflict_' + c.name"
+                    t-att-checked="state.pipConflictModal.choices[c.name] === c.incoming"
+                    t-on-change="() => this.setPipChoice(c.name, c.incoming)"
+                  />
+                                    <code t-esc="c.incoming" />
+                                    <span
+                    class="ah-conflict-hint"
+                    t-esc="'(' + (c.incomingSource || 'incoming') + ')'"
+                  />
+                                </label>
+                            </div>
+                        </div>
+                    </t>
+                </div>
+                <div class="ic-confirm-actions ah-resolve-actions">
+                    <button
+            class="ic-confirm-btn-cancel"
+            t-on-click="closePipConflictModal"
+          >Edit Manually</button>
+                    <button
+            class="ic-confirm-btn-ok"
+            t-on-click="confirmPipResolve"
+          >Apply &amp; Resolve</button>
+                </div>
+            </IcModal>
+
+            <!-- Restore database dialog -->
+            <IcModal
+        t-if="state.restoreDialog"
+        title="'Restore Database'"
+        boxClass="'ic-restore-box'"
+        onClose="() => this.closeRestore()"
+      >
+                        <div class="ic-restore-header">
+                            <h3 class="ic-confirm-title">Restore Database</h3>
+                            <span
+            class="ic-restore-instance-name"
+            t-esc="state.inst.name"
+          />
+                        </div>
+                        <div class="ic-restore-modes">
+                            <label
+            t-att-class="'ic-restore-mode' + (state.restoreDialog.mode === 'browser' ? ' active' : '')"
+          >
+                                <input
+              type="radio"
+              name="restore_mode"
+              value="browser"
+              t-att-checked="state.restoreDialog.mode === 'browser'"
+              t-on-change="() => { state.restoreDialog.mode = 'browser'; }"
+            />
+                                <div class="ic-restore-mode-body">
+                                    <span
+                class="ic-restore-mode-title"
+              >Through your browser</span>
+                                    <span
+                class="ic-restore-mode-hint"
+              >Recommended for backups up to 2 GB</span>
+                                </div>
+                            </label>
+                            <label
+            t-att-class="'ic-restore-mode' + (state.restoreDialog.mode === 'ssh' ? ' active' : '')"
+          >
+                                <input
+              type="radio"
+              name="restore_mode"
+              value="ssh"
+              t-att-checked="state.restoreDialog.mode === 'ssh'"
+              t-on-change="() => { state.restoreDialog.mode = 'ssh'; }"
+            />
+                                <div class="ic-restore-mode-body">
+                                    <span
+                class="ic-restore-mode-title"
+              >Through SSH</span>
+                                    <span
+                class="ic-restore-mode-hint"
+              >Any size. We lend you a temporary key</span>
+                                </div>
+                            </label>
+                            <label
+            t-att-class="'ic-restore-mode' + (state.restoreDialog.mode === 'url' ? ' active' : '')"
+          >
+                                <input
+              type="radio"
+              name="restore_mode"
+              value="url"
+              t-att-checked="state.restoreDialog.mode === 'url'"
+              t-on-change="() => { state.restoreDialog.mode = 'url'; }"
+            />
+                                <div class="ic-restore-mode-body">
+                                    <span
+                class="ic-restore-mode-title"
+              >From a link</span>
+                                    <span
+                class="ic-restore-mode-hint"
+              >The host downloads it. https, sftp or ftp</span>
+                                </div>
+                            </label>
+                        </div>
+                        <t t-if="state.restoreDialog.mode === 'browser'">
+                            <label class="ic-restore-drop">
+                                <input
+              type="file"
+              accept=".zip"
+              class="ic-restore-file-input"
+              t-on-change="onRestoreFileChange"
+            />
+                                <t t-if="!state.restoreDialog.file">
+                                    <i class="fa fa-upload ic-restore-drop-icon" />
+                                    <span>Click to browse or drop your <strong
+                >.zip</strong> backup</span>
+                                </t>
+                                <t t-else="">
+                                    <i
+                class="fa fa-check-circle ic-restore-drop-icon ok"
+              />
+                                    <span t-esc="state.restoreDialog.file.name" />
+                                </t>
+                            </label>
+                        </t>
+                        <t t-if="state.restoreDialog.mode === 'browser' and state.restoreDialog.uploading">
+                            <div class="ic-restore-rsync-hint">
+                                Uploading… <t t-esc="state.restoreDialog.progress"/>%
+                            </div>
+                        </t>
+                        <t t-if="state.restoreDialog.mode === 'ssh'">
+                            <t t-if="!state.restoreDialog.grant">
+                                <p class="ic-restore-rsync-hint">
+                                    We install a temporary key on the host that can only write your backup into one directory, and expires by itself. You do not need an account on the machine.
+                                </p>
+                                <div class="ic-confirm-actions">
+                                    <button class="ic-confirm-btn-ok"
+                                            t-att-disabled="state.restoreDialog.granting"
+                                            t-on-click="() => this.requestUploadKey()">
+                                        <t t-if="state.restoreDialog.granting"><i class="fa fa-spinner fa-spin"/> Preparing…</t>
+                                        <t t-else="">Give me an upload key</t>
+                                    </button>
+                                </div>
+                            </t>
+                            <t t-else="">
+                                <p class="ic-restore-rsync-hint">
+                                    Run this on your computer. It writes the key with private permissions, sends the backup, and removes the key afterwards. Valid until <strong t-esc="state.restoreDialog.grant.expires_at"/> UTC — copy it now, it is not shown again.
+                                </p>
+                                <p t-if="state.restoreDialog.keyQueued" class="ic-restore-rsync-hint">
+                                    The job that installs the key is waiting in this instance's queue: the command works once it has started.
+                                </p>
+                                <p t-if="state.restoreDialog.limitBytes" class="ic-restore-rsync-hint" t-esc="doorLimitText()"/>
+                                <div class="ic-restore-rsync-wrap">
+                                    <div class="ic-restore-rsync-cmd">
+                                        <code t-esc="uploadCommand()"/>
+                                    </div>
+                                    <button class="ic-restore-copy-btn"
+                                            t-on-click="() => this.copyUploadCmd()"
+                                            t-att-title="state.restoreDialog.copied ? 'Copied!' : 'Copy'">
+                                        <i t-att-class="state.restoreDialog.copied ? 'fa fa-check' : 'fa fa-clipboard'"/>
+                                    </button>
+                                </div>
+                                <div class="ic-confirm-actions">
+                                    <button class="ic-confirm-btn-cancel"
+                                            t-att-disabled="state.restoreDialog.checking"
+                                            t-on-click="() => this.checkUpload()">Check what arrived</button>
+                                </div>
+                                <t t-if="state.restoreDialog.received">
+                                    <p class="ic-restore-rsync-hint">
+                                        Received <strong t-esc="state.restoreDialog.received.filename"/> — <t t-esc="state.restoreDialog.received.bytes"/> bytes.<br/>
+                                        SHA-256 <code t-esc="state.restoreDialog.received.sha256"/>
+                                    </p>
+                                </t>
+                            </t>
+                        </t>
+                        <t t-if="state.restoreDialog.mode === 'url'">
+                            <p class="ic-restore-rsync-hint">
+                                The host downloads the archive itself, so nothing is limited by your connection or by ours. Links with a user and password are accepted; the password is stored encrypted and never shown again.
+                            </p>
+                            <label class="ic-refresh-field">
+                                <span>Link to the backup</span>
+                                <input type="text"
+                                       placeholder="https://… , sftp://user:password@… , ftp://…"
+                                       t-att-value="state.restoreDialog.url"
+                                       t-on-input="(ev) => { state.restoreDialog.url = ev.target.value; }"/>
+                            </label>
+                        </t>
+                        <t t-if="state.inst.environment !== 'production'">
+                            <label class="ic-restore-backup-checkbox">
+                                <input
+              type="checkbox"
+              t-att-checked="state.restoreDialog.backupBeforeRestore"
+              t-on-change="(ev) => { state.restoreDialog.backupBeforeRestore = ev.target.checked; }"
+            />
+                                <span>Take a safety backup before restoring</span>
+                            </label>
+                        </t>
+                        <t t-if="state.restoreDialog.error">
+                            <div
+            class="ic-restore-error"
+            t-esc="state.restoreDialog.error"
+          />
+                        </t>
+                        <div class="ic-confirm-actions">
+                            <button
+            class="ic-confirm-btn-cancel"
+            t-on-click="closeRestore"
+          >Cancel</button>
+                            <button
+            class="ic-confirm-btn-ok"
+            t-att-disabled="state.restoreDialog.uploading or state.restoreDialog.checking"
+            t-on-click="doRestore"
+          >
+                                <t t-if="state.restoreDialog.uploading">
+                                    <i class="fa fa-spinner fa-spin" /> Uploading…
+                                </t>
+                                <t t-else=""><t t-out="env.icon('db', 15)" /> Import</t>
+                            </button>
+                        </div>
+            </IcModal>
+
+            <!-- Refresh from production dialog -->
+            <IcModal
+        t-if="state.refreshDialog"
+        title="'Refresh from production'"
+        boxClass="'ic-restore-box'"
+        onClose="() => this.closeRefreshDialog()"
+      >
+                <div class="ic-restore-header">
+                    <h3 class="ic-confirm-title">Refresh from production</h3>
+                    <span
+            class="ic-restore-instance-name"
+            t-esc="state.inst.name"
+          />
+                </div>
+
+                <t t-if="state.refreshDialog.loading">
+                    <p class="ic-restore-rsync-hint">
+                        <i class="fa fa-spinner fa-spin" /> Loading production instances…
+                    </p>
+                </t>
+                <t t-elif="!state.refreshSources.length">
+                    <p class="ic-restore-rsync-hint">
+                        This project has no deployed production instance to copy from.
+                    </p>
+                </t>
+                <t t-else="">
+                    <t t-if="state.refreshSources.length > 1">
+                        <label class="ic-refresh-field">
+                            <span class="ic-refresh-field-label">Source instance</span>
+                            <RlSelect
+                options="refreshSourceOptions"
+                value="state.refreshDialog.sourceId"
+                onChange.bind="onRefreshSourceChange"
+                placeholder.translate="— pick a production instance —"
+              />
+                        </label>
+                    </t>
+                    <t t-else="">
+                        <p class="ic-refresh-single-source">
+                            <span class="ic-refresh-field-label">Source instance</span>
+                            <strong t-esc="state.refreshSources[0].name" />
+                        </p>
+                    </t>
+
+                    <div class="ic-restore-modes">
+                        <label
+              t-att-class="'ic-restore-mode' + (state.refreshDialog.source === 'backup' ? ' active' : '') + (refreshCanUseBackup ? '' : ' disabled')"
+            >
+                            <input
+                type="radio"
+                name="refresh_source"
+                value="backup"
+                t-att-disabled="!refreshCanUseBackup"
+                t-att-checked="state.refreshDialog.source === 'backup'"
+                t-on-change="() => this.setRefreshSourceMode('backup')"
+              />
+                            <div class="ic-restore-mode-body">
+                                <span
+                  class="ic-restore-mode-title"
+                >Latest backup</span>
+                                <span class="ic-restore-mode-hint">
+                                    <t t-if="refreshCanUseBackup"
+                    >Recommended — no extra load on production</t>
+                                    <t t-else=""
+                    >Unavailable: this production has no backup destination</t>
+                                </span>
+                            </div>
+                        </label>
+                        <label
+              t-att-class="'ic-restore-mode' + (state.refreshDialog.source === 'live' ? ' active' : '')"
+            >
+                            <input
+                type="radio"
+                name="refresh_source"
+                value="live"
+                t-att-checked="state.refreshDialog.source === 'live'"
+                t-on-change="() => this.setRefreshSourceMode('live')"
+              />
+                            <div class="ic-restore-mode-body">
+                                <span
+                  class="ic-restore-mode-title"
+                >Live dump from production</span>
+                                <span
+                  class="ic-restore-mode-hint"
+                >Data as of right now; runs a dump on the live database</span>
+                            </div>
+                        </label>
+                    </div>
+
+                    <label class="ic-refresh-checkbox">
+                        <input
+              type="checkbox"
+              t-att-checked="state.refreshDialog.neutralize"
+              t-on-change="(ev) => { state.refreshDialog.neutralize = ev.target.checked; }"
+            />
+                        <span>Neutralize the database: disable scheduled actions and outgoing mail, and show the test banner</span>
+                    </label>
+
+                    <div class="ic-refresh-warning">
+                        <i class="fa fa-exclamation-triangle" />
+                        <span>This overwrites this instance's database and filestore. Its code (repositories and branches) is left untouched.</span>
+                    </div>
+                </t>
+
+                <t t-if="state.refreshDialog.error">
+                    <div
+            class="ic-restore-error"
+            t-esc="state.refreshDialog.error"
+          />
+                </t>
+
+                <div class="ic-confirm-actions">
+                    <button
+            class="ic-confirm-btn-cancel"
+            t-on-click="closeRefreshDialog"
+          >Cancel</button>
+                    <button
+            class="ic-confirm-btn-ok"
+            t-att-disabled="!state.refreshDialog.sourceId or state.refreshDialog.submitting"
+            t-on-click="doRefreshFromProduction"
+          >
+                        <t t-if="state.refreshDialog.submitting">
+                            <i class="fa fa-spinner fa-spin" /> Starting…
+                        </t>
+                        <t t-else=""><i class="fa fa-refresh" /> Refresh</t>
+                    </button>
+                </div>
+            </IcModal>
+
+            <!-- Connect as user dialog -->
+            <IcModal
+        t-if="state.connectDialog"
+        title="'Connect as user'"
+        boxClass="'ic-connect-box'"
+        onClose="() => this.closeConnectModal()"
+      >
+                <div class="ic-connect-header">
+                    <h3 class="ic-confirm-title">Connect as user</h3>
+                    <span class="ic-restore-instance-name" t-esc="state.inst.name" />
+                </div>
+                <t t-if="state.connectDialog.loading">
+                    <div class="ic-connect-loading"><i
+              class="fa fa-spinner fa-spin"
+            /> Loading users…</div>
+                </t>
+                <t t-elif="state.connectDialog.error">
+                    <div class="ic-restore-error" t-esc="state.connectDialog.error" />
+                </t>
+                <t t-elif="!state.connectDialog.users.length">
+                    <div class="ic-connect-empty">No internal users found.</div>
+                </t>
+                <t t-else="">
+                    <ul class="ic-connect-user-list">
+                        <t t-foreach="state.connectDialog.users" t-as="u" t-key="u.id">
+                            <li
+                class="ic-connect-user-item"
+                t-att-class="(state.connectDialog.connecting or !this.canConnectAsTarget(u)) ? 'ic-connect-user-item--disabled' : ''"
+                t-on-click="() => this.connectAs(u.id)"
+              >
+                                <i class="fa fa-user ic-connect-user-icon" />
+                                <span class="ic-connect-user-name" t-esc="u.name" />
+                                <span class="ic-connect-user-login" t-esc="u.login" />
+                                <t t-if="u.is_admin and !this.canConnectAsTarget(u)">
+                                    <span class="ic-connect-user-login">Admin — requires Manager</span>
+                                </t>
+                            </li>
+                        </t>
+                    </ul>
+                    <t t-if="state.connectDialog.connecting">
+                        <div class="ic-connect-loading"><i
+                class="fa fa-spinner fa-spin"
+              /> Opening session…</div>
+                    </t>
+                </t>
+                <div class="ic-confirm-actions">
+                    <button
+            class="ic-confirm-btn-cancel"
+            t-on-click="closeConnectModal"
+          >Cancel</button>
+                </div>
+            </IcModal>
+
+            <!-- Shell service picker dialog -->
+            <IcModal
+        t-if="state.shellDialog"
+        title="'Open Shell'"
+        boxClass="'ic-connect-box'"
+        onClose="() => this.closeShellDialog()"
+      >
+                <div class="ic-connect-header">
+                    <h3 class="ic-confirm-title">Open Shell</h3>
+                    <span class="ic-restore-instance-name" t-esc="state.inst.name" />
+                </div>
+                <t t-if="state.shellDialog.opening">
+                    <div class="ic-connect-loading"><i
+              class="fa fa-spinner fa-spin"
+            /> Opening terminal…</div>
+                </t>
+                <t t-elif="state.shellDialog.error">
+                    <div class="ic-restore-error" t-esc="state.shellDialog.error" />
+                </t>
+                <t t-else="">
+                    <ul class="ic-connect-user-list">
+                        <t
+              t-foreach="state.shellDialog.services"
+              t-as="svc"
+              t-key="svc"
+            >
+                            <li
+                class="ic-connect-user-item"
+                t-on-click="() => this.openShell(svc)"
+              >
+                                <i class="fa fa-cube ic-connect-user-icon" />
+                                <span class="ic-connect-user-name" t-esc="svc" />
+                            </li>
+                        </t>
+                    </ul>
+                </t>
+                <div class="ic-confirm-actions">
+                    <button
+            class="ic-confirm-btn-cancel"
+            t-on-click="closeShellDialog"
+          >Cancel</button>
+                </div>
+            </IcModal>
+
+            <!-- Create backup modal -->
+            <IcModal
+        t-if="state.createBackupModal"
+        title="'Create Backup'"
+        onClose="() => this.closeCreateBackupModal()"
+      >
+                <h3 class="ic-confirm-title">Create Backup</h3>
+                <t t-if="state.inst.environment === 'production'">
+                    <p class="ic-confirm-message">
+                        Triggers a duplicity backup to S3. The chain is incremental:
+                        full once a week, incrementals in between.
+                        A backup_list job runs right after to refresh the table below.
+                    </p>
+                </t>
+                <t t-else="">
+                    <p class="ic-confirm-message">
+                        Runs <code>click-odoo-backupdb</code> in the odoo container.
+                        The ZIP is attached to this list and <strong
+            >expires in 2 hours</strong>.
+                    </p>
+                    <div class="ic-download-group">
+                        <div class="ic-download-group-label">Contents</div>
+                        <label class="ic-download-opt">
+                            <input
+                type="radio"
+                name="cb_filestore"
+                value="all"
+                t-att-checked="state.createBackupModal.withFilestore"
+                t-on-change="() => { state.createBackupModal.withFilestore = true; }"
+              />
+                            <div>
+                                <strong>DB + filestore</strong>
+                                <span
+                  class="ic-download-hint"
+                >Includes attachments. Larger file. Restorable as-is.</span>
+                            </div>
+                        </label>
+                        <label class="ic-download-opt">
+                            <input
+                type="radio"
+                name="cb_filestore"
+                value="dump"
+                t-att-checked="!state.createBackupModal.withFilestore"
+                t-on-change="() => { state.createBackupModal.withFilestore = false; }"
+              />
+                            <div>
+                                <strong>DB only</strong>
+                                <span
+                  class="ic-download-hint"
+                >Faster, smaller. Enough for testing/debugging schema.</span>
+                            </div>
+                        </label>
+                    </div>
+                </t>
+                <div class="ic-confirm-actions">
+                    <button
+            class="ic-confirm-btn-cancel"
+            t-on-click="closeCreateBackupModal"
+          >Cancel</button>
+                    <button
+            class="ic-confirm-btn-ok"
+            t-att-disabled="state.createBackupModal.loading"
+            t-on-click="doCreateBackup"
+          >
+                        <t t-if="state.createBackupModal.loading">
+                            <i class="fa fa-spinner fa-spin" /> Starting…
+                        </t>
+                        <t t-else="">
+                            <t t-out="env.icon('plus', 15)" /> Create Backup
+                        </t>
+                    </button>
+                </div>
+            </IcModal>
+
+            <!-- Download backup modal -->
+            <IcModal
+        t-if="state.downloadModal"
+        title="'Download a database dump'"
+        onClose="() => this.closeDownloadModal()"
+      >
+                <h3 class="ic-confirm-title">Download a database dump</h3>
+                <p class="ic-confirm-message">
+                    <t t-if="isLiveNeutralDump or isLiveExactDump">
+                        Dumping the current database on the fly.
+                    </t>
+                    <t t-elif="state.downloadModal.time === 'latest'">
+                        Latest available backup.
+                    </t>
+                    <t t-else="">
+                        Backup from <strong
+              t-esc="formatBackupDate(state.downloadModal.time)"
+            />
+                    </t>
+                </p>
+                <div class="ic-download-group">
+                    <div class="ic-download-group-label">Type of dump</div>
+                    <label class="ic-download-opt">
+                        <input
+              type="radio"
+              name="dl_mode"
+              value="neutral"
+              t-att-checked="state.downloadModal.mode === 'neutral'"
+              t-on-change="() => { state.downloadModal.mode = 'neutral'; }"
+            />
+                        <div>
+                            <strong>Neutralized database dump</strong>
+                            <span
+                class="ic-download-hint"
+              >Safe for testing: crons off, mail servers archived, credentials scrubbed, red ribbon added.</span>
+                        </div>
+                    </label>
+                    <label class="ic-download-opt">
+                        <input
+              type="radio"
+              name="dl_mode"
+              value="exact"
+              t-att-checked="state.downloadModal.mode === 'exact'"
+              t-on-change="() => { state.downloadModal.mode = 'exact'; }"
+            />
+                        <div>
+                            <strong>Exact database dump</strong>
+                            <span
+                class="ic-download-hint"
+              >Real data. Handle with care — contains secrets and will send real emails if restored.</span>
+                        </div>
+                    </label>
+                </div>
+                <div class="ic-download-group">
+                    <div class="ic-download-group-label">Filestore</div>
+                    <label class="ic-download-opt">
+                        <input
+              type="radio"
+              name="dl_type"
+              value="dump"
+              t-att-checked="state.downloadModal.type === 'dump'"
+              t-on-change="() => { state.downloadModal.type = 'dump'; }"
+            />
+                        <div>
+                            <strong>Without filestore</strong>
+                            <span
+                class="ic-download-hint"
+              >Faster, smaller file. Enough for testing/troubleshooting.</span>
+                        </div>
+                    </label>
+                    <label class="ic-download-opt">
+                        <input
+              type="radio"
+              name="dl_type"
+              value="all"
+              t-att-checked="state.downloadModal.type === 'all'"
+              t-on-change="() => { state.downloadModal.type = 'all'; }"
+            />
+                        <div>
+                            <strong>With filestore</strong>
+                            <span
+                class="ic-download-hint"
+              >Includes attachments. Larger file.</span>
+                        </div>
+                    </label>
+                </div>
+                <div class="ic-confirm-actions">
+                    <button
+            class="ic-confirm-btn-cancel"
+            t-on-click="closeDownloadModal"
+          >Cancel</button>
+                    <button
+            class="ic-confirm-btn-ok"
+            t-att-disabled="state.downloadModal.loading"
+            t-on-click="doDownloadBackup"
+          >
+                        <t t-if="state.downloadModal.loading">
+                            <i class="fa fa-spinner fa-spin" /> Preparing…
+                        </t>
+                        <t t-else="">
+                            <t t-out="env.icon('download', 15)" /> Download
+                        </t>
+                    </button>
+                </div>
+            </IcModal>
+
+            <!-- Restore backup modal (production, dangerous) -->
+            <IcModal
+        t-if="state.restoreBackupModal"
+        title="'Restore Backup'"
+        boxClass="'ic-confirm-box ic-restore-backup-box'"
+        onClose="() => this.closeRestoreBackupModal()"
+      >
+                <h3 class="ic-confirm-title ic-danger-title">
+                    <t t-out="env.icon('alert', 15)" /> Restore Backup
+                </h3>
+                <p class="ic-restore-warning">
+                    This will <strong>permanently destroy</strong> the current database
+                    and replace it with the backup from
+                    <strong t-esc="formatBackupDate(state.restoreBackupModal.time)" />.
+                </p>
+                <p class="ic-restore-warning">
+                    This action <strong>cannot be undone</strong>.
+                </p>
+                <p class="ic-restore-warning" t-if="state.inst.auto_update !== false">
+                    Its modules are then updated to the code the instance
+                    runs now. To undo a deployment, revert its code first,
+                    or its migration runs again.
+                </p>
+                <div class="ic-restore-confirm-input">
+                    <label>Type the instance name to confirm:
+                        <strong t-esc="state.inst.name" />
+                    </label>
+                    <input
+            type="text"
+            placeholder="Instance name"
+            t-att-value="state.restoreBackupModal.confirmName"
+            t-on-input="(ev) => { state.restoreBackupModal.confirmName = ev.target.value; }"
+          />
+                </div>
+                <div class="ic-confirm-actions">
+                    <button
+            class="ic-confirm-btn-cancel"
+            t-on-click="closeRestoreBackupModal"
+          >Cancel</button>
+                    <button
+            class="ic-confirm-btn-ok danger"
+            t-att-disabled="!restoreNameMatches or state.restoreBackupModal.loading"
+            t-on-click="doRestoreBackup"
+          >
+                        <t t-if="state.restoreBackupModal.loading">
+                            <i class="fa fa-spinner fa-spin" /> Restoring…
+                        </t>
+                        <t t-else="">
+                            <t t-out="env.icon('restore', 15)" /> Restore
+                        </t>
+                    </button>
+                </div>
+            </IcModal>
+
+            <!-- Remove deployed instance modal (keep in panel / delete completely) -->
+            <IcModal
+        t-if="state.removeModal"
+        title="'Remove instance'"
+        boxClass="'ic-remove-box'"
+        onClose="() => this.closeRemoveModal()"
+      >
+                <h3 class="ic-confirm-title">Remove instance</h3>
+                <p class="ic-confirm-message">
+                    Remove "<strong
+            t-esc="state.removeModal.instance.name"
+          />" from the host?
+                    Both options stop the containers and delete the instance
+                    directory, <strong>database and filestore included</strong>.
+                    They differ only in what is left in this panel.
+                </p>
+
+                <p
+          class="ic-remove-note"
+          t-if="state.removeModal.instance.effective_backup_backend_id"
+        >
+                    <strong>Delete completely</strong> also erases every backup
+                    stored in
+                    <strong
+            t-esc="state.removeModal.instance.effective_backup_backend_name"
+          />, so nothing is left behind that no instance owns. That runs before
+                    the containers come down — the only moment anything can
+                    still reach the storage — and if it fails the instance is
+                    not deleted at all.
+                    <strong>Keep in panel</strong> archives it instead: a fresh
+                    full backup is taken now and everything older is pruned, so
+                    exactly one restorable copy survives. The instance moves to
+                    the project's Archived tab, where it can be brought back on
+                    any host and restored from that copy.
+                </p>
+                <p class="ic-remove-note danger" t-else="">
+                    This instance has no backup destination, so what is
+                    destroyed here cannot be recovered.
+                </p>
+
+                <!-- The name is asked for from memory or from the page
+                     header on purpose: it is NOT rendered selectable
+                     inside this box. If it could be copied from the
+                     dialog itself the barrier would evaporate. -->
+                <label class="ic-remove-typed-label">
+                    To delete completely, type the instance name:
+                    <input
+            type="text"
+            class="ic-remove-typed"
+            autocomplete="off"
+            spellcheck="false"
+            t-att-value="state.removeModal.typed"
+            t-on-input="(ev) => this.state.removeModal.typed = ev.target.value"
+          />
+                </label>
+
+                <div class="ic-remove-options">
+                    <button
+            class="ic-remove-option"
+            t-on-click="() => this._removeFromHost(true)"
+          >
+                        <span class="ic-remove-option-title">Keep in panel</span>
+                        <span class="ic-remove-option-desc">
+                            The record stays as a draft, keeping its repos,
+                            dependencies, domains and resource limits, ready to
+                            deploy again here or on another host. It comes back
+                            empty.
+                        </span>
+                    </button>
+                    <button
+            class="ic-remove-option danger"
+            t-att-disabled="!removeConfirmed"
+            t-on-click="() => this._removeFromHost(false)"
+          >
+                        <span class="ic-remove-option-title">Delete completely</span>
+                        <span class="ic-remove-option-desc">
+                            The record and its configuration are removed from
+                            the panel too, and its backups with them. Past job
+                            logs survive, no longer attached to any instance.
+                        </span>
+                    </button>
+                </div>
+
+                <div class="ic-confirm-actions">
+                    <!-- autofocus: IcModal honours it over the first
+                         focusable, so the Enter that lands here before
+                         the dialog is read cancels. Both options below
+                         destroy the data. -->
+                    <button
+            class="ic-confirm-btn-cancel"
+            autofocus="autofocus"
+            t-on-click="closeRemoveModal"
+          >Cancel</button>
+                </div>
+            </IcModal>
+
+            <!-- Confirm dialog -->
+            <IcConfirmDialog
+        t-if="state.confirmDialog"
+        title="state.confirmDialog.title"
+        message="state.confirmDialog.message"
+        confirmLabel="state.confirmDialog.confirmLabel"
+        isDanger="state.confirmDialog.isDanger"
+        onConfirm="state.confirmDialog.onConfirm"
+        onCancel="state.confirmDialog.onCancel"
+      />
+
+            <!-- Sync with project modal -->
+            <IcModal
+        t-if="state.syncModal"
+        title="'Sync with project'"
+        boxClass="'ic-sync-box'"
+        onClose="() => this.closeSyncModal()"
+      >
+                        <h3 class="ic-confirm-title">Sync with project</h3>
+                        <p class="ic-sync-sub">
+                            Compare this instance's dependencies and repos with the project template.
+                            Select items to transfer.
+                        </p>
+
+                        <t t-if="state.syncModal.loading">
+                            <div class="ic-sync-loading"><i
+              class="fa fa-spinner fa-spin"
+            /> Comparing…</div>
+                        </t>
+
+                        <t t-elif="state.syncModal.error">
+                            <div
+            class="ic-restore-error"
+            t-esc="state.syncModal.error"
+          />
+                        </t>
+
+                        <t t-elif="!syncHasDifferences">
+                            <div class="ic-sync-empty">
+                                <t
+              t-out="env.icon('check', 15)"
+            /> Everything is in sync.
+                            </div>
+                        </t>
+
+                        <t t-else="">
+                            <t t-if="syncShowSelectAll">
+                                <div class="ic-sync-all">
+                                    <label class="ic-sync-selectall">
+                                        <input
+                      type="checkbox"
+                      t-att-checked="syncAllState.checked"
+                      t-att-indeterminate="syncAllState.indeterminate"
+                      t-on-change="toggleSyncAll"
+                    />
+                                        <span>Select all changes</span>
+                                    </label>
+                                </div>
+                            </t>
+                            <div class="ic-sync-sections">
+                                <!-- PIP section -->
+                                <t t-set="pipDiff" t-value="state.syncModal.diff.pip" />
+                                <t
+              t-if="pipDiff.only_instance.length or pipDiff.only_project.length or pipDiff.conflicts.length"
+            >
+                                    <div class="ic-sync-section">
+                                        <div class="ic-sync-section-head">
+                                            <div
+                                              class="ic-sync-section-title"
+                                              id="ic-sync-title-pip"
+                                            >Python Dependencies (pip)</div>
+                                            <t t-call="incubacloud.InstanceDetail.syncSelectAll">
+                                                <t t-set="sec" t-value="'pip'" />
+                                            </t>
+                                        </div>
+                                        <t
+                  t-foreach="pipDiff.only_instance"
+                  t-as="line"
+                  t-key="'pi_' + line"
+                >
+                                            <label class="ic-sync-item">
+                                                <input
+                      type="checkbox"
+                      t-att-checked="state.syncModal.actions.pip.push[line]"
+                      t-on-change="() => this.toggleSyncAction('pip', 'push', line)"
+                    />
+                                                <code t-esc="line" />
+                                                <span
+                      class="ic-sync-tag ic-sync-tag-push"
+                    >instance only</span>
+                                                <span
+                      class="ic-sync-direction"
+                    >→ push to project</span>
+                                            </label>
+                                        </t>
+                                        <t
+                  t-foreach="pipDiff.only_project"
+                  t-as="line"
+                  t-key="'pp_' + line"
+                >
+                                            <label class="ic-sync-item">
+                                                <input
+                      type="checkbox"
+                      t-att-checked="state.syncModal.actions.pip.pull[line]"
+                      t-on-change="() => this.toggleSyncAction('pip', 'pull', line)"
+                    />
+                                                <code t-esc="line" />
+                                                <span
+                      class="ic-sync-tag ic-sync-tag-pull"
+                    >project only</span>
+                                                <span
+                      class="ic-sync-direction"
+                    >← pull to instance</span>
+                                            </label>
+                                        </t>
+                                        <t
+                  t-foreach="pipDiff.conflicts"
+                  t-as="c"
+                  t-key="'pc_' + c.name"
+                >
+                                            <div class="ic-sync-conflict">
+                                                <div class="ic-sync-conflict-title">
+                                                    <span
+                        class="ic-sync-tag ic-sync-tag-conflict"
+                      >differs</span>
+                                                    <strong t-esc="c.name" />
+                                                </div>
+                                                <label class="ic-sync-conflict-opt">
+                                                    <input
+                        type="radio"
+                        t-att-name="'pip_c_' + c.name"
+                        t-att-checked="state.syncModal.actions.pip.conflicts[c.name] === 'instance'"
+                        t-on-change="() => this.setSyncConflict('pip', c.name, 'instance')"
+                      />
+                                                    <code t-esc="c.instance_line" />
+                                                    <span
+                        class="ic-sync-hint"
+                      >(instance)</span>
+                                                </label>
+                                                <label class="ic-sync-conflict-opt">
+                                                    <input
+                        type="radio"
+                        t-att-name="'pip_c_' + c.name"
+                        t-att-checked="state.syncModal.actions.pip.conflicts[c.name] === 'project'"
+                        t-on-change="() => this.setSyncConflict('pip', c.name, 'project')"
+                      />
+                                                    <code t-esc="c.project_line" />
+                                                    <span
+                        class="ic-sync-hint"
+                      >(project)</span>
+                                                </label>
+                                                <label class="ic-sync-conflict-opt">
+                                                    <input
+                        type="radio"
+                        t-att-name="'pip_c_' + c.name"
+                        t-att-checked="!state.syncModal.actions.pip.conflicts[c.name]"
+                        t-on-change="() => this.setSyncConflict('pip', c.name, null)"
+                      />
+                                                    <span
+                        class="ic-sync-hint"
+                      >skip</span>
+                                                </label>
+                                            </div>
+                                        </t>
+                                    </div>
+                                </t>
+
+                                <!-- APT section -->
+                                <t t-set="aptDiff" t-value="state.syncModal.diff.apt" />
+                                <t
+              t-if="aptDiff.only_instance.length or aptDiff.only_project.length or aptDiff.conflicts.length"
+            >
+                                    <div class="ic-sync-section">
+                                        <div class="ic-sync-section-head">
+                                            <div
+                                              class="ic-sync-section-title"
+                                              id="ic-sync-title-apt"
+                                            >System Dependencies (apt)</div>
+                                            <t t-call="incubacloud.InstanceDetail.syncSelectAll">
+                                                <t t-set="sec" t-value="'apt'" />
+                                            </t>
+                                        </div>
+                                        <t
+                  t-foreach="aptDiff.only_instance"
+                  t-as="line"
+                  t-key="'ai_' + line"
+                >
+                                            <label class="ic-sync-item">
+                                                <input
+                      type="checkbox"
+                      t-att-checked="state.syncModal.actions.apt.push[line]"
+                      t-on-change="() => this.toggleSyncAction('apt', 'push', line)"
+                    />
+                                                <code t-esc="line" />
+                                                <span
+                      class="ic-sync-tag ic-sync-tag-push"
+                    >instance only</span>
+                                                <span
+                      class="ic-sync-direction"
+                    >→ push to project</span>
+                                            </label>
+                                        </t>
+                                        <t
+                  t-foreach="aptDiff.only_project"
+                  t-as="line"
+                  t-key="'ap_' + line"
+                >
+                                            <label class="ic-sync-item">
+                                                <input
+                      type="checkbox"
+                      t-att-checked="state.syncModal.actions.apt.pull[line]"
+                      t-on-change="() => this.toggleSyncAction('apt', 'pull', line)"
+                    />
+                                                <code t-esc="line" />
+                                                <span
+                      class="ic-sync-tag ic-sync-tag-pull"
+                    >project only</span>
+                                                <span
+                      class="ic-sync-direction"
+                    >← pull to instance</span>
+                                            </label>
+                                        </t>
+                                        <t
+                  t-foreach="aptDiff.conflicts"
+                  t-as="c"
+                  t-key="'ac_' + c.name"
+                >
+                                            <div class="ic-sync-conflict">
+                                                <div class="ic-sync-conflict-title">
+                                                    <span
+                        class="ic-sync-tag ic-sync-tag-conflict"
+                      >differs</span>
+                                                    <strong t-esc="c.name" />
+                                                </div>
+                                                <label class="ic-sync-conflict-opt">
+                                                    <input
+                        type="radio"
+                        t-att-name="'apt_c_' + c.name"
+                        t-att-checked="state.syncModal.actions.apt.conflicts[c.name] === 'instance'"
+                        t-on-change="() => this.setSyncConflict('apt', c.name, 'instance')"
+                      />
+                                                    <code t-esc="c.instance_line" />
+                                                    <span
+                        class="ic-sync-hint"
+                      >(instance)</span>
+                                                </label>
+                                                <label class="ic-sync-conflict-opt">
+                                                    <input
+                        type="radio"
+                        t-att-name="'apt_c_' + c.name"
+                        t-att-checked="state.syncModal.actions.apt.conflicts[c.name] === 'project'"
+                        t-on-change="() => this.setSyncConflict('apt', c.name, 'project')"
+                      />
+                                                    <code t-esc="c.project_line" />
+                                                    <span
+                        class="ic-sync-hint"
+                      >(project)</span>
+                                                </label>
+                                                <label class="ic-sync-conflict-opt">
+                                                    <input
+                        type="radio"
+                        t-att-name="'apt_c_' + c.name"
+                        t-att-checked="!state.syncModal.actions.apt.conflicts[c.name]"
+                        t-on-change="() => this.setSyncConflict('apt', c.name, null)"
+                      />
+                                                    <span
+                        class="ic-sync-hint"
+                      >skip</span>
+                                                </label>
+                                            </div>
+                                        </t>
+                                    </div>
+                                </t>
+
+                                <!-- Repos section -->
+                                <t
+              t-set="reposDiff"
+              t-value="state.syncModal.diff.repos"
+            />
+                                <t
+              t-if="reposDiff.only_instance.length or reposDiff.only_project.length or reposDiff.conflicts.length"
+            >
+                                    <div class="ic-sync-section">
+                                        <div class="ic-sync-section-head">
+                                            <div
+                                              class="ic-sync-section-title"
+                                              id="ic-sync-title-repos"
+                                            >Repositories</div>
+                                            <t t-call="incubacloud.InstanceDetail.syncSelectAll">
+                                                <t t-set="sec" t-value="'repos'" />
+                                            </t>
+                                        </div>
+                                        <t
+                  t-foreach="reposDiff.only_instance"
+                  t-as="r"
+                  t-key="'ri_' + r.url"
+                >
+                                            <label class="ic-sync-item">
+                                                <input
+                      type="checkbox"
+                      t-att-checked="state.syncModal.actions.repos.push[r.url]"
+                      t-on-change="() => this.toggleSyncAction('repos', 'push', r.url)"
+                    />
+                                                <code t-esc="r.url" />
+                                                <span
+                      class="ic-sync-hint"
+                      t-esc="'@' + r.branch"
+                    />
+                                                <span
+                      class="ic-sync-tag ic-sync-tag-push"
+                    >instance only</span>
+                                                <span
+                      class="ic-sync-direction"
+                    >→ push to project</span>
+                                            </label>
+                                        </t>
+                                        <t
+                  t-foreach="reposDiff.only_project"
+                  t-as="r"
+                  t-key="'rp_' + r.url"
+                >
+                                            <label class="ic-sync-item">
+                                                <input
+                      type="checkbox"
+                      t-att-checked="state.syncModal.actions.repos.pull[r.url]"
+                      t-on-change="() => this.toggleSyncAction('repos', 'pull', r.url)"
+                    />
+                                                <code t-esc="r.url" />
+                                                <span
+                      class="ic-sync-hint"
+                      t-esc="'@' + r.branch"
+                    />
+                                                <span
+                      class="ic-sync-tag ic-sync-tag-pull"
+                    >project only</span>
+                                                <span
+                      class="ic-sync-direction"
+                    >← pull to instance</span>
+                                            </label>
+                                        </t>
+                                        <t
+                  t-foreach="reposDiff.conflicts"
+                  t-as="c"
+                  t-key="'rc_' + c.url"
+                >
+                                            <div class="ic-sync-conflict">
+                                                <div class="ic-sync-conflict-title">
+                                                    <span
+                        class="ic-sync-tag ic-sync-tag-conflict"
+                      >differs</span>
+                                                    <code t-esc="c.url" />
+                                                </div>
+                                                <t
+                      t-foreach="Object.entries(c.fields)"
+                      t-as="entry"
+                      t-key="entry[0]"
+                    >
+                                                    <div class="ic-sync-conflict-field">
+                                                        <span
+                          class="ic-sync-field-name"
+                          t-esc="entry[0]"
+                        />:
+                                                        <span class="ic-sync-hint">
+                                                            instance=<code
+                            t-esc="entry[1].instance || '(empty)'"
+                          />
+                                                            project=<code
+                            t-esc="entry[1].project || '(empty)'"
+                          />
+                                                        </span>
+                                                    </div>
+                                                </t>
+                                                <div class="ic-sync-conflict-opts">
+                                                    <label class="ic-sync-conflict-opt">
+                                                        <input
+                          type="radio"
+                          t-att-name="'repo_c_' + c.url"
+                          t-att-checked="state.syncModal.actions.repos.conflicts[c.url] === 'instance'"
+                          t-on-change="() => this.setSyncConflict('repos', c.url, 'instance')"
+                        />
+                                                        <span>Use instance values</span>
+                                                    </label>
+                                                    <label class="ic-sync-conflict-opt">
+                                                        <input
+                          type="radio"
+                          t-att-name="'repo_c_' + c.url"
+                          t-att-checked="state.syncModal.actions.repos.conflicts[c.url] === 'project'"
+                          t-on-change="() => this.setSyncConflict('repos', c.url, 'project')"
+                        />
+                                                        <span>Use project values</span>
+                                                    </label>
+                                                    <label class="ic-sync-conflict-opt">
+                                                        <input
+                          type="radio"
+                          t-att-name="'repo_c_' + c.url"
+                          t-att-checked="!state.syncModal.actions.repos.conflicts[c.url]"
+                          t-on-change="() => this.setSyncConflict('repos', c.url, null)"
+                        />
+                                                        <span>Skip</span>
+                                                    </label>
+                                                </div>
+                                            </div>
+                                        </t>
+                                    </div>
+                                </t>
+                            </div>
+                        </t>
+
+                        <div class="ic-confirm-actions">
+                            <button
+            class="ic-confirm-btn-cancel"
+            t-on-click="closeSyncModal"
+          >Cancel</button>
+                            <t t-if="syncHasDifferences">
+                                <button
+              class="ic-confirm-btn-ok"
+              t-att-disabled="!syncHasSelections or state.syncModal.applying"
+              t-on-click="applySyncActions"
+            >
+                                    <t t-if="state.syncModal.applying">
+                                        <i class="fa fa-spinner fa-spin" /> Applying…
+                                    </t>
+                                    <t t-else="">Apply selected</t>
+                                </button>
+                            </t>
+                        </div>
+            </IcModal>
+
+            <!-- Blocked deploy dialog -->
+            <IcModal
+        t-if="state.conflictBlocked"
+        title="'Deploy blocked'"
+        boxClass="'ic-conflict-box'"
+        onClose="() => { state.conflictBlocked = null; }"
+      >
+                <div class="ic-conflict-header">
+                    <span class="ic-conflict-icon">!</span>
+                    <h3>Deploy blocked</h3>
+                </div>
+                <p
+          class="ic-conflict-description"
+          t-esc="state.conflictBlocked.message"
+        />
+                <div class="ic-confirm-actions">
+                    <button
+            class="ic-confirm-btn-cancel"
+            t-on-click="() => { state.conflictBlocked = null; }"
+          >Close</button>
+                    <button
+            class="ic-confirm-btn-ok"
+            t-on-click="() => { state.conflictBlocked = null; env.toggleSlideOver('alerts'); }"
+          >
+                        Go to Alerts
+                    </button>
+                </div>
+            </IcModal>
+
+        </div>
+    </t>
+
+    <!-- "Select all" box in the head of a section of the Sync with project
+         modal. Takes ``sec`` (pip, apt or repos); a section with only
+         conflicts has no rows to tick and shows none. Its name is its
+         own label plus the section's title, so a screen reader tells
+         the boxes apart. -->
+    <t t-name="incubacloud.InstanceDetail.syncSelectAll">
+        <t t-set="selectState" t-value="syncSectionState(sec)" />
+        <label t-if="selectState.total" class="ic-sync-selectall">
+            <input
+                type="checkbox"
+                t-att-aria-labelledby="'ic-sync-all-' + sec + ' ic-sync-title-' + sec"
+                t-att-checked="selectState.checked"
+                t-att-indeterminate="selectState.indeterminate"
+                t-on-change="() => this.toggleSyncSection(sec)"
+            />
+            <span t-att-id="'ic-sync-all-' + sec">Select all</span>
+        </label>
+    </t>
+
+    <!-- ════════════════════════════════════════════════════════════════════════
+         SHARED TAB BODY (general / database / networking / email / build /
+         config / resources / dependencies / repos / backups / audit). Repos
+         is kept mounted via display:none to preserve the branch cache.
+         On the instance's page it shows the open tab. The new-instance page
+         calls it once per section, with ``section`` set to that section's
+         key, and it shows that section alone.
+         ════════════════════════════════════════════════════════════════════════ -->
+    <t t-name="incubacloud.InstanceDetail.tabBody">
+        <t t-set="bodyTab" t-value="section || state.tab"/>
+
+        <!-- ── General ──────────────────────────────────────────────────────── -->
+        <t t-if="bodyTab === 'general'">
+            <div class="ic-inst-col">
+                <div class="ic-set-block">
+                    <div class="ic-set-block__body">
+                        <div class="ic-rgrid">
+                            <t t-if="!isCreate and state.inst.deployed">
+                                <div class="ic-w-l">
+                                    <div class="ic-locked-notice">
+                                        Locked: Name, Host and Odoo Version cannot be changed after deployment.
+                                    </div>
+                                </div>
+                            </t>
+                            <div
+                class="rl-frow ic-w-m"
+                t-att-class="validator.fieldError('name') ? 'has-error' : ''"
+              >
+                                <label for="idet-name">Name <span class="rl-req">*</span></label>
+                                <input
+                  id="idet-name"
+                    t-att-aria-invalid="validator.fieldError('name') ? 'true' : undefined"
+                    t-att-aria-describedby="validator.fieldError('name') ? 'idet-err-name' : undefined"
+                  type="text"
+                  t-att-placeholder="state.form.environment === 'staging' ? 'myproject-staging' : 'myproject'"
+                  t-att-value="state.form.name"
+                  t-att-disabled="(!isCreate and state.inst.deployed) || null"
+                  t-on-input="(ev) => this.onInput('name', ev)"
+                  t-on-blur="() => validator.touch('name', state.form)"
+                />
+                                <t t-if="validator.fieldError('name')">
+                                    <span
+                    class="ic-field-error"
+                      t-att-id="'idet-err-name'"
+                    t-esc="validator.fieldError('name')"
+                  />
+                                </t>
+                            </div>
+                            <div
+                class="rl-frow ic-host-row ic-w-m"
+                t-att-class="validator.fieldError('host_id') ? 'has-error' : ''"
+              >
+                                <label for="idet-host_id">Host
+                                    <t t-if="!state.autoassignEnabled">
+                                        <span class="rl-req">*</span>
+                                    </t>
+                                </label>
+                                <t t-if="!state.hosts.length and !state.autoassignEnabled">
+                                    <span class="ic-form-note ic-no-host-note">No host ready for this instance yet.</span>
+                                    <button type="button" class="rl-btn rl-btn-sm ic-no-host-add"
+                                            t-on-click="() => env.navigate('hosts', {})">
+                                        Add a host →
+                                    </button>
+                                </t>
+                                <t t-else="">
+                                    <RlSelect
+                    id="'idet-host_id'"
+                    ariaInvalid="validator.fieldError('host_id') ? true : false"
+                    ariaDescribedby="validator.fieldError('host_id') ? 'idet-err-host_id' : undefined"
+                    value="state.form.host_id"
+                    options="hostOptions"
+                    emptyLabel="state.autoassignEnabled ? 'Auto (recommended)' : '— select host —'"
+                    disabled="hostLocked"
+                    onChange="(value) => { this.onHostSelect({ target: { value: value } }); validator.touch('host_id', state.form); }"
+                    ariaLabel="'Host'"
+                  />
+                                </t>
+                                <t t-if="validator.fieldError('host_id')">
+                                    <span
+                    class="ic-field-error"
+                      t-att-id="'idet-err-host_id'"
+                    t-esc="validator.fieldError('host_id')"
+                  />
+                                </t>
+                            </div>
+                            <div class="rl-frow ic-w-m">
+                                <label for="idet-odoo_admin_password" id="idet-odoo_admin_password-label">Admin password</label>
+                                <PasswordInput
+                  id="'idet-odoo_admin_password'"
+                  value="state.form.odoo_admin_password"
+                  autoGenerate="true"
+                  hasValue="state.has_odoo_admin_password"
+                  required="true"
+                  onChange="(val) => this.onPasswordChange('odoo_admin_password', val)"
+                />
+                            </div>
+                            <div class="ic-w-m ic-rgrid__gap" aria-hidden="true"/>
+                            <div class="rl-frow ic-w-l">
+                                <label for="idet-tags">Tags</label>
+                                <TagSelector
+                  id="'idet-tags'"
+                  selected="state.selectedTags"
+                  available="state.allTags"
+                  onAdd.bind="addTag"
+                  onRemove.bind="removeTag"
+                  onCreate.bind="createTag"
+                />
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Whether the whole staging stays: not a matter of the
+                     network, where it used to sit. -->
+                <t t-if="!isCreate and state.form.environment === 'staging'">
+                    <section class="ic-set-block" aria-labelledby="idet-g-purge">
+                        <div class="ic-set-block__head">
+                            <h3 class="ic-set-block__title" id="idet-g-purge">Automatic purge</h3>
+                        </div>
+                        <div class="ic-set-block__body">
+                            <div class="rl-ftoggle">
+                                <div>
+                                    <div class="rl-tl-label">Never purge automatically</div>
+                                    <div
+                      class="rl-th"
+                    >keep this staging out of the autopurge for good. For the permanent ones — a QA environment nobody logs into for months is still not disposable.</div>
+                                </div>
+                                <button
+                  type="button"
+                  t-att-class="'rl-sw' + (state.form.autopurge_exempt ? ' on' : '')"
+                  role="switch"
+                  t-att-aria-checked="state.form.autopurge_exempt ? 'true' : 'false'"
+                  aria-label="Toggle never purge automatically"
+                  t-on-click="() => { state.form.autopurge_exempt = !state.form.autopurge_exempt; state.saved = false; }"
+                />
+                            </div>
+                        </div>
+                    </section>
+                </t>
+            </div>
+        </t>
+
+        <!-- ── Database ─────────────────────────────────────────────────────── -->
+        <t t-if="bodyTab === 'database'">
+            <div class="ic-inst-col">
+                <div class="ic-set-block">
+                    <div class="ic-set-block__body">
+                        <div class="ic-rgrid">
+                            <t t-if="!isCreate and state.inst.deployed">
+                                <div class="ic-w-l">
+                                    <div class="ic-locked-notice">
+                                        Locked: Database fields cannot be changed after deployment.
+                                    </div>
+                                </div>
+                            </t>
+                            <div class="rl-frow ic-w-s">
+                                <label for="idet-postgres_version">PostgreSQL version</label>
+                                <RlSelect
+                  id="'idet-postgres_version'"
+                  options="pgVersions"
+                  value="state.form.postgres_version"
+                  disabled="(!isCreate and state.inst.deployed)"
+                  onChange="(value) => this.onPgSelect({ target: { value: value } })"
+                />
+                            </div>
+                            <div class="ic-w-s ic-rgrid__gap" aria-hidden="true"/>
+                            <div class="rl-frow ic-w-m">
+                                <label for="idet-postgres_username">DB user</label>
+                                <input
+                  id="idet-postgres_username"
+                  type="text"
+                  placeholder="odoo"
+                  t-att-disabled="(!isCreate and state.inst.deployed) || null"
+                  t-att-value="state.form.postgres_username"
+                  t-on-input="(ev) => this.onInput('postgres_username', ev)"
+                />
+                            </div>
+                            <div class="rl-frow ic-w-m">
+                                <label for="idet-postgres_password" id="idet-postgres_password-label">DB password</label>
+                                <PasswordInput
+                  id="'idet-postgres_password'"
+                  value="state.form.postgres_password"
+                  autoGenerate="true"
+                  hasValue="state.has_postgres_password"
+                  required="true"
+                  onChange="(val) => this.onPasswordChange('postgres_password', val)"
+                />
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </t>
+
+        <!-- ── Networking: the names the instance answers to, and what it
+             shows on them. ─────────────────────────────────────────────── -->
+        <t t-if="bodyTab === 'networking'">
+            <div class="ic-inst-col">
+                <section class="ic-set-block" aria-labelledby="idet-g-domains">
+                    <div class="ic-set-block__head">
+                        <h3 class="ic-set-block__title" id="idet-g-domains">Domains <span
+                  class="rl-opt"
+                >— auto-generated if empty</span></h3>
+                    </div>
+                    <div class="ic-set-block__body">
+                        <div class="ic-domains-list">
+                            <t
+                t-foreach="state.form.domains || []"
+                t-as="d"
+                t-key="d_index"
+              >
+                                <div class="ic-domain-row">
+                                    <input
+                    type="text"
+                    class="ic-domain-hostname"
+                    placeholder="example.com"
+                    t-att-value="d.hostname"
+                    t-on-input="(ev) => this.onDomainChange(d_index, 'hostname', ev.target.value)"
+                  />
+                                    <input
+                    type="text"
+                    class="ic-domain-redirect"
+                    placeholder="redirect to (optional)"
+                    t-att-value="d.redirect_to"
+                    t-on-input="(ev) => this.onDomainChange(d_index, 'redirect_to', ev.target.value)"
+                  />
+                                    <div class="ic-domain-tls">
+                                        <label
+                      class="ic-domain-permanent"
+                      title="Permanent redirect (301) instead of temporary (302)."
+                      t-att-class="{ 'ic-domain-permanent--off': !d.redirect_to }"
+                    >
+                                            <input
+                        type="checkbox"
+                        t-att-checked="d.redirect_permanent"
+                        t-att-disabled="!d.redirect_to"
+                        t-on-change="(ev) => this.onDomainChange(d_index, 'redirect_permanent', ev.target.checked)"
+                      />
+                                            <span>301</span>
+                                        </label>
+                                        <div
+                      class="ic-domain-cert"
+                      title="Automatic: the host decides — its own certificate when a CDN answers for this name and that certificate covers it, Let's Encrypt otherwise. Let's Encrypt: issue a certificate automatically. Existing certificate: serve a certificate held on the host (its default one on Host › Traefik, or one loaded by hand per RB-12); the deploy stops if the host holds none. No TLS: no TLS config for this router; the host proxy still redirects HTTP to HTTPS, so in practice this ends up self-signed."
+                    >
+                                            <RlSelect
+                        options="certResolverOptions"
+                        value="d.cert_resolver || 'auto'"
+                        onChange="(value) => this.onDomainChange(d_index, 'cert_resolver', value)"
+                      />
+                                        </div>
+                                    </div>
+                                    <button
+                    class="ic-domain-remove"
+                    title="Remove"
+                    t-on-click="() => this.removeDomain(d_index)"
+                  >
+                                        <t t-out="env.icon('x', 15)" />
+                                    </button>
+                                </div>
+                            </t>
+                            <button class="ic-domain-add" t-on-click="addDomain">
+                                + Add domain
+                            </button>
+                        </div>
+                    </div>
+                </section>
+
+                <t t-if="!isCreate and (state.form.odoo_proxy || 'traefik') === 'traefik'">
+                    <section class="ic-set-block" aria-labelledby="idet-g-public">
+                        <div class="ic-set-block__head">
+                            <h3 class="ic-set-block__title" id="idet-g-public">Public pages</h3>
+                        </div>
+                        <div class="ic-set-block__body">
+                            <div class="rl-ftoggle">
+                                <div>
+                                    <div
+                      class="rl-tl-label"
+                    >Allow Odoo's public website info page</div>
+                                    <div
+                      class="rl-th"
+                    >Odoo lists the installed apps and its version at /website/info. Blocked by default; a rebuild applies the change.</div>
+                                </div>
+                                <button
+                  type="button"
+                  t-att-class="'rl-sw' + (state.form.website_info_public ? ' on' : '')"
+                  role="switch"
+                  t-att-aria-checked="state.form.website_info_public ? 'true' : 'false'"
+                  aria-label="Toggle public website info page"
+                  t-on-click="() => { state.form.website_info_public = !state.form.website_info_public; state.saved = false; }"
+                />
+                            </div>
+                        </div>
+                    </section>
+                </t>
+            </div>
+        </t>
+
+        <!-- ── Email (production): the relay its outgoing mail leaves by. A
+             staging's mail never leaves the server (Mails), so it has no
+             such tab; its relay values are kept, and copied by a clone. ── -->
+        <t t-if="bodyTab === 'email'">
+            <div class="ic-inst-col">
+                <p class="ic-smtp-note ic-inst-lead" t-esc="mailCaptureNotice"/>
+                <section class="ic-set-block" aria-labelledby="idet-g-relay">
+                    <div class="ic-set-block__head">
+                        <h3 class="ic-set-block__title" id="idet-g-relay">Outgoing mail relay</h3>
+                    </div>
+                    <div class="ic-set-block__body">
+                        <div class="ic-rgrid">
+                            <t t-if="showsRelayAuth">
+                                <div class="rl-frow ic-w-m">
+                                    <label for="idet-smtp_relay_auth">SMTP authentication</label>
+                                    <RlSelect
+                    id="'idet-smtp_relay_auth'"
+                    options="relayAuthOptions"
+                    ariaLabel="'SMTP authentication'"
+                    value="state.form.smtp_relay_auth"
+                    onChange="(value) => this.onRelayAuthChange(value)"
+                  />
+                                </div>
+                                <div class="ic-w-m ic-rgrid__gap" aria-hidden="true"/>
+                            </t>
+                            <div class="rl-frow ic-w-m">
+                                <label for="idet-smtp_relay_host">SMTP host <span
+                    t-if="!isOAuthRelay"
+                    class="rl-opt"
+                  >— leave empty to skip</span></label>
+                                <input
+                  type="text"
+                  id="idet-smtp_relay_host"
+                  placeholder="smtp.example.com"
+                  t-att-value="state.form.smtp_relay_host"
+                  t-att-readonly="isOAuthRelay ? 'readonly' : undefined"
+                  t-on-input="(ev) => this.onInput('smtp_relay_host', ev)"
+                />
+                            </div>
+                            <div
+                class="rl-frow ic-w-s"
+                t-att-class="validator.fieldError('smtp_relay_port') ? 'has-error' : ''"
+              >
+                                <label for="idet-smtp_relay_port">SMTP port</label>
+                                <input
+                    id="idet-smtp_relay_port"
+                    t-att-aria-invalid="validator.fieldError('smtp_relay_port') ? 'true' : undefined"
+                    t-att-aria-describedby="validator.fieldError('smtp_relay_port') ? 'idet-err-smtp_relay_port' : undefined"
+                  type="number"
+                  t-att-value="state.form.smtp_relay_port"
+                  t-att-readonly="isOAuthRelay ? 'readonly' : undefined"
+                  t-on-input="(ev) => this.onInput('smtp_relay_port', ev)"
+                  t-on-blur="() => validator.touch('smtp_relay_port', state.form)"
+                />
+                                <t t-if="validator.fieldError('smtp_relay_port')">
+                                    <span
+                    class="ic-field-error"
+                      t-att-id="'idet-err-smtp_relay_port'"
+                    t-esc="validator.fieldError('smtp_relay_port')"
+                  />
+                                </t>
+                            </div>
+                            <div class="rl-frow ic-w-s">
+                                <label for="idet-smtp_relay_security">SMTP encryption</label>
+                                <RlSelect
+                  id="'idet-smtp_relay_security'"
+                  options="[{value:'none',label:'None'},{value:'starttls',label:'STARTTLS'},{value:'ssl',label:'SSL/TLS'}]"
+                  value="state.form.smtp_relay_security"
+                  disabled="isOAuthRelay"
+                  onChange="(value) => { state.form.smtp_relay_security = value; state.saved = false; }"
+                />
+                            </div>
+                            <div class="rl-frow ic-w-m">
+                                <label t-if="isOAuthRelay" for="idet-smtp_relay_user">Sender mailbox</label>
+                                <label t-else="" for="idet-smtp_relay_user">SMTP user</label>
+                                <input
+                  id="idet-smtp_relay_user"
+                  type="text"
+                  t-att-placeholder="isOAuthRelay ? 'notifications@example.com' : undefined"
+                  t-att-value="state.form.smtp_relay_user"
+                  t-on-input="(ev) => this.onInput('smtp_relay_user', ev)"
+                />
+                            </div>
+                            <t t-if="!isOAuthRelay">
+                                <div class="rl-frow ic-w-m">
+                                    <label for="idet-smtp_relay_password" id="idet-smtp_relay_password-label">SMTP password</label>
+                                    <PasswordInput
+                    id="'idet-smtp_relay_password'"
+                    value="state.form.smtp_relay_password"
+                    hasValue="state.has_smtp_relay_password"
+                    onChange="(val) => this.onPasswordChange('smtp_relay_password', val)"
+                  />
+                                </div>
+                            </t>
+                            <t t-else="">
+                                <div class="rl-frow ic-w-m">
+                                    <label for="idet-smtp_relay_oauth_client_secret" id="idet-smtp_relay_oauth_client_secret-label">Client secret</label>
+                                    <PasswordInput
+                    id="'idet-smtp_relay_oauth_client_secret'"
+                    value="state.form.smtp_relay_oauth_client_secret"
+                    hasValue="state.has_smtp_relay_oauth_client_secret"
+                    emptyHint.translate="Paste the Value of a client secret from Entra ID."
+                    onChange="(val) => this.onPasswordChange('smtp_relay_oauth_client_secret', val)"
+                  />
+                                </div>
+                                <div class="rl-frow ic-w-m">
+                                    <label for="idet-smtp_relay_oauth_directory_id">Directory ID</label>
+                                    <input
+                    id="idet-smtp_relay_oauth_directory_id"
+                    type="text"
+                    placeholder="00000000-0000-0000-0000-000000000000"
+                    t-att-value="state.form.smtp_relay_oauth_directory_id"
+                    t-on-input="(ev) => this.onInput('smtp_relay_oauth_directory_id', ev)"
+                  />
+                                </div>
+                                <div class="rl-frow ic-w-m">
+                                    <label for="idet-smtp_relay_oauth_client_id">Application (client) ID</label>
+                                    <input
+                    id="idet-smtp_relay_oauth_client_id"
+                    type="text"
+                    placeholder="00000000-0000-0000-0000-000000000000"
+                    t-att-value="state.form.smtp_relay_oauth_client_id"
+                    t-on-input="(ev) => this.onInput('smtp_relay_oauth_client_id', ev)"
+                  />
+                                </div>
+                                <div class="rl-frow ic-w-l">
+                                    <div class="ic-smtp-note">
+                                        <span>Register an app in Entra ID with the SMTP.SendAsApp permission and give it this mailbox in Exchange Online.</span>
+                                        <t t-out="' '"/>
+                                        <a
+                      t-att-href="relayGuideUrl"
+                      target="_blank"
+                      rel="noopener"
+                    >Step-by-step guide</a>
+                                    </div>
+                                </div>
+                            </t>
+                        </div>
+                    </div>
+                </section>
+
+                <t t-if="relayStatus">
+                    <section class="ic-set-block" aria-labelledby="idet-g-relay-status">
+                        <div class="ic-set-block__head">
+                            <h3 class="ic-set-block__title" id="idet-g-relay-status">Relay status</h3>
+                        </div>
+                        <div class="ic-set-block__body">
+                            <div class="ic-relay-status">
+                                <div class="ic-relay-status-line">
+                                    <span class="rl-l">Relay</span>
+                                    <span
+                      class="rl-v"
+                      t-att-class="relayStatus.tone"
+                      t-esc="relayStatus.label"
+                    />
+                                    <span
+                      t-if="relayStatus.detail"
+                      class="ic-relay-status-detail"
+                      t-esc="relayStatus.detail"
+                    />
+                                </div>
+                                <button
+                  type="button"
+                  class="rl-btn rl-btn-ghost rl-btn-sm"
+                  t-att-disabled="relayTestDisabledReason or state.relayTestLoading"
+                  t-att-title="relayTestDisabledReason or undefined"
+                  t-on-click="sendRelayTestMail"
+                >Send test mail</button>
+                                <span
+                  t-if="relayTestDisabledReason"
+                  class="ic-smtp-note"
+                  t-esc="relayTestDisabledReason"
+                />
+                            </div>
+                        </div>
+                    </section>
+                </t>
+            </div>
+        </t>
+
+        <!-- ── Build (edit only): when the instance is rebuilt, and what the
+             rebuild does. ─────────────────────────────────────────────── -->
+        <t t-if="bodyTab === 'build'">
+            <div class="ic-inst-col">
+                <section class="ic-set-block" aria-labelledby="idet-g-push">
+                    <div class="ic-set-block__head">
+                        <h3 class="ic-set-block__title" id="idet-g-push">On push</h3>
+                    </div>
+                    <div class="ic-set-block__body">
+                        <div class="rl-ftoggle">
+                            <div>
+                                <div class="rl-tl-label">Auto-rebuild on push</div>
+                                <div class="rl-th">rebuild on push to unfrozen repos</div>
+                                <div t-if="gitlabHookWarning" class="rl-th ic-gitlab-hook-warn"
+                                     t-esc="gitlabHookWarning"/>
+                            </div>
+                            <button
+                type="button"
+                t-att-class="'rl-sw' + (state.form.auto_rebuild ? ' on' : '')"
+                role="switch"
+                t-att-aria-checked="state.form.auto_rebuild ? 'true' : 'false'"
+                aria-label="Toggle auto-rebuild"
+                t-on-click="() => { state.form.auto_rebuild = !state.form.auto_rebuild; state.saved = false; }"
+              />
+                        </div>
+                    </div>
+                </section>
+                <section class="ic-set-block" aria-labelledby="idet-g-rebuild">
+                    <div class="ic-set-block__head">
+                        <h3 class="ic-set-block__title" id="idet-g-rebuild">On rebuild</h3>
+                    </div>
+                    <div class="ic-set-block__body">
+                        <div class="rl-ftoggle">
+                            <div>
+                                <div
+                  class="rl-tl-label"
+                >Auto-update modules on rebuild</div>
+                                <div
+                  class="rl-th"
+                >runs click-odoo-update during rebuild and after a restore. Disable to skip module migrations and the safe boot test.</div>
+                            </div>
+                            <button
+                type="button"
+                t-att-class="'rl-sw' + (state.form.auto_update ? ' on' : '')"
+                role="switch"
+                t-att-aria-checked="state.form.auto_update ? 'true' : 'false'"
+                aria-label="Toggle auto-update"
+                t-on-click="() => { state.form.auto_update = !state.form.auto_update; state.saved = false; }"
+              />
+                        </div>
+                        <div class="rl-ftoggle ic-ftoggle--nested" t-if="state.form.auto_update">
+                            <div>
+                                <div
+                  class="rl-tl-label"
+                >Test the new image before applying it</div>
+                                <div
+                  class="rl-th"
+                >boots the new image on a copy of the database first; with large databases on ext4 it takes about 30 minutes for every 500 GB. Off, the rebuild applies it straight away and says so.</div>
+                            </div>
+                            <button
+                type="button"
+                t-att-class="'rl-sw' + (state.form.boot_test ? ' on' : '')"
+                role="switch"
+                t-att-aria-checked="state.form.boot_test ? 'true' : 'false'"
+                aria-label="Toggle the boot test"
+                t-on-click="() => { state.form.boot_test = !state.form.boot_test; state.saved = false; }"
+              />
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </t>
+
+        <!-- ── Odoo Config (edit only) ──────────────────────────────────────── -->
+        <t t-if="bodyTab === 'config'">
+            <div class="ic-code-editor-wrap">
+                <div class="ic-code-gutter">
+                    <t t-foreach="getLineNumbers('odoo_conf')" t-as="n" t-key="n">
+                        <div class="ic-line-num" t-esc="n" />
+                    </t>
+                </div>
+                <textarea
+          class="ic-code-area"
+          spellcheck="false"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          t-att-value="state.form.odoo_conf"
+          t-on-input="(ev) => this.onInput('odoo_conf', ev)"
+          t-on-scroll="onCodeScroll"
+        />
+            </div>
+        </t>
+
+        <!-- ── Resources: each service's two short fields ───────────────────── -->
+        <t t-if="bodyTab === 'resources'">
+            <div class="ic-inst-col">
+                <div class="ic-res-grid">
+                    <section class="ic-set-block" aria-labelledby="idet-g-res-odoo">
+                        <div class="ic-set-block__head">
+                            <h3 class="ic-set-block__title" id="idet-g-res-odoo">Odoo</h3>
+                        </div>
+                        <div class="ic-set-block__body">
+                            <div class="ic-rgrid">
+                                <div class="rl-frow ic-w-s">
+                                    <label for="idet-res-odoo-memory_limit" id="idet-res-odoo-memory_limit-label">Memory limit</label>
+                                    <input
+                    id="idet-res-odoo-memory_limit"
+                    aria-labelledby="idet-g-res-odoo idet-res-odoo-memory_limit-label"
+                    type="text"
+                    t-att-value="state.form.odoo_memory_limit"
+                    t-on-input="(ev) => this.onInput('odoo_memory_limit', ev)"
+                    placeholder="2g"
+                  />
+                                </div>
+                                <div class="rl-frow ic-w-s">
+                                    <label for="idet-res-odoo-cpus" id="idet-res-odoo-cpus-label">CPUs</label>
+                                    <input
+                    id="idet-res-odoo-cpus"
+                    aria-labelledby="idet-g-res-odoo idet-res-odoo-cpus-label"
+                    type="number"
+                    step="0.25"
+                    t-att-value="state.form.odoo_cpus"
+                    t-on-input="(ev) => this.onInput('odoo_cpus', ev)"
+                  />
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                    <section class="ic-set-block" aria-labelledby="idet-g-res-db">
+                        <div class="ic-set-block__head">
+                            <h3 class="ic-set-block__title" id="idet-g-res-db">Database</h3>
+                        </div>
+                        <div class="ic-set-block__body">
+                            <div class="ic-rgrid">
+                                <div class="rl-frow ic-w-s">
+                                    <label for="idet-res-db-memory_limit" id="idet-res-db-memory_limit-label">Memory limit</label>
+                                    <input
+                    id="idet-res-db-memory_limit"
+                    aria-labelledby="idet-g-res-db idet-res-db-memory_limit-label"
+                    type="text"
+                    t-att-value="state.form.db_memory_limit"
+                    t-on-input="(ev) => this.onInput('db_memory_limit', ev)"
+                    placeholder="1g"
+                  />
+                                </div>
+                                <div class="rl-frow ic-w-s">
+                                    <label for="idet-res-db-cpus" id="idet-res-db-cpus-label">CPUs</label>
+                                    <input
+                    id="idet-res-db-cpus"
+                    aria-labelledby="idet-g-res-db idet-res-db-cpus-label"
+                    type="number"
+                    step="0.25"
+                    t-att-value="state.form.db_cpus"
+                    t-on-input="(ev) => this.onInput('db_cpus', ev)"
+                  />
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                    <section class="ic-set-block" aria-labelledby="idet-g-res-backup">
+                        <div class="ic-set-block__head">
+                            <h3 class="ic-set-block__title" id="idet-g-res-backup">Backup</h3>
+                        </div>
+                        <div class="ic-set-block__body">
+                            <div class="ic-rgrid">
+                                <div class="rl-frow ic-w-s">
+                                    <label for="idet-res-backup-memory_limit" id="idet-res-backup-memory_limit-label">Memory limit</label>
+                                    <input
+                    id="idet-res-backup-memory_limit"
+                    aria-labelledby="idet-g-res-backup idet-res-backup-memory_limit-label"
+                    type="text"
+                    t-att-value="state.form.backup_memory_limit"
+                    t-on-input="(ev) => this.onInput('backup_memory_limit', ev)"
+                    placeholder="512m"
+                  />
+                                </div>
+                                <div class="rl-frow ic-w-s">
+                                    <label for="idet-res-backup-cpus" id="idet-res-backup-cpus-label">CPUs</label>
+                                    <input
+                    id="idet-res-backup-cpus"
+                    aria-labelledby="idet-g-res-backup idet-res-backup-cpus-label"
+                    type="number"
+                    step="0.05"
+                    t-att-value="state.form.backup_cpus"
+                    t-on-input="(ev) => this.onInput('backup_cpus', ev)"
+                  />
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                    <section class="ic-set-block" aria-labelledby="idet-g-res-smtp">
+                        <div class="ic-set-block__head">
+                            <h3 class="ic-set-block__title" id="idet-g-res-smtp">SMTP</h3>
+                        </div>
+                        <div class="ic-set-block__body">
+                            <div class="ic-rgrid">
+                                <div class="rl-frow ic-w-s">
+                                    <label for="idet-res-smtp-memory_limit" id="idet-res-smtp-memory_limit-label">Memory limit</label>
+                                    <input
+                    id="idet-res-smtp-memory_limit"
+                    aria-labelledby="idet-g-res-smtp idet-res-smtp-memory_limit-label"
+                    type="text"
+                    t-att-value="state.form.smtp_memory_limit"
+                    t-on-input="(ev) => this.onInput('smtp_memory_limit', ev)"
+                    placeholder="256m"
+                  />
+                                </div>
+                                <div class="rl-frow ic-w-s">
+                                    <label for="idet-res-smtp-cpus" id="idet-res-smtp-cpus-label">CPUs</label>
+                                    <input
+                    id="idet-res-smtp-cpus"
+                    aria-labelledby="idet-g-res-smtp idet-res-smtp-cpus-label"
+                    type="number"
+                    step="0.05"
+                    t-att-value="state.form.smtp_cpus"
+                    t-on-input="(ev) => this.onInput('smtp_cpus', ev)"
+                  />
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </t>
+
+        <!-- ── Dependencies ─────────────────────────────────────────────────── -->
+        <t t-if="bodyTab === 'deps'">
+            <div class="ic-deps-panel">
+                <t t-if="!isCreate">
+                    <button
+            class="rl-btn rl-btn-ghost rl-btn-sm ic-btn-sync"
+            t-on-click="openSyncModal"
+          >
+                        <t t-out="env.icon('move', 15)" /> Sync with project
+                    </button>
+                </t>
+                <div class="ic-deps-section-label">pip.txt — Python</div>
+                <p t-if="state.pipFocusName" class="ic-deps-focus-hint" role="status"
+                   t-esc="pipFocusHint" />
+                <div class="ic-code-editor-wrap">
+                    <div class="ic-code-gutter">
+                        <t t-foreach="getLineNumbers('pipDeps')" t-as="n" t-key="n">
+                            <div class="ic-line-num" t-esc="n" />
+                        </t>
+                    </div>
+                    <textarea
+            t-ref="pipArea"
+            class="ic-code-area"
+            spellcheck="false"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="off"
+            t-att-value="state.pipDeps"
+            t-on-input="onDepsInput"
+            t-on-scroll="onCodeScroll"
+          />
+                </div>
+                <div
+          class="ic-deps-section-label"
+          style="margin-top:16px"
+        >apt.txt — System</div>
+                <div class="ic-code-editor-wrap">
+                    <div class="ic-code-gutter">
+                        <t t-foreach="getLineNumbers('aptDeps')" t-as="n" t-key="n">
+                            <div class="ic-line-num" t-esc="n" />
+                        </t>
+                    </div>
+                    <textarea
+            class="ic-code-area"
+            spellcheck="false"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="off"
+            t-att-value="state.aptDeps"
+            t-on-input="onAptInput"
+            t-on-scroll="onCodeScroll"
+          />
+                </div>
+            </div>
+        </t>
+
+        <!-- ── Backups: where a production's go, then the list ─────────────── -->
+        <t t-if="bodyTab === 'backups'">
+            <t t-if="state.form.environment === 'production'">
+                <div class="ic-inst-col">
+                    <section class="ic-set-block" aria-labelledby="idet-g-destination">
+                        <div class="ic-set-block__head">
+                            <h3 class="ic-set-block__title" id="idet-g-destination">Destination</h3>
+                        </div>
+                        <div class="ic-set-block__body">
+                            <div class="ic-rgrid">
+                                <div class="rl-frow ic-w-m">
+                                    <label for="idet-backup_backend_id">Backup backend</label>
+                                    <RlSelect
+                    id="'idet-backup_backend_id'"
+                    value="state.form.backup_backend_id"
+                    options="backupBackendOptions"
+                    disabled="backupBackendLocked"
+                    emptyLabel.translate="— Use project/global default —"
+                    ariaLabel.translate="Backup backend"
+                    onChange="(value) => this.onBackupBackendSelect({ target: { value: value } })"
+                  />
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </t>
+            <t t-if="!isCreate and !state.inst.deployed">
+                <p class="rl-tabnote">Backups appear here after the first deploy.</p>
+            </t>
+            <div t-if="!isCreate and state.inst.deployed" class="ic-backups-panel">
+                <div class="ic-backups-toolbar">
+                    <t t-if="state.inst.environment === 'production'">
+                        <button
+              class="rl-btn rl-btn-ghost rl-btn-sm"
+              t-att-disabled="state.backupsLoading"
+              t-on-click="refreshBackups"
+            >
+                            <i
+                t-att-class="'fa ' + (state.backupsLoading ? 'fa-spinner fa-spin' : 'fa-refresh')"
+              />
+                            <t t-if="state.backupsLoading"> Scanning…</t>
+                            <t t-else=""> Refresh</t>
+                        </button>
+                    </t>
+                    <button
+            class="rl-btn rl-btn-primary rl-btn-sm"
+            t-att-disabled="state.backupsLoading"
+            t-on-click="() => this.openCreateBackupModal()"
+          >
+                        <t t-out="env.icon('plus', 15)" /> Create Backup
+                    </button>
+                    <IcPager
+            offset="state.backupsOffset"
+            limit="pageSize"
+            total="state.backupsData?.total || 0"
+            onPage="(o) => this.backupsGoPage(o)"
+          />
+                </div>
+
+                <!-- Info banners -->
+                <t
+          t-if="state.inst.environment !== 'production' and !state.inst.effective_backup_backend_id"
+        >
+                    <div class="ic-backups-info">
+                        <i class="fa fa-info-circle" />
+                        Manual backups only (ZIP). Stored for 2 hours.
+                    </div>
+                </t>
+                <t
+          t-elif="state.inst.environment === 'production' and !state.inst.effective_backup_backend_id"
+        >
+                    <div class="ic-backups-info ic-backups-warning">
+                        <t t-out="env.icon('alert', 15)" />
+                        No backup backend configured. Choose one above, in the project settings, or set a global default in Settings › General.
+                    </div>
+                </t>
+
+                <!-- Error -->
+                <t t-if="state.backupsError">
+                    <div class="ic-backups-error" role="alert">
+                        <t t-out="env.icon('alert', 15)" /> <t
+              t-esc="state.backupsError"
+            />
+                    </div>
+                </t>
+
+                <!-- Empty state -->
+                <t
+          t-if="!state.backupsLoading and !state.backupsData and !state.backupsError"
+        >
+                    <div class="ic-backups-empty">
+                        <i class="fa fa-inbox" /> No backups found.
+                    </div>
+                </t>
+
+                <!-- Unified backup table -->
+                <t t-if="state.backupsData and state.backupsData.backups">
+                    <t t-if="!state.backupsData.backups.length">
+                        <div class="ic-backups-empty">
+                            <i class="fa fa-inbox" /> No backups found.
+                        </div>
+                    </t>
+                    <t t-else="">
+                        <table class="rl-table ic-backup-table rl-table--backups">
+                            <thead>
+                                <tr>
+                                    <th>Type</th>
+                                    <th>Contents</th>
+                                    <th>Date</th>
+                                    <th>Size</th>
+                                    <th class="ic-bk-actions-col">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <t
+                  t-foreach="state.backupsData.backups"
+                  t-as="bk"
+                  t-key="bk.id"
+                >
+                                    <tr>
+                                        <td>
+                                            <span
+                        t-att-class="'ic-backup-type-badge ic-bk-' + bk.type.toLowerCase()"
+                      >
+                                                <t t-esc="bk.type" />
+                                            </span>
+                                        </td>
+                                        <td t-esc="bk.contents || '—'" />
+                                        <td t-esc="formatBackupDate(bk.time)" />
+                                        <td
+                      t-esc="bk.size ? formatSize(bk.size) : '—'"
+                    />
+                                        <td class="ic-bk-actions-cell">
+                                            <!-- Download always last, at the edge; a row
+                                                 that cannot be restored keeps the slot,
+                                                 so both form columns. -->
+                                            <div class="ic-bk-actions">
+                                                <button
+                          t-if="!bk.attachment_id"
+                          class="ic-bk-action-btn ic-bk-restore-btn"
+                          title="Restore"
+                          t-on-click="() => this.openRestoreModal(bk.time)"
+                        >
+                                                    <t t-out="env.icon('restore', 15)" />
+                                                </button>
+                                                <span
+                          t-else=""
+                          class="ic-bk-action-slot"
+                          aria-hidden="true"
+                        />
+                                                <button
+                          class="ic-bk-action-btn"
+                          title="Download"
+                          t-on-click="() => this.downloadRow(bk)"
+                        >
+                                                    <t t-out="env.icon('download', 15)" />
+                                                </button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                </t>
+                            </tbody>
+                        </table>
+                    </t>
+                </t>
+            </div>
+        </t>
+
+        <!-- ── Metrics ──────────────────────────────────────────────────────── -->
+        <t t-if="bodyTab === 'metrics'">
+            <div class="ic-metrics-panel">
+
+                <!-- The board: a diagnosis, then since when, which
+                     resource, which process or query, and how big —
+                     drawn by the panel from the central's series. -->
+                <t t-if="state.inst">
+                    <MetricsBoard instanceId="props.instance_id"
+                                  canConfigure="canConfigureObservability"
+                                  onShowRequests.bind="showRequests"/>
+                </t>
+
+                <!-- Recent requests. This is the half the charts cannot
+                     give: the client IP and the path. Read live from the
+                     host and never stored — these lines carry the IP
+                     addresses of this instance's end users. -->
+                <div class="rl-phead" id="ic-requests" style="margin-block-start:18px;">
+                    <div>
+                        <h2 class="rl-ptitle" style="font-size:15px;">Recent requests</h2>
+                        <p class="rl-psub">Read from the proxy on this host. Nothing is stored.</p>
+                    </div>
+                    <button class="rl-btn rl-btn-ghost rl-btn-sm"
+                            t-att-disabled="state.accessLog.loading || null"
+                            t-on-click="loadAccessLog">
+                        <t t-if="state.accessLog.loading">Reading…</t>
+                        <t t-else="">Refresh</t>
+                    </button>
+                </div>
+
+                <t t-if="state.accessLog.error">
+                    <div class="rl-stub" role="alert">
+                        <span class="rl-si"><t t-out="env.icon('alert', 46)"/></span>
+                        <h3>Could not read the proxy log</h3>
+                        <p t-esc="state.accessLog.error"/>
+                    </div>
+                </t>
+                <t t-elif="state.accessLog.loaded and !state.accessLog.entries.length">
+                    <div class="rl-stub">
+                        <h3>No requests recorded</h3>
+                        <p>Either nothing has reached this instance recently, or the
+                           proxy on this host has not been redeployed since access
+                           logging was switched on.</p>
+                    </div>
+                </t>
+                <t t-elif="state.accessLog.entries.length">
+                    <div class="ic-metrics-summary">
+                        <div class="rl-card rl-card-pad">
+                            <div class="rl-ovtitle">Status codes</div>
+                            <t t-foreach="state.accessLog.summary.by_status" t-as="row" t-key="row.key">
+                                <div class="rl-ovrow">
+                                    <span class="rl-l" t-esc="row.key"/>
+                                    <span class="rl-v" t-esc="row.count"/>
+                                </div>
+                            </t>
+                        </div>
+                        <div class="rl-card rl-card-pad">
+                            <div class="rl-ovtitle">Top clients</div>
+                            <t t-foreach="state.accessLog.summary.top_clients" t-as="row" t-key="row.key">
+                                <div class="rl-ovrow">
+                                    <span class="rl-l" t-esc="row.key"/>
+                                    <span class="rl-v" t-esc="row.count"/>
+                                </div>
+                            </t>
+                        </div>
+                        <div class="rl-card rl-card-pad">
+                            <div class="rl-ovtitle">Top paths</div>
+                            <t t-foreach="state.accessLog.summary.top_paths" t-as="row" t-key="row.key">
+                                <div class="rl-ovrow">
+                                    <span class="rl-l ic-path" t-esc="row.key"/>
+                                    <span class="rl-v" t-esc="row.count"/>
+                                </div>
+                            </t>
+                        </div>
+                        <div class="rl-card rl-card-pad" data-cut="login">
+                            <div class="rl-ovtitle">Login attempts</div>
+                            <t t-if="state.accessLog.summary.login_posts.length">
+                                <t t-foreach="state.accessLog.summary.login_posts" t-as="row" t-key="row.key">
+                                    <div class="rl-ovrow">
+                                        <span class="rl-l ic-path" t-esc="row.key"/>
+                                        <span class="rl-v" t-esc="row.count"/>
+                                    </div>
+                                </t>
+                            </t>
+                            <p t-else="" class="ic-requests-none">No one posted to the login page in these requests.</p>
+                        </div>
+                        <div class="rl-card rl-card-pad" data-cut="scan">
+                            <div class="rl-ovtitle">Scanners</div>
+                            <t t-if="state.accessLog.summary.scan.total">
+                                <p class="ic-requests-none">Requests for other software's files (WordPress, .env, .git…) answered 404: <t t-esc="state.accessLog.summary.scan.total"/></p>
+                                <t t-foreach="state.accessLog.summary.scan.top_clients" t-as="row" t-key="row.key">
+                                    <div class="rl-ovrow">
+                                        <span class="rl-l ic-path" t-esc="row.key"/>
+                                        <span class="rl-v" t-esc="row.count"/>
+                                    </div>
+                                </t>
+                            </t>
+                            <p t-else="" class="ic-requests-none">No one probed for other software's files in these requests.</p>
+                        </div>
+                    </div>
+
+                    <div class="rl-card rl-card-pad ic-requests-minutes" t-if="state.accessLog.summary.by_minute.length > 1">
+                        <div class="rl-ovtitle">Requests per minute</div>
+                        <div class="ic-requests-bars" role="img" aria-label="Requests per minute in the requests read">
+                            <t t-foreach="state.accessLog.summary.by_minute" t-as="m" t-key="m.key">
+                                <span t-att-class="'ic-requests-bar' + (m.errors ? ' has-errors' : '')"
+                                      t-att-style="'block-size:' + Math.max(4, Math.round(100 * m.count / requestsPeakMinute)) + '%'"
+                                      t-att-title="m.key.replace('T', ' ') + ' UTC · ' + m.count + (m.errors ? ' · 5xx ' + m.errors : '')"/>
+                            </t>
+                        </div>
+                    </div>
+
+                    <div class="rl-card ic-requests">
+                        <div class="ic-requests-toolbar">
+                            <label class="ic-requests-search">
+                                <i class="fa fa-search" aria-hidden="true"/>
+                                <input type="search"
+                                       placeholder="Search path, client, method or status…"
+                                       aria-label="Search requests"
+                                       t-att-value="state.accessLog.q"
+                                       t-on-input="onRequestsSearch"/>
+                            </label>
+                            <div class="ic-requests-chips" role="group" aria-label="Filter by status">
+                                <t t-foreach="requestChips" t-as="chip" t-key="chip.key">
+                                    <button type="button" class="ic-requests-chip"
+                                            t-att-aria-pressed="state.accessLog.cls === chip.key ? 'true' : 'false'"
+                                            t-on-click="() => this.setRequestsClass(chip.key)">
+                                        <t t-esc="chip.label"/>
+                                        <span class="ic-requests-n" t-esc="chip.count"/>
+                                    </button>
+                                </t>
+                            </div>
+                        </div>
+                        <div class="ic-requests-box" t-ref="requestsBox" tabindex="0"
+                             role="region" aria-label="Requests">
+                            <table class="rl-table">
+                                <thead>
+                                    <tr>
+                                        <th>Time</th><th>Client</th><th>Method</th>
+                                        <th>Path</th><th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <t t-foreach="pagedRequests" t-as="req" t-key="req_index">
+                                        <tr>
+                                            <td class="ic-requests-time" t-esc="req.time"/>
+                                            <td>
+                                                <t t-set="hl" t-value="highlightRequest(req.ClientHost)"/>
+                                                <t t-esc="hl[0]"/><mark t-if="hl[1]" t-esc="hl[1]"/><t t-esc="hl[2]"/>
+                                            </td>
+                                            <td>
+                                                <t t-set="hl" t-value="highlightRequest(req.RequestMethod)"/>
+                                                <t t-esc="hl[0]"/><mark t-if="hl[1]" t-esc="hl[1]"/><t t-esc="hl[2]"/>
+                                            </td>
+                                            <td class="ic-path">
+                                                <t t-set="hl" t-value="highlightRequest(req.RequestPath)"/>
+                                                <t t-esc="hl[0]"/><mark t-if="hl[1]" t-esc="hl[1]"/><t t-esc="hl[2]"/>
+                                            </td>
+                                            <td>
+                                                <t t-set="hl" t-value="highlightRequest(req.DownstreamStatus)"/>
+                                                <span t-attf-class="ic-status ic-status-#{requestClass(req) || 'x'}">
+                                                    <t t-esc="hl[0]"/><mark t-if="hl[1]" t-esc="hl[1]"/><t t-esc="hl[2]"/>
+                                                </span>
+                                            </td>
+                                        </tr>
+                                    </t>
+                                </tbody>
+                            </table>
+                            <div class="ic-requests-empty" t-if="!filteredRequests.length">
+                                No request matches this search.
+                            </div>
+                        </div>
+                        <div class="ic-requests-foot">
+                            <span t-esc="requestsCountLabel"/>
+                            <IcPager offset="state.accessLog.offset"
+                                     limit="requestsPageSize"
+                                     total="filteredRequests.length"
+                                     onPage="(o) => this.requestsGoPage(o)"/>
+                        </div>
+                    </div>
+                </t>
+            </div>
+        </t>
+
+        <!-- ── Egress whitelist ─────────────────────────────────────────────── -->
+        <!-- What this staging may reach on the open internet. The list is
+             its own — a gateway per instance, which is what a customer
+             actually asks for — and it is rendered into the compose file,
+             so it takes a rebuild to apply, not a job. -->
+        <t t-if="bodyTab === 'whitelist'">
+            <div class="ic-whitelist-panel">
+                <!-- One sentence, one string: an emphasis tag inside a
+                     sentence makes the extractor emit fragments ("records the
+                     change; it reaches the", "rebuild") that no translator can
+                     place and no language has to order the same way. -->
+                <p class="rl-tabnote">
+                    Hostnames this staging can reach on the internet, through a gateway of its own. Everything else is refused. Saving records the change; it reaches the instance on its next rebuild.
+                </p>
+                <p class="rl-tabnote" t-if="state.form.whitelist.length === 0">
+                    With the list empty this staging falls back to the shared whitelist of its host, which is how every instance worked before this tab existed.
+                </p>
+                <div class="rl-card ic-whitelist-card">
+                    <t t-foreach="state.form.whitelist" t-as="hostname" t-key="hostname">
+                        <div class="rl-row ic-whitelist-item">
+                            <span class="rl-mono ic-whitelist-hostname" t-esc="hostname"/>
+                            <span class="rl-rspacer"/>
+                            <button class="rl-iconbtn danger" title="Remove"
+                                    t-on-click="() => this.removeWhitelistEntry(hostname)">
+                                <t t-out="env.icon('x', 14)"/>
+                            </button>
+                        </div>
+                    </t>
+                    <t t-if="state.form.whitelist.length === 0">
+                        <div class="ic-whitelist-empty">No hosts in whitelist.</div>
+                    </t>
+                </div>
+                <div class="ic-whitelist-add">
+                    <input type="text" placeholder="e.g. api.example.com"
+                           t-att-value="state.newWhitelistEntry"
+                           t-on-input="(ev) => { state.newWhitelistEntry = ev.target.value; }"
+                           t-on-keydown="onWhitelistKeydown"/>
+                    <button class="rl-btn rl-btn-ghost"
+                            t-on-click="() => this.addWhitelistEntry()">
+                        <t t-out="env.icon('plus', 15)"/> Add
+                    </button>
+                </div>
+            </div>
+        </t>
+
+        <!-- ── Mails ────────────────────────────────────────────────────────── -->
+        <!-- A staging's mail never leaves the server: Odoo is wired to an
+             in-stack catcher. This is that mailbox, read live over SSH and
+             stored nowhere in the panel. -->
+        <t t-if="bodyTab === 'mails'">
+            <div class="ic-mails-panel">
+
+                <div class="ic-mails-toolbar">
+                    <span class="ic-mails-notice">
+                        <t t-out="env.icon('shield', 14)"/>
+                        <t t-esc="mailCaptureNotice"/>
+                    </span>
+                    <div class="ic-mails-spacer"/>
+                    <button
+            class="rl-btn rl-btn-ghost rl-btn-sm"
+            t-att-disabled="state.mails.loading"
+            t-on-click="loadMails"
+          >
+                        <i t-att-class="'fa ' + (state.mails.loading ? 'fa-spinner fa-spin' : 'fa-refresh')"/>
+                        <t t-if="state.mails.loading"> Reading…</t>
+                        <t t-else=""> Refresh</t>
+                    </button>
+                    <button
+            class="rl-btn rl-btn-ghost rl-btn-sm ic-mails-clear"
+            t-att-disabled="state.mails.loading or !state.mails.items.length"
+            t-on-click="clearMailbox"
+          >
+                        <t t-out="env.icon('trash', 15)"/> Clear mailbox
+                    </button>
+                </div>
+
+                <t t-if="state.mails.error">
+                    <div class="rl-stub">
+                        <span class="rl-si"><i class="fa fa-envelope-o"/></span>
+                        <h3>Mailbox unavailable</h3>
+                        <p t-esc="state.mails.error"/>
+                    </div>
+                </t>
+                <t t-elif="state.mails.loading and !state.mails.loaded">
+                    <div class="history-loading">Loading…</div>
+                </t>
+                <t t-elif="!state.mails.items.length">
+                    <div class="rl-stub">
+                        <span class="rl-si"><i class="fa fa-envelope-o"/></span>
+                        <h3>No mail captured yet</h3>
+                        <p>Anything this staging sends will show up here. The
+                           catcher keeps it in memory, so a restart empties it.</p>
+                    </div>
+                </t>
+                <t t-else="">
+                    <table class="rl-table rl-table--mails">
+                        <thead>
+                            <tr>
+                                <th>Received</th>
+                                <th>From</th>
+                                <th>To</th>
+                                <th>Subject</th>
+                                <th class="ic-mails-size">Size</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <t t-foreach="state.mails.items" t-as="mail" t-key="mail.id">
+                                <tr
+                  t-att-class="state.mails.openId === mail.id ? 'ic-mail-row is-open' : 'ic-mail-row'"
+                  t-on-click="() => this.openMail(mail.id)"
+                >
+                                    <td class="rl-mono" t-esc="formatMailDate(mail.created)"/>
+                                    <td t-esc="mail.from || '—'"/>
+                                    <td t-esc="formatMailTo(mail.to)"/>
+                                    <td>
+                                        <t t-esc="mail.subject || '(no subject)'"/>
+                                        <t t-if="mail.attachments">
+                                            <span class="ic-mail-clip" t-att-title="'Has attachments'">
+                                                <i class="fa fa-paperclip"/>
+                                                <t t-esc="mail.attachments"/>
+                                            </span>
+                                        </t>
+                                    </td>
+                                    <td class="ic-mails-size rl-mono" t-esc="formatMailSize(mail.size)"/>
+                                </tr>
+                            </t>
+                        </tbody>
+                    </table>
+                </t>
+
+                <!-- One open message -->
+                <t t-if="state.mails.openId">
+                    <div class="ic-mail-view">
+                        <div class="ic-mail-view-head">
+                            <strong t-esc="state.mails.message?.subject || '(no subject)'"/>
+                            <button class="ic-mail-close" t-on-click="closeMail" t-att-title="'Close'">
+                                <t t-out="env.icon('x', 15)"/>
+                            </button>
+                        </div>
+
+                        <t t-if="state.mails.messageLoading">
+                            <div class="history-loading">Loading…</div>
+                        </t>
+                        <t t-elif="state.mails.messageError">
+                            <div class="ic-mail-error" t-esc="state.mails.messageError"/>
+                        </t>
+                        <t t-elif="state.mails.message">
+                            <div class="ic-mail-headers">
+                                <div><span class="rl-l">From</span><span class="rl-v" t-esc="state.mails.message.from || '—'"/></div>
+                                <div><span class="rl-l">To</span><span class="rl-v" t-esc="state.mails.message.to || '—'"/></div>
+                                <t t-if="state.mails.message.cc">
+                                    <div><span class="rl-l">Cc</span><span class="rl-v" t-esc="state.mails.message.cc"/></div>
+                                </t>
+                                <div><span class="rl-l">Received</span><span class="rl-v" t-esc="formatMailDate(state.mails.message.created)"/></div>
+                            </div>
+
+                            <t t-if="state.mails.message.attachments.length">
+                                <div class="ic-mail-atts">
+                                    <t t-foreach="state.mails.message.attachments" t-as="att" t-key="att_index">
+                                        <span class="ic-mail-att">
+                                            <i class="fa fa-paperclip"/>
+                                            <t t-esc="att.filename || att.type"/>
+                                            <span class="ic-mail-att-size" t-esc="formatMailSize(att.size)"/>
+                                        </span>
+                                    </t>
+                                </div>
+                            </t>
+
+                            <div class="ic-mail-views">
+                                <t t-if="state.mails.message.html">
+                                    <button
+                    t-att-class="state.mails.view === 'html' ? 'rl-tab active' : 'rl-tab'"
+                    t-on-click="() => this.setMailView('html')"
+                  >HTML</button>
+                                </t>
+                                <t t-if="state.mails.message.text">
+                                    <button
+                    t-att-class="state.mails.view === 'text' ? 'rl-tab active' : 'rl-tab'"
+                    t-on-click="() => this.setMailView('text')"
+                  >Text</button>
+                                </t>
+                            </div>
+
+                            <!-- The body is mail generated by somebody else's
+                                 database. It renders in a sandbox with no
+                                 scripts and no same-origin, so it cannot reach
+                                 the panel's session. -->
+                            <t t-if="state.mails.view === 'html' and state.mails.message.html">
+                                <iframe
+                  class="ic-mail-body"
+                  sandbox=""
+                  t-att-srcdoc="state.mails.message.html"
+                />
+                                <t t-if="state.mails.message.html_truncated">
+                                    <div class="ic-mail-trunc">This message was too large to show in full.</div>
+                                </t>
+                            </t>
+                            <t t-elif="state.mails.message.text">
+                                <pre class="ic-mail-body ic-mail-text" t-esc="state.mails.message.text"/>
+                                <t t-if="state.mails.message.text_truncated">
+                                    <div class="ic-mail-trunc">This message was too large to show in full.</div>
+                                </t>
+                            </t>
+                            <t t-else="">
+                                <div class="ic-mail-empty">This message has no readable body.</div>
+                            </t>
+                        </t>
+                    </div>
+                </t>
+            </div>
+        </t>
+
+        <!-- ── Audit Logs ───────────────────────────────────────────────────── -->
+        <t t-if="bodyTab === 'activity'">
+            <div class="ic-activity-panel">
+
+                <!-- Filter bar -->
+                <div class="ic-audit-filters">
+                    <input
+            class="ic-audit-search"
+            type="text"
+            placeholder="Search user or action…"
+            t-att-value="state.auditFilter.q"
+            t-on-input="(ev) => { state.auditFilter.q = ev.target.value; }"
+          />
+                    <div class="ic-audit-select" style="width:160px">
+                        <RlSelect
+              options="state.auditActions"
+              emptyLabel.translate="All actions"
+              value="state.auditFilter.action"
+              onChange="(value) => { state.auditFilter.action = value; }"
+            />
+                    </div>
+                    <input
+            class="ic-audit-date"
+            type="date"
+            t-att-value="state.auditFilter.date_from"
+            t-on-change="(ev) => { state.auditFilter.date_from = ev.target.value; }"
+          />
+                    <span class="ic-audit-date-sep">→</span>
+                    <input
+            class="ic-audit-date"
+            type="date"
+            t-att-value="state.auditFilter.date_to"
+            t-on-change="(ev) => { state.auditFilter.date_to = ev.target.value; }"
+          />
+                    <button
+            class="ic-audit-apply-btn"
+            t-on-click="applyAuditFilter"
+          >Apply</button>
+                    <button
+            class="ic-audit-reset-btn"
+            t-on-click="resetAuditFilter"
+          >Reset</button>
+                    <div class="ic-audit-spacer" />
+                    <IcPager
+            offset="state.auditOffset"
+            limit="pageSize"
+            total="state.auditTotal"
+            onPage="(o) => this.auditGoPage(o)"
+          />
+                </div>
+
+                <t t-if="state.auditLogLoading">
+                    <div class="history-loading">Loading…</div>
+                </t>
+                <t t-elif="!state.auditLog.length">
+                    <div class="rl-stub">
+                        <span class="rl-si"><i class="fa fa-history" /></span>
+                        <h3>No entries found</h3>
+                        <p>No audit log entries match the current filters.</p>
+                    </div>
+                </t>
+                <t t-else="">
+                    <table class="rl-table rl-table--audit">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>User</th>
+                                <th>Action</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <t t-foreach="state.auditLog" t-as="entry" t-key="entry.id">
+                                <tr>
+                                    <td
+                    class="rl-mono"
+                    t-esc="formatDate(entry.create_date)"
+                  />
+                                    <td t-esc="entry.user_name" />
+                                    <td class="rl-mono" t-esc="entry.action" />
+                                    <td t-esc="entry.details || '—'" />
+                                </tr>
+                            </t>
+                        </tbody>
+                    </table>
+                </t>
+            </div>
+        </t>
+
+        <!-- ── Repos — kept mounted to preserve branch cache ──────────────────── -->
+        <div
+      class="rl-repolist ic-repos-list"
+      t-if="!section or section === 'repos'"
+      t-att-style="bodyTab !== 'repos' ? 'display:none' : ''"
+    >
+            <div class="ic-repos-toolbar">
+                <button class="rl-btn rl-btn-ghost rl-btn-sm" t-on-click="addRepo">
+                    <t t-out="env.icon('plus', 14)" /> Add repository
+                </button>
+                <t t-if="state.form.repos.length">
+                    <button
+            class="rl-btn rl-btn-ghost rl-btn-sm"
+            t-on-click="freezeAllRepos"
+            t-att-disabled="state.freezingAll"
+            title="Pin all repos to their current HEAD"
+          >
+                        <t t-out="env.icon('lock', 15)" /> Freeze all
+                    </button>
+                    <button
+            class="rl-btn rl-btn-ghost rl-btn-sm"
+            t-on-click="unfreezeAllRepos"
+            title="Unpin all repos — rebuilds will use branch tips"
+          >
+                        <t t-out="env.icon('unlock', 15)" /> Unfreeze all
+                    </button>
+                    <input
+            class="ic-repos-search"
+            type="text"
+            placeholder="Filter repos…"
+            aria-label="Filter repositories"
+            t-att-value="state.repoSearch"
+            t-on-input="(ev) => { state.repoSearch = ev.target.value; }"
+          />
+                </t>
+            </div>
+            <t t-foreach="filteredRepos" t-as="repo" t-key="repo._origIdx">
+                <RepoEditor
+          repo="repo"
+          hasAddons="true"
+          repoModel="'cloud.instance.repo'"
+          onChange="(field, value) => this.onRepoChange(repo._origIdx, field, value)"
+          onRemove="() => this.removeRepo(repo._origIdx)"
+          preferredBranch="'' + (state.form.odoo_version || '')"
+          onFetchRequirements="(url, branch) => this._fetchAndMergeRequirements(url, branch)"
+        />
+            </t>
+            <t t-if="!state.form.repos.length">
+                <div class="ic-repos-empty">
+                    No repositories yet — click Add to link a repo.
+                </div>
+            </t>
+        </div>
+
+    </t>
+
+</templates>

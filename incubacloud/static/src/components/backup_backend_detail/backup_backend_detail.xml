@@ -1,0 +1,751 @@
+<templates>
+
+    <t t-name="incubacloud.BackupBackendDetail">
+        <div class="ic-backend-detail">
+
+            <t t-if="state.loading">
+                <div class="ic-detail-loading">Loading…</div>
+            </t>
+
+            <t t-elif="state.backend">
+                <div class="rl-page">
+
+                    <!-- Breadcrumb -->
+                    <div class="rl-crumb">
+                        <a t-on-click="goBack">Backup Destinations</a>
+                        <span class="rl-sep">/</span>
+                        <span class="rl-cur">
+                            <t t-if="isNew">New Backup Destination</t>
+                            <t t-else="" t-esc="state.backend.name" />
+                        </span>
+                    </div>
+
+                    <!-- Header -->
+                    <div class="rl-phead">
+                        <div class="rl-htext ic-detail-title">
+                            <h1 class="rl-ptitle">
+                                <t t-if="isNew">New Backup Destination</t>
+                                <t t-else="" t-esc="state.backend.name" />
+                            </h1>
+                        </div>
+                        <!-- Same trash as the instance header, so
+                             deleting does not mean scrolling to the
+                             footer of a long form. -->
+                        <t t-if="!isNew">
+                            <div class="rl-pactions">
+                                <button
+                  class="rl-iconbtn danger"
+                  title="Delete"
+                  aria-label="Delete backup destination"
+                  t-att-disabled="state.deleting"
+                  t-on-click="deleteBackend"
+                >
+                                    <t t-out="env.icon('trash', 15)" />
+                                </button>
+                            </div>
+                        </t>
+                    </div>
+
+                    <!-- Tabs: General (with its usage and, folded, the
+                         retention), Storage and Notifications -->
+                    <div class="rl-tabs" role="tablist">
+                        <button
+              t-att-class="'rl-tab' + (state.tab === 'general' ? ' active' : '')"
+              role="tab"
+              t-att-aria-selected="state.tab === 'general' ? 'true' : 'false'"
+              t-on-click="() => this.setTab('general')"
+            >General</button>
+                        <button
+              t-att-class="'rl-tab' + (state.tab === 'storage' ? ' active' : '')"
+              role="tab"
+              t-att-aria-selected="state.tab === 'storage' ? 'true' : 'false'"
+              t-on-click="() => this.setTab('storage')"
+            >Storage</button>
+                        <button
+              t-att-class="'rl-tab' + (state.tab === 'notifications' ? ' active' : '')"
+              role="tab"
+              t-att-aria-selected="state.tab === 'notifications' ? 'true' : 'false'"
+              t-on-click="() => this.setTab('notifications')"
+            >Notifications</button>
+                    </div>
+
+                    <!-- Tab content: group cards on the 12-column grid
+                         (form standard §2, §3) -->
+                    <div class="ic-detail-body ic-rec-col">
+
+                        <!-- ── General ──────────────────────────────────────── -->
+                        <t t-if="state.tab === 'general'">
+                            <div class="ic-set-block">
+                                <div class="ic-set-block__body">
+                                    <div class="ic-rgrid">
+                                        <div
+                  t-att-class="'rl-frow ic-w-m' + (validator.fieldError('name') ? ' has-error' : '')"
+                >
+                                            <label for="bbd-name">Name <span class="rl-req">*</span></label>
+                                            <input
+                    id="bbd-name"
+                    t-att-aria-invalid="validator.fieldError('name') ? 'true' : undefined"
+                    t-att-aria-describedby="validator.fieldError('name') ? 'bbd-err-name' : undefined"
+                    type="text"
+                    placeholder="My S3 Backup"
+                    t-att-value="state.form.name"
+                    t-on-input="(ev) => this.onInput('name', ev)"
+                    t-on-blur="() => validator.touch('name')"
+                  />
+                                            <t t-if="validator.fieldError('name')">
+                                                <span
+                      class="ic-field-error"
+                      t-att-id="'bbd-err-name'"
+                      t-esc="validator.fieldError('name')"
+                    />
+                                            </t>
+                                        </div>
+                                        <div class="rl-frow ic-w-s">
+                                            <label for="bbd-type">Type</label>
+                                            <RlSelect
+                    id="'bbd-type'"
+                    value="state.form.backend_type"
+                    disabled="typeLocked"
+                    ariaLabel="'Backend type'"
+                    ariaDescribedby="'bbd-type-note'"
+                    options="typeOptions"
+                    onChange="(value) => this.setType(value)"
+                  />
+                                            <span class="ic-form-note" id="bbd-type-note">
+                                                <t t-if="typeLocked">A destination keeps its type: create another one for the other type.</t>
+                                                <t t-else="">Chosen when creating: it cannot change afterwards.</t>
+                                            </span>
+                                        </div>
+                                        <div class="rl-frow ic-w-s">
+                                            <label for="bbd-image">Image version</label>
+                                            <input
+                    id="bbd-image"
+                    type="text"
+                    placeholder="latest"
+                    t-att-value="state.form.backup_image_version"
+                    t-on-input="(ev) => this.onInput('backup_image_version', ev)"
+                  />
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Who deletes old backups and when: the
+                                     defaults serve nearly everyone -->
+                                <SettingAdvanced
+                  fields="advancedFields"
+                  changed="advancedChanged"
+                  forceOpen="advancedNeedsLook"
+                >
+                                    <div class="ic-set-block__body">
+                                        <div class="ic-rgrid">
+                                            <div
+                      t-att-class="'rl-frow ic-w-s' + (validator.fieldError('backup_retention') ? ' has-error' : '')"
+                    >
+                                                <label for="bbd-retention">Retention period</label>
+                                                <input
+                        id="bbd-retention"
+                        t-att-aria-invalid="validator.fieldError('backup_retention') ? 'true' : undefined"
+                        t-att-aria-describedby="validator.fieldError('backup_retention') ? 'bbd-retention-note bbd-err-backup_retention' : 'bbd-retention-note'"
+                        type="text"
+                        placeholder="3M"
+                        t-att-value="state.form.backup_retention"
+                        t-on-input="(ev) => this.onInput('backup_retention', ev)"
+                        t-on-blur="() => validator.touch('backup_retention')"
+                      />
+                                                <span
+                        class="ic-form-note"
+                        id="bbd-retention-note"
+                      >Examples: 3M (3 months), 30D (30 days), 1Y (1 year)</span>
+                                                <t t-if="validator.fieldError('backup_retention')">
+                                                    <span
+                          class="ic-field-error"
+                          t-att-id="'bbd-err-backup_retention'"
+                          t-esc="validator.fieldError('backup_retention')"
+                        />
+                                                </t>
+                                            </div>
+                                            <div class="rl-frow ic-w-s">
+                                                <label for="bbd-tz">Timezone</label>
+                                                <input
+                        id="bbd-tz"
+                        type="text"
+                        placeholder="UTC"
+                        t-att-value="state.form.backup_tz"
+                        t-on-input="(ev) => this.onInput('backup_tz', ev)"
+                      />
+                                            </div>
+                                            <div class="rl-frow ic-w-m">
+                                                <label for="bbd-retention_owner">Who deletes old backups</label>
+                                                <RlSelect
+                        id="'bbd-retention_owner'"
+                        value="state.form.retention_owner"
+                        ariaLabel="'Who deletes old backups'"
+                        ariaDescribedby="'bbd-retention_owner-note'"
+                        options="retentionOwnerOptions"
+                        onChange="(value) => this.onInput('retention_owner', { target: { value: value } })"
+                      />
+                                                <span
+                        class="ic-form-note"
+                        id="bbd-retention_owner-note"
+                      >Backups older than the retention period are deleted by this.</span>
+                                                <t
+                        t-if="!isNew and !state.retention_owner_declared"
+                      >
+                                                    <span class="ic-field-error">
+                                                        Unconfirmed — migrated from the old on/off flag. Pick a value and save to confirm.
+                                                    </span>
+                                                </t>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </SettingAdvanced>
+                            </div>
+
+                            <!-- What the bucket holds, against its quota -->
+                            <section class="ic-set-block" aria-labelledby="bbd-g-usage">
+                                <div class="ic-set-block__head">
+                                    <h3 class="ic-set-block__title" id="bbd-g-usage">Usage</h3>
+                                </div>
+                                <div class="ic-set-block__body">
+                                    <t t-if="!isNew">
+                                        <t t-if="usagePct !== null">
+                                            <div class="rl-gauge">
+                                                <div
+                          t-att-class="'rl-gauge-fill ' + gaugeBand"
+                          t-att-style="'width:' + usagePct + '%'"
+                        />
+                                            </div>
+                                            <!-- The share in a span of its own: each «GB» is then
+                                                 a term alone, whatever the line breaks around it. -->
+                                            <div class="rl-rmeta">
+                                                <t t-out="state.last_measured_gb.toFixed(2)" /> GB /
+                                                <t t-out="state.form.quota_gb" /> GB
+                                                <span>(<t t-out="usagePct.toFixed(1)" />%)</span>
+                                            </div>
+                                        </t>
+                                        <t t-else="">
+                                            <div class="rl-rmeta">
+                                                Usage:
+                                                <t
+                          t-out="state.last_measured_gb.toFixed(2)"
+                        /> GB
+                                                <t t-if="!state.form.quota_gb">
+                                                    — set a quota below to see a % bar and enable alerts.
+                                                </t>
+                                            </div>
+                                        </t>
+                                        <div class="ic-usage-meta-row">
+                                            <span class="rl-rmeta">
+                                                <t t-if="state.last_measured_at">
+                                                    Last measured: <t
+                            t-out="state.last_measured_at"
+                          />
+                                                </t>
+                                                <t t-else="">
+                                                    Never measured yet — the daily cron will catch this up.
+                                                </t>
+                                            </span>
+                                            <button
+                        class="rl-btn rl-btn-ghost rl-btn-sm"
+                        t-att-disabled="state.refreshingUsage"
+                        t-on-click="refreshUsage"
+                      >
+                                                <t t-if="state.refreshingUsage">Refreshing…</t>
+                                                <t t-else=""><t
+                            t-out="env.icon('refresh', 14)"
+                          /> Refresh now</t>
+                                            </button>
+                                        </div>
+                                    </t>
+                                    <t t-else="">
+                                        <div
+                      class="rl-rmeta"
+                    >Save the destination first to start measuring usage.</div>
+                                    </t>
+
+                                    <div class="ic-rgrid ic-usage-fields">
+                                        <div class="rl-frow ic-w-s">
+                                            <label for="bbd-quota">Quota</label>
+                                            <div class="ic-set-num">
+                                                <input
+                        id="bbd-quota"
+                        class="ic-set-input"
+                        type="number"
+                        min="0"
+                        step="1"
+                        aria-describedby="bbd-quota-note"
+                        t-att-value="state.form.quota_gb"
+                        t-on-change="onQuotaInput"
+                      />
+                                                <span class="ic-set-unit">GB</span>
+                                            </div>
+                                            <span
+                      class="ic-form-note"
+                      id="bbd-quota-note"
+                    >0 = no quota (usage still tracked).</span>
+                                        </div>
+                                        <div class="rl-frow ic-w-s">
+                                            <label for="bbd-threshold">Alert threshold (%)</label>
+                                            <input
+                      id="bbd-threshold"
+                      type="number"
+                      min="-1"
+                      max="100"
+                      step="1"
+                      aria-describedby="bbd-threshold-note"
+                      t-att-value="state.form.alert_threshold_pct"
+                      t-on-change="onThresholdInput"
+                    />
+                                            <span
+                      class="ic-form-note"
+                      id="bbd-threshold-note"
+                    >0 = inherit settings default; -1 = disabled; 1–100 = explicit.</span>
+                                        </div>
+                                        <div class="rl-frow ic-w-m">
+                                            <label for="bbd-alert_email">Alert email
+                                                <span
+                        class="rl-opt"
+                      > — falls back to Notification To</span>
+                                            </label>
+                                            <input
+                      id="bbd-alert_email"
+                      type="email"
+                      placeholder="ops@example.com"
+                      t-att-value="state.form.alert_email"
+                      t-on-input="(ev) => this.onInput('alert_email', ev)"
+                    />
+                                        </div>
+                                    </div>
+                                </div>
+                            </section>
+                        </t>
+
+                        <!-- ── Storage ──────────────────────────────────────── -->
+                        <t t-if="state.tab === 'storage'">
+                            <div class="ic-set-block" t-if="isSftp">
+                                <div class="ic-set-block__body">
+                                    <div class="ic-rgrid">
+                                        <div
+                  t-att-class="'rl-frow ic-w-m' + (validator.fieldError('sftp_host') ? ' has-error' : '')"
+                >
+                                            <label for="bbd-sftp_host">Server <span class="rl-req">*</span></label>
+                                            <input
+                    id="bbd-sftp_host"
+                    t-att-aria-invalid="validator.fieldError('sftp_host') ? 'true' : undefined"
+                    t-att-aria-describedby="validator.fieldError('sftp_host') ? 'bbd-err-sftp_host' : undefined"
+                    type="text"
+                    placeholder="u123456.your-storagebox.de"
+                    t-att-value="state.form.sftp_host"
+                    t-on-input="(ev) => this.onInput('sftp_host', ev)"
+                    t-on-blur="() => validator.touch('sftp_host')"
+                  />
+                                            <t t-if="validator.fieldError('sftp_host')">
+                                                <span class="ic-field-error" t-att-id="'bbd-err-sftp_host'" t-esc="validator.fieldError('sftp_host')"/>
+                                            </t>
+                                        </div>
+                                        <div
+                  t-att-class="'rl-frow ic-w-s' + (validator.fieldError('sftp_port') ? ' has-error' : '')"
+                >
+                                            <label for="bbd-sftp_port">Port</label>
+                                            <input
+                    id="bbd-sftp_port"
+                    type="number"
+                    min="1"
+                    max="65535"
+                    t-att-aria-invalid="validator.fieldError('sftp_port') ? 'true' : undefined"
+                    t-att-aria-describedby="validator.fieldError('sftp_port') ? 'bbd-err-sftp_port' : undefined"
+                    t-att-value="state.form.sftp_port"
+                    t-on-input="(ev) => this.onInput('sftp_port', ev)"
+                    t-on-blur="() => validator.touch('sftp_port')"
+                  />
+                                            <t t-if="validator.fieldError('sftp_port')">
+                                                <span class="ic-field-error" t-att-id="'bbd-err-sftp_port'" t-esc="validator.fieldError('sftp_port')"/>
+                                            </t>
+                                        </div>
+                                        <div
+                  t-att-class="'rl-frow ic-w-m' + (validator.fieldError('sftp_user') ? ' has-error' : '')"
+                >
+                                            <label for="bbd-sftp_user">User <span class="rl-req">*</span></label>
+                                            <input
+                    id="bbd-sftp_user"
+                    type="text"
+                    placeholder="u123456-sub1"
+                    t-att-aria-invalid="validator.fieldError('sftp_user') ? 'true' : undefined"
+                    t-att-aria-describedby="validator.fieldError('sftp_user') ? 'bbd-err-sftp_user' : undefined"
+                    t-att-value="state.form.sftp_user"
+                    t-on-input="(ev) => this.onInput('sftp_user', ev)"
+                    t-on-blur="() => validator.touch('sftp_user')"
+                  />
+                                            <t t-if="validator.fieldError('sftp_user')">
+                                                <span class="ic-field-error" t-att-id="'bbd-err-sftp_user'" t-esc="validator.fieldError('sftp_user')"/>
+                                            </t>
+                                        </div>
+                                        <div class="rl-frow ic-w-m">
+                                            <label for="bbd-sftp_path">Folder</label>
+                                            <input
+                    id="bbd-sftp_path"
+                    type="text"
+                    placeholder="backups"
+                    aria-describedby="bbd-sftp_path-note"
+                    t-att-value="state.form.sftp_path"
+                    t-on-input="(ev) => this.onInput('sftp_path', ev)"
+                  />
+                                            <span class="ic-form-note" id="bbd-sftp_path-note">Under the user's home; start with / for an absolute path. Each instance writes to its own folder inside it.</span>
+                                        </div>
+                                        <t t-if="backupDst">
+                                            <div class="rl-frow ic-w-l">
+                                                <label for="bbd-sftp-dst">Backup path</label>
+                                                <output id="bbd-sftp-dst" class="rl-mono ic-backup-dst" t-esc="backupDst"/>
+                                            </div>
+                                        </t>
+                                    </div>
+                                    <p class="ic-form-note">The connection test runs from this panel; the backups run from each server that hosts an instance. A server that only accepts some addresses must accept both. Changing an instance's destination starts a new backup chain: the earlier backups stay where they were.</p>
+                                </div>
+                            </div>
+
+                            <!-- The panel's key and the server's key -->
+                            <section class="ic-set-block" aria-labelledby="bbd-g-sftp-keys" t-if="isSftp">
+                                <div class="ic-set-block__head">
+                                    <h3 class="ic-set-block__title" id="bbd-g-sftp-keys">Keys</h3>
+                                </div>
+                                <div class="ic-set-block__body">
+                                    <div class="rl-frow ic-w-m">
+                                        <label for="bbd-sftp_auth_method">Authentication</label>
+                                        <RlSelect
+                    id="'bbd-sftp_auth_method'"
+                    value="state.form.sftp_auth_method"
+                    ariaLabel="'Authentication'"
+                    ariaDescribedby="'bbd-sftp_auth_method-note'"
+                    options="authOptions"
+                    onChange="(value) => this.onInput('sftp_auth_method', { target: { value: value } })"
+                  />
+                                        <span class="ic-form-note" id="bbd-sftp_auth_method-note">A key the panel generates is the safer way in. Choose a password only for a server that accepts no key.</span>
+                                    </div>
+                                    <t t-if="isSftpPassword">
+                                        <div
+                  t-att-class="'rl-frow ic-w-m' + (validator.fieldError('sftp_password') ? ' has-error' : '')"
+                >
+                                            <label for="bbd-sftp_password" id="bbd-sftp_password-label">Password <span class="rl-req" t-if="!state.has_sftp_password">*</span></label>
+                                            <PasswordInput
+                    id="'bbd-sftp_password'"
+                    value="state.form.sftp_password"
+                    hasValue="state.has_sftp_password"
+                    ariaInvalid="Boolean(validator.fieldError('sftp_password'))"
+                    ariaDescribedby="validator.fieldError('sftp_password') ? 'bbd-err-sftp_password' : 'bbd-sftp_password-note'"
+                    onChange="(val) => this.onPasswordChange('sftp_password', val)"
+                  />
+                                            <t t-if="validator.fieldError('sftp_password')">
+                                                <span class="ic-field-error" t-att-id="'bbd-err-sftp_password'" t-esc="validator.fieldError('sftp_password')"/>
+                                            </t>
+                                            <span class="ic-form-note" id="bbd-sftp_password-note">The SFTP user's password. It may not hold quotes, backquotes, $, \ or #, nor start or end with a space.</span>
+                                        </div>
+                                    </t>
+                                    <t t-if="isNew">
+                                        <p class="ic-form-note" t-if="!isSftpPassword">The panel generates a key for this destination when you create it. You then add it to the server and confirm the server's key here.</p>
+                                        <p class="ic-form-note" t-else="">Once you create it, confirm the server's key here.</p>
+                                    </t>
+                                    <t t-else="">
+                                        <p class="ic-form-note" t-if="!isSftpPassword and !state.sftp.public_key">Save to generate the key, then add it to the server.</p>
+                                        <div class="rl-frow ic-w-l" t-elif="!isSftpPassword">
+                                            <label for="bbd-sftp-authorized">Public key for the server's authorized_keys</label>
+                                            <output id="bbd-sftp-authorized" class="rl-mono ic-backup-dst" aria-describedby="bbd-sftp-authorized-note" t-esc="authorizedKeysLine"/>
+                                            <span class="ic-form-note" id="bbd-sftp-authorized-note">Add this line to the user's ~/.ssh/authorized_keys. restrict keeps the key to file transfers; leave it out if your provider does not accept options.</span>
+                                            <div class="ic-sftp-actions">
+                                                <button type="button" class="rl-btn rl-btn-ghost rl-btn-sm" t-on-click="() => this.copy(authorizedKeysLine)">Copy</button>
+                                                <button type="button" class="rl-btn rl-btn-ghost rl-btn-sm" t-on-click="regenerateKey">Regenerate key</button>
+                                            </div>
+                                        </div>
+                                        <div class="rl-frow ic-w-l">
+                                            <span class="ic-sftp-label" id="bbd-sftp-hostkey-label">Server key</span>
+                                            <t t-if="state.sftp.fingerprint">
+                                                <output class="rl-mono" aria-labelledby="bbd-sftp-hostkey-label" t-esc="state.sftp.fingerprint"/>
+                                                <span class="ic-form-note" t-if="state.sftp.trusted_by">Trusted by <t t-esc="state.sftp.trusted_by"/>.</span>
+                                            </t>
+                                            <t t-else="">
+                                                <span class="ic-form-note" aria-labelledby="bbd-sftp-hostkey-label">Not trusted yet: instances cannot back up to this destination until you trust the server's key.</span>
+                                            </t>
+                                            <t t-if="state.presented">
+                                                <div class="ic-sftp-presented" role="status">
+                                                    <p>The server presents this <t t-esc="state.presented.key_type"/> key:</p>
+                                                    <p class="rl-mono" t-esc="state.presented.fingerprint"/>
+                                                    <p>Compare it with the fingerprint your provider shows before you trust it.</p>
+                                                    <button type="button" class="rl-btn rl-btn-primary rl-btn-sm" t-att-disabled="state.trustingKey" t-on-click="trustHostKey">Trust this key</button>
+                                                </div>
+                                            </t>
+                                            <div class="ic-sftp-actions">
+                                                <button type="button" class="rl-btn rl-btn-ghost rl-btn-sm" t-att-disabled="state.readingKey" t-on-click="readHostKey">
+                                                    <t t-if="state.readingKey">Reading…</t>
+                                                    <t t-else="">Read the server key</t>
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </t>
+                                </div>
+                            </section>
+
+                            <div class="ic-set-block" t-if="!isSftp">
+                                <div class="ic-set-block__body">
+                                    <div class="ic-rgrid">
+                                        <div
+                  t-att-class="'rl-frow ic-w-m' + (validator.fieldError('s3_bucket') ? ' has-error' : '')"
+                >
+                                            <label for="bbd-bucket">Bucket <span class="rl-req">*</span></label>
+                                            <input
+                    id="bbd-bucket"
+                    t-att-aria-invalid="validator.fieldError('s3_bucket') ? 'true' : undefined"
+                    t-att-aria-describedby="validator.fieldError('s3_bucket') ? 'bbd-err-s3_bucket' : undefined"
+                    type="text"
+                    placeholder="my-backup-bucket"
+                    t-att-value="state.form.s3_bucket"
+                    t-on-input="(ev) => this.onInput('s3_bucket', ev)"
+                    t-on-blur="() => validator.touch('s3_bucket')"
+                  />
+                                            <t t-if="validator.fieldError('s3_bucket')">
+                                                <span
+                      class="ic-field-error"
+                      t-att-id="'bbd-err-s3_bucket'"
+                      t-esc="validator.fieldError('s3_bucket')"
+                    />
+                                            </t>
+                                        </div>
+                                        <div class="rl-frow ic-w-m">
+                                            <label for="bbd-path">Path</label>
+                                            <input
+                    id="bbd-path"
+                    type="text"
+                    placeholder="backups"
+                    t-att-value="state.form.s3_path"
+                    t-on-input="(ev) => this.onInput('s3_path', ev)"
+                  />
+                                        </div>
+                                        <div class="rl-frow ic-w-l">
+                                            <label for="bbd-endpoint">Endpoint URL
+                                                <span
+                      class="rl-opt"
+                    > — leave empty for AWS S3</span>
+                                            </label>
+                                            <input
+                    id="bbd-endpoint"
+                    type="text"
+                    placeholder="https://s3.us-east-1.amazonaws.com"
+                    t-att-value="state.form.s3_endpoint_url"
+                    t-on-input="(ev) => this.onInput('s3_endpoint_url', ev)"
+                  />
+                                        </div>
+                                        <div class="rl-frow ic-w-m">
+                                            <label for="bbd-region">Region</label>
+                                            <input
+                    id="bbd-region"
+                    type="text"
+                    placeholder="eu-west-par"
+                    aria-describedby="bbd-region-note"
+                    t-att-value="state.form.s3_region"
+                    t-on-input="(ev) => this.onInput('s3_region', ev)"
+                  />
+                                            <span class="ic-form-note" id="bbd-region-note">As your provider names it. Continuous recovery signs its requests with it. Leave empty for Cloudflare R2 (auto) or AWS S3 in us-east-1.</span>
+                                        </div>
+                                        <t t-if="backupDst">
+                                            <div class="rl-frow ic-w-l">
+                                                <label for="bbd-dst">Backup path (preview)</label>
+                                                <output
+                      id="bbd-dst"
+                      class="rl-mono ic-backup-dst"
+                      t-esc="backupDst"
+                    />
+                                            </div>
+                                        </t>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- The key that reaches the bucket, and the
+                                 passphrase the backups are encrypted with -->
+                            <section class="ic-set-block" aria-labelledby="bbd-g-access">
+                                <div class="ic-set-block__head">
+                                    <h3 class="ic-set-block__title" id="bbd-g-access">
+                                        <t t-if="isSftp">Encryption</t>
+                                        <t t-else="">Access and encryption</t>
+                                    </h3>
+                                </div>
+                                <div class="ic-set-block__body">
+                                    <div class="ic-rgrid">
+                                        <t t-if="!isSftp">
+                                        <div class="rl-frow ic-w-m">
+                                            <label for="bbd-access_key">Access key ID</label>
+                                            <input
+                    id="bbd-access_key"
+                    type="text"
+                    t-att-value="state.form.s3_access_key_id"
+                    t-on-input="(ev) => this.onInput('s3_access_key_id', ev)"
+                  />
+                                        </div>
+                                        <div class="rl-frow ic-w-m">
+                                            <label for="bbd-s3_secret_access_key" id="bbd-s3_secret_access_key-label">Secret access key</label>
+                                            <PasswordInput
+                    id="'bbd-s3_secret_access_key'"
+                    value="state.form.s3_secret_access_key"
+                    hasValue="state.has_s3_secret_access_key"
+                    onChange="(val) => this.onPasswordChange('s3_secret_access_key', val)"
+                  />
+                                        </div>
+                                        </t>
+                                        <div class="rl-frow ic-w-m">
+                                            <label for="bbd-passphrase" id="bbd-passphrase-label">Passphrase</label>
+                                            <PasswordInput
+                    id="'bbd-passphrase'"
+                    value="state.form.passphrase"
+                    autoGenerate="true"
+                    hasValue="state.has_passphrase"
+                    onChange="(val) => this.onPasswordChange('passphrase', val)"
+                  />
+                                        </div>
+                                    </div>
+                                </div>
+                            </section>
+                        </t>
+
+                        <!-- ── Notifications ─────────────────────────────────── -->
+                        <t t-if="state.tab === 'notifications'">
+                            <div class="ic-set-block">
+                                <div class="ic-set-block__body">
+                                    <div class="ic-rgrid">
+                                        <div
+                  t-att-class="'rl-frow ic-w-m' + (validator.fieldError('email_from') ? ' has-error' : '')"
+                >
+                                            <label for="bbd-email_from">From</label>
+                                            <input
+                    id="bbd-email_from"
+                    t-att-aria-invalid="validator.fieldError('email_from') ? 'true' : undefined"
+                    t-att-aria-describedby="validator.fieldError('email_from') ? 'bbd-err-email_from' : undefined"
+                    type="email"
+                    placeholder="backups@example.com"
+                    t-att-value="state.form.email_from"
+                    t-on-input="(ev) => this.onInput('email_from', ev)"
+                    t-on-blur="() => validator.touch('email_from')"
+                  />
+                                            <t t-if="validator.fieldError('email_from')">
+                                                <span
+                      class="ic-field-error"
+                      t-att-id="'bbd-err-email_from'"
+                      t-esc="validator.fieldError('email_from')"
+                    />
+                                            </t>
+                                        </div>
+                                        <div
+                  t-att-class="'rl-frow ic-w-m' + (validator.fieldError('email_to') ? ' has-error' : '')"
+                >
+                                            <label for="bbd-email_to">To</label>
+                                            <input
+                    id="bbd-email_to"
+                    t-att-aria-invalid="validator.fieldError('email_to') ? 'true' : undefined"
+                    t-att-aria-describedby="validator.fieldError('email_to') ? 'bbd-err-email_to' : undefined"
+                    type="email"
+                    placeholder="admin@example.com"
+                    t-att-value="state.form.email_to"
+                    t-on-input="(ev) => this.onInput('email_to', ev)"
+                    t-on-blur="() => validator.touch('email_to')"
+                  />
+                                            <t t-if="validator.fieldError('email_to')">
+                                                <span
+                      class="ic-field-error"
+                      t-att-id="'bbd-err-email_to'"
+                      t-esc="validator.fieldError('email_to')"
+                    />
+                                            </t>
+                                        </div>
+                                    </div>
+                                    <div class="rl-ftoggle ic-notify-toggle">
+                                        <div>
+                                            <div class="rl-tl-label" id="bb-report-success-label">Report on success</div>
+                                            <div
+                    class="rl-th"
+                  >Send email notification on successful backup</div>
+                                        </div>
+                                        <button
+                  type="button"
+                  t-att-class="'rl-sw' + (state.form.smtp_report_success ? ' on' : '')"
+                  role="switch"
+                  t-att-aria-checked="state.form.smtp_report_success ? 'true' : 'false'"
+                  aria-labelledby="bb-report-success-label"
+                  t-on-click="() => this.toggleField('smtp_report_success')"
+                />
+                                    </div>
+                                </div>
+                            </div>
+                        </t>
+
+                    </div>
+
+                    <!-- Footer: Delete and Test Connection act at once; a new
+                         destination is created here -->
+                    <div class="rl-formfoot ic-detail-footer">
+                        <t t-if="!isNew">
+                            <button
+                class="rl-btn rl-btn-danger ic-btn-danger"
+                t-att-disabled="state.deleting"
+                t-on-click="deleteBackend"
+              >
+                                <t t-out="env.icon('trash', 15)" />
+                                <t t-if="state.deleting"> Deleting…</t>
+                                <t t-else=""> Delete</t>
+                            </button>
+                        </t>
+                        <div class="rl-ff-hint" />
+                        <t t-if="!isNew">
+                            <button
+                class="rl-btn rl-btn-ghost ic-btn-secondary-action"
+                t-att-disabled="state.testing"
+                t-on-click="testConnection"
+              >
+                                <t t-if="state.testing">Testing…</t>
+                                <t t-else="">Test Connection</t>
+                            </button>
+                        </t>
+                        <button
+              t-if="isNew"
+              class="rl-btn rl-btn-primary ic-btn-save"
+              t-att-disabled="state.saving"
+              t-on-click="save"
+            >
+                            <t t-if="state.saving">
+                                <i
+                  class="fa fa-spinner fa-spin"
+                  style="margin-right:5px"
+                />
+                                <t t-if="isNew">Creating…</t>
+                            </t>
+                            <t t-else="">
+                                <t t-if="isNew">Create Destination</t>
+                            </t>
+                        </button>
+                    </div>
+                    <!-- Saving an existing destination is the save bar's -->
+                    <SaveBar t-if="!isNew" count="unsavedCount" saving="state.saving"
+                             onSave.bind="save" onDiscard.bind="discard" reserveSpace="true"/>
+
+                </div>
+            </t>
+
+            <!-- Error state -->
+            <t t-elif="state.error">
+                <div class="ic-detail-error-state" role="alert">
+                    <p t-esc="state.error" />
+                    <button t-on-click="goBack">← Back to Backup Destinations</button>
+                </div>
+            </t>
+
+            <!-- Confirm dialog -->
+            <IcConfirmDialog
+        t-if="state.confirmDialog"
+        title="state.confirmDialog.title"
+        message="state.confirmDialog.message"
+        confirmLabel="state.confirmDialog.confirmLabel"
+        isDanger="state.confirmDialog.isDanger"
+        onConfirm="state.confirmDialog.onConfirm"
+        onCancel="state.confirmDialog.onCancel"
+      />
+
+        </div>
+    </t>
+
+</templates>

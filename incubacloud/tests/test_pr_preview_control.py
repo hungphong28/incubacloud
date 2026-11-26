@@ -1,0 +1,1451 @@
+"""Pull request previews: who gets one, who decides, and what a failure says.
+
+A pull request on a repository a production instance follows creates a
+staging carrying a copy of that instance's data. These tests pin the
+four things that make the feature governable:
+
+* a hook that lets a layer on top keep its own instances out;
+* a project switch that starts off and travels through the API;
+* a failure that is reported where people look — the pull request and
+  the production instance — instead of a log line;
+* the preview's address, which the success comment promises.
+"""
+import asyncio
+import json
+import logging
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from psycopg2 import errors as pg_errors
+
+from odoo import fields
+from odoo.exceptions import UserError
+from odoo.http import Request
+from odoo.tests.common import TransactionCase
+
+from odoo.addons.incubacloud.controllers._data_load import _routes_crud
+from odoo.addons.incubacloud.github.client import GitHubAPIError, GitHubAppClient
+from odoo.addons.incubacloud.models import cloud_github_event, cloud_instance
+from odoo.addons.incubacloud.models.cloud_github_event import (
+    PR_PREVIEW_FAILED_CODE,
+)
+from odoo.addons.incubacloud.models.cloud_gitlab_mr_note import (
+    PR_PREVIEW_NOTE_FAILED_CODE,
+)
+from odoo.addons.incubacloud.models.host_probe_executor import MIN_DISK_GB
+from odoo.addons.queue_job.exception import RetryableJobError
+
+REPO_URL = 'https://github.com/owner/repo.git'
+#: ``cloud_github_event.PR_OTHER_INSTALLATION_CODE``.
+PR_OTHER_INSTALLATION_CODE = 'github_pr_other_installation'
+REPO_FULL = 'owner/repo'
+FORK_URL = 'https://github.com/someone/repo.git'
+FORK_FULL = 'someone/repo'
+INSTALLATION_ID = 4242
+
+
+def _pr_payload(
+    pr_number, action='opened', branch='feature-x', *,
+    installation=INSTALLATION_ID, base=(REPO_FULL, REPO_URL),
+    head=(REPO_FULL, REPO_URL),
+):
+    """Return the JSON a ``pull_request`` delivery carries.
+
+    :param int installation: the App installation GitHub sent it for
+    :param tuple base: ``(full_name, clone_url)`` of the repository the
+        pull request is opened on, where the installation lives
+    :param tuple head: ``(full_name, clone_url)`` of the repository its
+        branch comes from; a fork when it differs from *base*
+    """
+    return json.dumps({
+        'action': action,
+        'installation': {'id': installation},
+        'pull_request': {
+            'number': pr_number,
+            'base': {'ref': 'main', 'repo': {
+                'full_name': base[0], 'clone_url': base[1],
+            }},
+            'head': {'ref': branch, 'repo': head and {
+                'full_name': head[0], 'clone_url': head[1],
+            }},
+        },
+        'repository': {'full_name': base[0], 'clone_url': base[1]},
+    })
+
+
+def _github_get(comments=(), state='open'):
+    """Return a ``side_effect`` for ``GitHubAppClient.get``, by endpoint.
+
+    :param comments: what the pull request's comments answer
+    :param state: the pull request's ``state``; an exception is raised,
+        anything else that is not a string is answered as it is
+    """
+    def get(endpoint, **_kwargs):
+        """Answer *endpoint* as GitHub would."""
+        if '/pulls/' in endpoint:
+            if isinstance(state, Exception):
+                raise state
+            if isinstance(state, str):
+                return {'number': 7, 'state': state}
+            return state
+        return list(comments)
+    return get
+
+
+class _LostRace(pg_errors.SerializationFailure):
+    """A serialization failure as PostgreSQL raises it, with its code."""
+
+    pgcode = '40001'
+
+
+class _PreviewBase(TransactionCase):
+    """A deployed production instance following an unpinned repository."""
+
+    def setUp(self):
+        super().setUp()
+        self.host = self.env['cloud.host'].create({
+            'name': 'PR Preview Host',
+            'ip_address': '10.0.0.9',
+            'user': 'ubuntu',
+            'wildcard_domain': '*.preview.example.com',
+        })
+        self.project = self.env['cloud.project'].create({
+            'name': 'PR Preview Project',
+            'pr_reviews_enabled': True,
+        })
+        self.prod = self.env['cloud.instance'].create({
+            'name': 'prod',
+            'project_id': self.project.id,
+            'host_id': self.host.id,
+            'environment': 'production',
+            'state': 'deployed',
+        })
+        # The production's own line is what it follows; the project, with
+        # no lines, is only the template new instances start from. The
+        # App's installation is the panel's own.
+        self.prod_line = self.env['cloud.instance.repo'].create({
+            'instance_id': self.prod.id,
+            'url': REPO_URL,
+            'branch': 'main',
+        })
+        App = self.env['cloud.github.app']
+        App.search([]).unlink()
+        App.create({
+            'app_id': '12345',
+            'private_key': 'not a key',
+            'installation_id': str(INSTALLATION_ID),
+        })
+
+    def _event(self, pr_number=7, action='opened', **payload):
+        """Create an unprocessed ``pull_request`` event.
+
+        :param payload: passed on to ``_pr_payload``
+        """
+        return self.env['cloud.github.event'].create({
+            'event_type': 'pull_request',
+            'delivery_id': f'pr-preview-{self.id()}-{pr_number}-{action}',
+            'payload': _pr_payload(pr_number, action=action, **payload),
+        })
+
+    def _clone_patch(self, **kwargs):
+        """Patch ``clone_to_staging`` on the model class."""
+        return patch.object(
+            type(self.env['cloud.instance']), 'clone_to_staging', **kwargs,
+        )
+
+    def _github_patches(self):
+        """Stand in for the GitHub App: return (client mock, patchers)."""
+        client = MagicMock(spec=GitHubAppClient)
+        Service = type(self.env['cloud.github.credential.service'])
+        return client, (
+            patch.object(
+                cloud_github_event, 'GitHubAppClient', return_value=client,
+            ),
+            patch.object(Service, 'get_credentials', return_value=object()),
+        )
+
+    def _alert(self):
+        """Return the active failure alert on the production instance."""
+        return self.env['cloud.alert'].search([
+            ('code', '=', PR_PREVIEW_FAILED_CODE),
+            ('instance_id', '=', self.prod.id),
+            ('state', '=', 'active'),
+        ])
+
+
+class TestPreviewEligibility(_PreviewBase):
+
+    def test_an_eligible_instance_is_cloned(self):
+        with self._clone_patch(return_value={}) as clone:
+            self._event()._process_pull_request_event()
+        clone.assert_called_once()
+        self.assertEqual(clone.call_args.args, ('pr-7',))
+        self.assertEqual(clone.call_args.kwargs['pr_number'], 7)
+        self.assertEqual(clone.call_args.kwargs['pr_repo'], REPO_FULL)
+        self.assertEqual(clone.call_args.kwargs['pr_head_branch'], 'feature-x')
+
+    def test_the_hook_can_decline_an_instance(self):
+        Event = type(self.env['cloud.github.event'])
+        with self._clone_patch(return_value={}) as clone, patch.object(
+            Event, '_pr_preview_allowed', return_value=False,
+        ) as hook:
+            event = self._event()
+            event._process_pull_request_event()
+        hook.assert_called_once()
+        self.assertEqual(hook.call_args.args[0], self.prod)
+        clone.assert_not_called()
+        self.assertTrue(event.processed)
+        self.assertFalse(self._alert(), "declining is not a failure")
+
+    def test_the_default_hook_says_yes(self):
+        self.assertTrue(
+            self.env['cloud.github.event']._pr_preview_allowed(self.prod),
+        )
+
+    def test_a_project_switched_off_gets_nothing(self):
+        self.project.pr_reviews_enabled = False
+        with self._clone_patch(return_value={}) as clone:
+            self._event()._process_pull_request_event()
+        clone.assert_not_called()
+
+
+class TestPreviewBinding(_PreviewBase):
+    """Only the panel's own installation, on a repository a production's
+    own lines follow, and never from a fork: the App is public, so a valid
+    signature says GitHub sent the event, not that it is about one of ours."""
+
+    def _assert_nothing(self, **payload):
+        """Run an ``opened`` event built with *payload*: nothing is cloned
+        and the event is still marked processed."""
+        with self._clone_patch(return_value={}) as clone:
+            event = self._event(**payload)
+            event._process_pull_request_event()
+        clone.assert_not_called()
+        self.assertTrue(event.processed)
+        self.assertFalse(self._alert(), "ignoring is not a failure")
+
+    def test_another_installation_gets_nothing(self):
+        self._assert_nothing(installation=INSTALLATION_ID + 1)
+
+    def test_an_event_without_installation_gets_nothing(self):
+        self._assert_nothing(installation=None)
+
+    def test_nothing_while_the_panel_has_no_installation(self):
+        self.env['cloud.github.app'].search([]).installation_id = False
+        self._assert_nothing()
+
+    def test_a_repository_only_the_production_follows_gets_a_preview(self):
+        """The project's lines are a template: an instance often follows
+        repositories its project does not list."""
+        self.assertFalse(self.project.repo_ids)
+        with self._clone_patch(return_value={}) as clone:
+            self._event()._process_pull_request_event()
+        clone.assert_called_once()
+
+    def test_a_repository_of_the_project_the_production_does_not_follow_gets_nothing(self):
+        self.env['cloud.project.repo'].with_context(
+            skip_apply_requirements=True,
+        ).create({
+            'project_id': self.project.id,
+            'url': REPO_URL,
+            'branch': 'main',
+        })
+        self.prod_line.with_context(skip_apply_requirements=True).url = (
+            'https://github.com/owner/other.git'
+        )
+        self._assert_nothing()
+
+    def test_a_production_line_saved_in_another_spelling_is_the_same_repository(self):
+        """A line saved before its URL was stored canonical still matches."""
+        self.env.cr.execute(
+            "UPDATE cloud_instance_repo SET url = %s WHERE id = %s",
+            ('git@github.com:Owner/Repo.git', self.prod_line.id),
+        )
+        self.prod_line.invalidate_recordset(['url'])
+        with self._clone_patch(return_value={}) as clone:
+            self._event()._process_pull_request_event()
+        clone.assert_called_once()
+
+    def test_a_pull_request_from_a_fork_gets_nothing(self):
+        self._assert_nothing(head=(FORK_FULL, FORK_URL))
+
+    def test_a_fork_whose_head_is_a_followed_repository_gets_nothing(self):
+        """Base on a stranger's repository, head on the one production
+        follows: matching on the head used to clone production."""
+        self._assert_nothing(
+            base=(FORK_FULL, FORK_URL), head=(REPO_FULL, REPO_URL),
+        )
+
+    def test_a_deleted_fork_gets_nothing(self):
+        self._assert_nothing(head=None)
+
+    def test_a_closed_pull_request_of_another_installation_keeps_the_preview(self):
+        preview = self.env['cloud.instance'].create({
+            'name': 'pr-7',
+            'project_id': self.project.id,
+            'environment': 'staging',
+            'pr_number': 7,
+            'pr_repo': REPO_FULL,
+        })
+        event = self._event(
+            action='closed', installation=INSTALLATION_ID + 1,
+        )
+        event._process_pull_request_event()
+        self.assertTrue(preview.exists())
+        self.assertTrue(event.processed)
+
+
+class TestPreviewSwitch(_PreviewBase):
+
+    def setUp(self):
+        super().setUp()
+        self.controller = _routes_crud.CrudMixin()
+        self.controller._sec = lambda: self.env['cloud.security.mixin']
+
+    def _request(self):
+        """Return a request stand-in bound to the test environment."""
+        fake = MagicMock(spec=Request)
+        fake.env = self.env
+        return fake
+
+    def test_a_new_project_starts_switched_off(self):
+        project = self.env['cloud.project'].create({'name': 'Fresh Project'})
+        self.assertFalse(project.pr_reviews_enabled)
+
+    def test_the_switch_is_read_through_the_api(self):
+        with patch.object(_routes_crud, 'request', self._request()):
+            data = self.controller.cloud_get_project(self.project.id)
+        self.assertIs(data['pr_reviews_enabled'], True)
+
+    def test_the_switch_is_saved_through_the_api(self):
+        with patch.object(_routes_crud, 'request', self._request()):
+            self.controller.cloud_save_project(
+                self.project.id, {'pr_reviews_enabled': False},
+            )
+        self.assertFalse(self.project.pr_reviews_enabled)
+
+    def test_a_project_can_be_created_with_it_on(self):
+        with patch.object(_routes_crud, 'request', self._request()):
+            result = self.controller.cloud_create_project({
+                'name': 'Opted In', 'pr_reviews_enabled': True,
+            })
+        project = self.env['cloud.project'].browse(result['id'])
+        self.assertTrue(project.pr_reviews_enabled)
+
+
+class TestPreviewFailureIsVisible(_PreviewBase):
+
+    def _process(self, clone_side_effect):
+        """Run one ``opened`` event; return (event, GitHub client mock)."""
+        client, patches = self._github_patches()
+        with self._clone_patch(side_effect=clone_side_effect), \
+                patches[0], patches[1]:
+            event = self._event()
+            event._process_pull_request_event()
+        return event, client
+
+    def test_a_refusal_is_commented_with_its_reason(self):
+        event, client = self._process(UserError("No room\non this host."))
+        client.post_issue_comment.assert_called_once()
+        owner, repo, number, body = client.post_issue_comment.call_args.args
+        self.assertEqual((owner, repo, number), ('owner', 'repo', 7))
+        # Collapsed to one line: a newline would break the Markdown table.
+        self.assertIn('No room on this host.', body)
+        self.assertIn('could not be created', body)
+        self.assertTrue(event.processed)
+
+    def test_a_refusal_raises_an_alert_on_production(self):
+        self._process(UserError("No room on this host."))
+        alert = self._alert()
+        self.assertEqual(len(alert), 1)
+        self.assertEqual(alert.level, 'warning')
+        self.assertIn('No room on this host.', alert.message)
+        self.assertIn('#7', alert.message)
+
+    def test_an_unexpected_error_never_reaches_the_pull_request(self):
+        _event, client = self._process(
+            RuntimeError("psql: password 'hunter2' rejected"),
+        )
+        body = client.post_issue_comment.call_args.args[3]
+        self.assertNotIn('hunter2', body)
+        self.assertNotIn('psql', body)
+        self.assertIn('ref:', body)
+        self.assertNotIn('hunter2', self._alert().message)
+
+    def test_a_later_success_closes_the_alert(self):
+        self._process(UserError("No room on this host."))
+        self.assertTrue(self._alert())
+        with self._clone_patch(return_value={}):
+            self._event(action='reopened')._process_pull_request_event()
+        self.assertFalse(self._alert())
+
+    def test_failing_to_comment_does_not_fail_the_event(self):
+        client, patches = self._github_patches()
+        client.post_issue_comment.side_effect = RuntimeError("GitHub is down")
+        with self._clone_patch(side_effect=UserError("No room.")), \
+                patches[0], patches[1]:
+            event = self._event()
+            event._process_pull_request_event()
+        self.assertTrue(event.processed)
+        self.assertTrue(self._alert(), "the alert does not depend on GitHub")
+
+    def test_a_clone_that_fails_half_way_leaves_nothing_behind(self):
+        Instance = self.env['cloud.instance']
+
+        def _half_way(prod, name, **kwargs):
+            Instance.create({
+                'name': name,
+                'project_id': prod.project_id.id,
+                'host_id': prod.host_id.id,
+                'environment': 'staging',
+                'pr_number': kwargs['pr_number'],
+                'pr_repo': kwargs['pr_repo'],
+            })
+            raise UserError("No room on this host.")
+
+        client, patches = self._github_patches()
+        with patch.object(
+            type(Instance), 'clone_to_staging', autospec=True,
+            side_effect=_half_way,
+        ), patches[0], patches[1]:
+            self._event()._process_pull_request_event()
+        self.assertFalse(
+            Instance.search([('pr_number', '=', 7), ('pr_repo', '=', REPO_FULL)]),
+            "a leftover row would make every reopen find the preview "
+            "as already existing",
+        )
+        self.assertTrue(self._alert())
+
+
+class TestPreviewOnAFullServer(_PreviewBase):
+    """A preview is not created on a server short of disk (16-nov-2026).
+
+    It goes to its production's server, past the automatic placement:
+    under the Check's ``MIN_DISK_GB`` free, not the placement's higher
+    ``_MIN_DISK_FREE_GB``, the clone is refused with a ``UserError``,
+    which the pull request hears as any refusal.
+    """
+
+    def _clone(self, free_gb, pr_number=7, probed=True):
+        """Clone production with the host at *free_gb*, probed or not; return the result."""
+        self.host.write({
+            'disk_free_gb': free_gb,
+            'last_probed': fields.Datetime.now() if probed else False,
+        })
+        with patch.object(
+            type(self.env['cloud.job']), 'enqueue_chain', return_value=[1, 2, 3],
+        ):
+            return self.prod.clone_to_staging(
+                f'pr-{pr_number}', pr_number=pr_number, pr_repo=REPO_FULL,
+                pr_head_branch='feature-x',
+            )
+
+    def test_a_server_short_of_disk_gets_no_preview(self):
+        with self.assertRaisesRegex(UserError, 'no preview is created'):
+            self._clone(MIN_DISK_GB - 7)
+        self.assertFalse(self.env['cloud.instance'].search([('pr_number', '=', 7)]))
+
+    def test_a_server_with_room_gets_it(self):
+        self.assertTrue(
+            self._clone(MIN_DISK_GB, 8)['staging_id'],
+        )
+
+    def test_under_the_placements_figure_it_still_gets_it(self):
+        """12 GB: under what the automatic placement asks of a server, over
+        the Check's figure. The production is built there already."""
+        self.assertLess(12, self.host._MIN_DISK_FREE_GB)
+        self.assertTrue(self._clone(12.0, 10)['staging_id'])
+
+    def test_a_server_without_a_free_byte_is_refused_and_not_named(self):
+        with self.assertRaisesRegex(UserError, 'no preview is created') as caught:
+            self._clone(0)
+        self.assertNotIn(self.host.name, str(caught.exception))
+
+    def test_a_server_never_read_gets_it(self):
+        self.assertTrue(self._clone(0, 9, probed=False)['staging_id'])
+
+    def test_a_staging_by_hand_is_not_held_to_it(self):
+        self.host.disk_free_gb = 1
+        with patch.object(
+            type(self.env['cloud.job']), 'enqueue_chain', return_value=[1, 2, 3],
+        ):
+            self.assertTrue(self.prod.clone_to_staging('stg')['staging_id'])
+
+
+class TestPreviewAddress(_PreviewBase):
+
+    def _clone(self):
+        """Clone the production instance as PR 7 without enqueuing jobs."""
+        with patch.object(
+            type(self.env['cloud.job']), 'enqueue_chain', return_value=[1, 2, 3],
+        ):
+            result = self.prod.clone_to_staging(
+                'pr-7', pr_number=7, pr_repo=REPO_FULL,
+                pr_head_branch='feature-x',
+            )
+        return self.env['cloud.instance'].browse(result['staging_id'])
+
+    def test_a_preview_gets_an_address_under_the_host_wildcard(self):
+        staging = self._clone()
+        self.assertEqual(
+            staging.domain,
+            f'{self.project.remote_folder}-pr-7.preview.example.com',
+        )
+
+    def test_the_ready_comment_links_to_it(self):
+        staging = self._clone()
+        body = staging._pr_preview_ready_body()
+        self.assertIn(f'https://{staging.domain}', body)
+        self.assertIn('`feature-x`', body)
+        self.assertNotIn('no domain configured', body)
+
+    def test_the_preview_follows_the_pull_request_branch(self):
+        staging = self._clone()
+        repo = staging.repo_ids.filtered(lambda r: r.url == REPO_URL)
+        self.assertEqual(repo.branch, 'feature-x')
+        self.assertFalse(repo.commit_sha)
+
+
+class TestPreviewCommentId(_PreviewBase):
+    """The preview keeps the id of the comment it posts, to edit and delete
+    it later. GitHub's comment ids are past 2^31: storing one failed with
+    "integer out of range" and the preview ended in error (11-oct-2026)."""
+
+    BIG_ID = 3_456_789_012
+
+    def _preview(self):
+        """Clone the production instance as PR 7 without enqueuing jobs."""
+        with patch.object(
+            type(self.env['cloud.job']), 'enqueue_chain', return_value=[1, 2, 3],
+        ):
+            result = self.prod.clone_to_staging(
+                'pr-7', pr_number=7, pr_repo=REPO_FULL,
+                pr_head_branch='feature-x',
+            )
+        return self.env['cloud.instance'].browse(result['staging_id'])
+
+    def _comment_patches(self):
+        """Stand in for the GitHub App the preview comments with: return
+        (client mock, patchers); a new comment gets ``BIG_ID``."""
+        client = MagicMock(spec=GitHubAppClient)
+        client.post_issue_comment.return_value = {'id': self.BIG_ID}
+        Service = type(self.env['cloud.github.credential.service'])
+        return client, (
+            patch.object(cloud_instance, 'GitHubAppClient', return_value=client),
+            patch.object(Service, 'get_credentials', return_value=object()),
+        )
+
+    def test_a_comment_id_past_32_bits_is_kept_and_edited(self):
+        staging = self._preview()
+        client, patches = self._comment_patches()
+        with patches[0], patches[1]:
+            staging._post_or_update_pr_comment('ready')
+            self.env.flush_all()
+            staging.invalidate_recordset(['pr_comment_id'])
+            self.assertEqual(staging.pr_comment_id, self.BIG_ID)
+            staging._post_or_update_pr_comment('ready again')
+        client.patch_issue_comment.assert_called_once_with(
+            'owner', 'repo', self.BIG_ID, 'ready again',
+        )
+
+    def test_the_column_is_a_bigint(self):
+        self.env.cr.execute("""
+            SELECT udt_name FROM information_schema.columns
+             WHERE table_name = 'cloud_instance'
+               AND column_name = 'pr_comment_id'
+        """)
+        self.assertEqual(self.env.cr.fetchone()[0], 'int8')
+
+
+class TestPreviewCommentInstallation(_PreviewBase):
+    """The comment is the installation's that sent the pull request, and
+    a comment GitHub does not take is seen on the production.
+
+    The App may be installed on more than one account; the panel keeps
+    one installation. A preview's comment was written, and deleted, with
+    that one's token whatever installation sent the request: GitHub
+    refused it, the refusal went to the server's log alone, and the
+    restore ended done with the pull request left without its comment.
+    """
+
+    OTHER_INSTALLATION = '9999'
+
+    def _preview(self, installation=OTHER_INSTALLATION, **vals):
+        """Create the preview of PR 7, deployed, as its clone through
+        *installation* leaves it."""
+        return self.env['cloud.instance'].sudo().create({
+            'name': 'pr-7', 'project_id': self.project.id,
+            'host_id': self.host.id, 'environment': 'staging',
+            'state': 'deployed', 'pr_number': 7, 'pr_repo': REPO_FULL,
+            'pr_head_branch': 'feature-x', 'pr_state': 'open',
+            'pr_installation_id': installation,
+        } | vals)
+
+    def _client(self):
+        """Stand in for the client of the App: return (client, class patch)."""
+        client = MagicMock(spec=GitHubAppClient)
+        client.post_issue_comment.return_value = {'id': 31}
+        client.get.side_effect = _github_get()
+        return client, patch.object(
+            cloud_instance, 'GitHubAppClient', return_value=client,
+        )
+
+    def _note_alert(self, instance):
+        """Return the active comment alert on *instance*."""
+        return self.env['cloud.alert'].search([
+            ('code', '=', PR_PREVIEW_NOTE_FAILED_CODE),
+            ('instance_id', '=', instance.id),
+            ('state', '=', 'active'),
+        ])
+
+    def test_the_event_s_installation_is_kept_on_the_preview(self):
+        with self._clone_patch(return_value={}) as clone:
+            self._event()._process_pull_request_event()
+        self.assertEqual(
+            clone.call_args.kwargs['pr_installation_id'], str(INSTALLATION_ID),
+        )
+
+    def test_the_comment_is_written_with_the_event_s_installation(self):
+        preview = self._preview()
+        client, patcher = self._client()
+        with patcher as cls:
+            preview._job_pr_comment()
+        creds = cls.call_args.args[0]
+        self.assertEqual(creds.installation_id, self.OTHER_INSTALLATION)
+        self.assertEqual(creds.app_id, '12345')
+        client.post_issue_comment.assert_called_once()
+        self.assertEqual(preview.pr_comment_id, 31)
+
+    def test_the_comment_is_deleted_with_it_too(self):
+        preview = self._preview(pr_comment_id=31)
+        client, patcher = self._client()
+        with patcher as cls:
+            preview._delete_pr_comment()
+        self.assertEqual(cls.call_args.args[0].installation_id, self.OTHER_INSTALLATION)
+        client.delete_issue_comment.assert_called_once_with('owner', 'repo', 31)
+
+    def test_a_preview_without_one_uses_the_panel_s(self):
+        preview = self._preview(installation='')
+        _client, patcher = self._client()
+        with patcher as cls:
+            preview._job_pr_comment()
+        self.assertEqual(cls.call_args.args[0].installation_id, str(INSTALLATION_ID))
+
+    def test_a_refused_comment_raises_an_alert_on_production(self):
+        preview = self._preview()
+        client, patcher = self._client()
+        client.post_issue_comment.side_effect = GitHubAPIError(
+            403, 'Resource not accessible by integration',
+        )
+        with patcher:
+            preview._job_pr_comment()
+        alert = self._note_alert(self.prod)
+        self.assertEqual(len(alert), 1)
+        self.assertIn('#7', alert.message)
+        self.assertIn('403', alert.message)
+
+    def test_github_away_is_tried_again_before_the_alert(self):
+        preview = self._preview()
+        client, patcher = self._client()
+        client.post_issue_comment.side_effect = GitHubAPIError(502, 'Bad gateway')
+        Note = type(self.env['cloud.gitlab.mr.note'])
+        with patcher, patch.object(Note, '_last_attempt', return_value=False), \
+                self.assertRaises(RetryableJobError):
+            preview._job_pr_comment()
+        self.assertFalse(self._note_alert(self.prod))
+        with patcher:
+            preview._job_pr_comment()
+        self.assertTrue(self._note_alert(self.prod), "the last try alerts")
+
+    def test_a_comment_that_goes_through_resolves_the_alert(self):
+        preview = self._preview()
+        self.env['cloud.alert'].sudo().raise_alert(
+            PR_PREVIEW_NOTE_FAILED_CODE, 'x', level='warning', instance=self.prod,
+            key=f'github_pr:{REPO_FULL}:7',
+        )
+        _client, patcher = self._client()
+        with patcher:
+            preview._job_pr_comment()
+        self.assertFalse(self._note_alert(self.prod))
+
+    def test_a_closed_or_undeployed_preview_gets_no_comment(self):
+        for name, vals in (('pr-7-a', {'pr_state': 'closed'}),
+                           ('pr-7-b', {'state': 'deploying'})):
+            with self.subTest(**vals):
+                preview = self._preview(name=name, **vals)
+                client, patcher = self._client()
+                with patcher:
+                    preview._job_pr_comment()
+                client.post_issue_comment.assert_not_called()
+
+    def test_queued_twice_it_is_one_job(self):
+        preview = self._preview()
+        preview._enqueue_pr_comment()
+        preview._enqueue_pr_comment()
+        jobs = self.env['queue.job'].sudo().search([
+            ('model_name', '=', 'cloud.instance'),
+            ('method_name', '=', '_job_pr_comment'),
+        ])
+        self.assertEqual(len(jobs), 1)
+
+
+class _CommentCase(_PreviewBase):
+    """What the comment of a pull request preview says, and how it is found.
+
+    The preview and the client of the App of
+    ``TestPreviewCommentInstallation``, without its tests.
+    """
+
+    OTHER_INSTALLATION = TestPreviewCommentInstallation.OTHER_INSTALLATION
+    _preview = TestPreviewCommentInstallation._preview
+    _client = TestPreviewCommentInstallation._client
+    _note_alert = TestPreviewCommentInstallation._note_alert
+
+    def _comment_jobs(self):
+        """Return the queued jobs of the pull request's comment."""
+        return self.env['queue.job'].sudo().search([
+            ('model_name', '=', 'cloud.instance'),
+            ('method_name', '=', '_job_pr_comment'),
+        ])
+
+
+class TestPreviewUpdateFailedComment(_CommentCase):
+    """A preview whose update failed says so on its pull request.
+
+    Its database was restored, but updating its modules to the request's
+    code failed: Odoo was left stopped, the restore failed, and nobody on
+    the pull request heard of it — the «ready» comment is queued by the
+    restore's success alone. The restore's failure now queues the comment,
+    which says it could not be updated and why; a rebuild that succeeds
+    makes it say «ready».
+    """
+
+    REASON = 'Updating its modules to this code failed (exit status 1).'
+
+    def _restore_fails_in_its_update(self, preview, status=1):
+        """Run a restore's ``on_failure`` on *preview*, its update failed.
+
+        :param status: the update's exit status, None for one that never
+            answered (the connection dropped, its time ran out)
+        """
+        from odoo.addons.incubacloud.models.restore_instance_executor import (
+            RestoreInstanceExecutor,
+        )
+        ex = object.__new__(RestoreInstanceExecutor)
+        ex.job = SimpleNamespace(id=1, instance_id=preview, payload={})
+        ex.env = self.env
+        lines = []
+        with patch.object(
+            RestoreInstanceExecutor, '_sys', autospec=True,
+            side_effect=lambda _self, line: lines.append(line),
+        ):
+            asyncio.run(ex.on_failure(
+                {'Restore database': {'exit_status': 0, 'stdout': ''},
+                 'Update changed modules': {'exit_status': status, 'stdout': ''}},
+                [f"'Update changed modules' exited with status {status}"],
+            ))
+        return lines
+
+    def test_the_failure_is_kept_and_its_comment_queued(self):
+        preview = self._preview()
+        lines = self._restore_fails_in_its_update(preview)
+        self.assertEqual(preview.status, 'error')
+        self.assertIn('exit status 1', preview.pr_update_error)
+        self.assertEqual(len(self._comment_jobs()), 1)
+        self.assertTrue(any('Pushing a fix' in line for line in lines))
+
+    def test_an_update_cut_off_is_kept_apart_and_still_said(self):
+        """It may still run on the server: the push of a fix does not pass
+        the hold, and neither the log nor the comment say it does."""
+        preview = self._preview()
+        lines = self._restore_fails_in_its_update(preview, status=None)
+        self.assertTrue(preview.pr_update_cut_off)
+        self.assertIn('did not end', preview.pr_update_error)
+        self.assertEqual(len(self._comment_jobs()), 1)
+        self.assertFalse(any('Pushing a fix' in line for line in lines))
+        self.assertTrue(any('may still be running' in line for line in lines))
+        client, patcher = self._client()
+        with patcher:
+            preview._job_pr_comment()
+        body = client.post_issue_comment.call_args.args[3]
+        self.assertIn('did not end', body)
+        self.assertIn('may still be running', body)
+        self.assertNotIn('Push a fix', body)
+
+    def test_an_update_that_failed_is_no_cut(self):
+        preview = self._preview(pr_update_cut_off=True)
+        self._restore_fails_in_its_update(preview)
+        self.assertFalse(preview.pr_update_cut_off)
+
+    def test_another_failure_queues_nothing(self):
+        preview = self._preview()
+        from odoo.addons.incubacloud.models.restore_instance_executor import (
+            RestoreInstanceExecutor,
+        )
+        ex = object.__new__(RestoreInstanceExecutor)
+        ex.job = SimpleNamespace(id=1, instance_id=preview, payload={})
+        ex.env = self.env
+        with patch.object(RestoreInstanceExecutor, '_sys', autospec=True):
+            asyncio.run(ex.on_failure(
+                {'Restore database': {'exit_status': 1, 'stdout': ''}},
+                ["'Restore database' exited with status 1"],
+            ))
+        self.assertFalse(preview.pr_update_error)
+        self.assertFalse(self._comment_jobs())
+
+    def test_the_comment_says_it_could_not_be_updated_and_why(self):
+        preview = self._preview(pr_update_error=self.REASON)
+        client, patcher = self._client()
+        with patcher:
+            preview._job_pr_comment()
+        body = client.post_issue_comment.call_args.args[3]
+        self.assertIn('could not be updated', body)
+        self.assertIn(self.REASON, body)
+        self.assertIn('Push a fix', body)
+        self.assertNotIn('ready', body)
+
+    def test_a_rebuild_that_succeeds_resolves_and_says_ready(self):
+        preview = self._preview(pr_update_error=self.REASON, pr_comment_id=31)
+        preview._preview_rebuilt(self.env['cloud.job'])
+        self.assertFalse(preview.pr_update_error)
+        self.assertEqual(len(self._comment_jobs()), 1)
+        client, patcher = self._client()
+        with patcher:
+            preview._job_pr_comment()
+        body = client.patch_issue_comment.call_args.args[3]
+        self.assertIn('ready', body)
+
+    def test_a_rebuild_of_a_preview_without_comment_writes_it(self):
+        preview = self._preview()
+        preview._preview_rebuilt(self.env['cloud.job'])
+        self.assertEqual(len(self._comment_jobs()), 1)
+
+    def test_a_rebuild_of_a_preview_with_its_comment_writes_nothing(self):
+        preview = self._preview(pr_comment_id=31)
+        preview._preview_rebuilt(self.env['cloud.job'])
+        self.assertFalse(self._comment_jobs())
+
+    def test_a_closed_request_hears_nothing(self):
+        preview = self._preview(pr_state='closed')
+        preview._preview_rebuilt(self.env['cloud.job'])
+        self.assertFalse(self._comment_jobs())
+
+
+class TestPreviewRebuildFailedComment(_CommentCase):
+    """A preview whose rebuild failed says so on its pull request.
+
+    The comment said «ready» after a rebuild that failed (16-nov-2026: a
+    build that filled its server's disk): it now says the rebuild failed,
+    with a link to its log, until a rebuild passes.
+    """
+
+    def _rebuild_job(self, preview):
+        """Return a rebuild job of *preview*."""
+        return self.env['cloud.job'].sudo().create({
+            'name': 'rebuild', 'host_id': self.host.id,
+            'instance_id': preview.id,
+            'job_type_id': self.env['cloud.job.type'].search(
+                [('code', '=', 'rebuild_instance')], limit=1,
+            ).id,
+        })
+
+    def _executor(self, job):
+        """Return the rebuild executor of *job*, its log kept in a list."""
+        from odoo.addons.incubacloud.models.rebuild_instance_executor import (
+            RebuildInstanceExecutor,
+        )
+        ex = object.__new__(RebuildInstanceExecutor)
+        ex.job = job
+        ex.env = self.env
+        ex.lines = []
+        return ex, patch.object(
+            RebuildInstanceExecutor, '_sys', autospec=True,
+            side_effect=lambda _self, line: _self.lines.append(line),
+        )
+
+    def test_a_failed_rebuild_is_kept_and_its_comment_queued(self):
+        preview = self._preview(pr_comment_id=31)
+        job = self._rebuild_job(preview)
+        ex, sys_patch = self._executor(job)
+        with sys_patch:
+            asyncio.run(ex.on_failure(
+                {'Rebuild Odoo image': {'exit_status': 1, 'stdout': ''}},
+                ["'Rebuild Odoo image' exited with status 1"],
+            ))
+        self.assertEqual(preview.pr_rebuild_failed_job, job.id)
+        self.assertEqual(len(self._comment_jobs()), 1)
+
+    def test_an_aborted_rebuild_says_its_error_last_and_is_kept(self):
+        preview = self._preview(pr_comment_id=31)
+        job = self._rebuild_job(preview)
+        ex, sys_patch = self._executor(job)
+        with sys_patch, patch.object(
+            type(ex), '_left_unapplied', autospec=True,
+            return_value='Rebuild Odoo image',
+        ):
+            asyncio.run(ex.on_abort(RuntimeError('the disk is full')))
+        self.assertEqual(ex.lines[-1], '✗ RuntimeError: the disk is full')
+        self.assertIn('rewrote the instance', ex.lines[0])
+        self.assertEqual(preview.pr_rebuild_failed_job, job.id)
+        self.assertEqual(len(self._comment_jobs()), 1)
+
+    def test_the_comment_says_the_rebuild_failed_with_its_log(self):
+        preview = self._preview(pr_comment_id=31)
+        job = self._rebuild_job(preview)
+        self.env['ir.config_parameter'].sudo().set_param(
+            'web.base.url', 'https://panel.example.com/',
+        )
+        preview._preview_rebuild_failed(job)
+        client, patcher = self._client()
+        with patcher:
+            preview._job_pr_comment()
+        body = client.patch_issue_comment.call_args.args[3]
+        self.assertIn('rebuild failed', body)
+        self.assertIn(f'https://panel.example.com/cloud/log/{job.id}', body)
+        self.assertNotIn('ready', body)
+        self.assertIn(preview._pr_note_marker(), body)
+
+    def test_a_purged_job_leaves_the_failure_without_its_link(self):
+        """Purging the old jobs does not turn the failure into «ready»."""
+        preview = self._preview(pr_comment_id=31)
+        job = self._rebuild_job(preview)
+        self.env['ir.config_parameter'].sudo().set_param(
+            'web.base.url', 'https://panel.example.com',
+        )
+        preview._preview_rebuild_failed(job)
+        job_id = job.id
+        self.env.flush_all()
+        job.unlink()
+        preview.invalidate_recordset()
+        self.assertEqual(preview.pr_rebuild_failed_job, job_id)
+        body = preview._pr_preview_body()
+        self.assertIn('rebuild failed', body)
+        self.assertNotIn('/cloud/log/', body)
+        self.assertNotIn('The log says why', body)
+
+    def test_a_rebuild_that_succeeds_says_ready_again(self):
+        preview = self._preview(pr_comment_id=31)
+        job = self._rebuild_job(preview)
+        preview._preview_rebuild_failed(job)
+        self._comment_jobs().unlink()
+        preview._preview_rebuilt(self._rebuild_job(preview))
+        self.assertFalse(preview.pr_rebuild_failed_job)
+        self.assertEqual(len(self._comment_jobs()), 1)
+        client, patcher = self._client()
+        with patcher:
+            preview._job_pr_comment()
+        self.assertIn('ready', client.patch_issue_comment.call_args.args[3])
+
+    def test_a_closed_request_hears_nothing_of_it(self):
+        preview = self._preview(pr_state='closed')
+        preview._preview_rebuild_failed(self._rebuild_job(preview))
+        self.assertFalse(preview.pr_rebuild_failed_job)
+        self.assertFalse(self._comment_jobs())
+
+    def test_an_instance_of_no_request_is_left_alone(self):
+        job = self._rebuild_job(self.prod)
+        self.prod._preview_rebuild_failed(job)
+        self.assertFalse(self.prod.pr_rebuild_failed_job)
+        self.assertFalse(self._comment_jobs())
+
+
+class TestPreviewRestoreClosedFromItsCheckpoint(_CommentCase):
+    """A preview's restore closed by whoever adopts its checkpoint.
+
+    Its update runs apart on the server (12-nov-2026): the worker that ran
+    the restore can die with it running, and the reconciliation closes the
+    job from its checkpoint (``_adopt_checkpoint``), the step it ran then
+    as ``_running_step``, the end of a step it found ended in its results
+    (``_record_ended_apart``). The restore's ``on_failure`` keeps the
+    preview's queue apart only from an update that may still run.
+    """
+
+    _UPDATE = 'Update changed modules'
+
+    def _closed(self, detached_started=True, parked=False, ended=None):
+        """Close a preview's restore from a checkpoint at its update.
+
+        :param bool detached_started: the row says the update started apart
+        :param bool parked: the row says the job was parked
+        :param ended: the update's exit status as the server said it, or
+            None when nothing is known of its end
+        :return: the preview
+        """
+        from odoo.addons.incubacloud.models.abstract_executor import (
+            JobWorkerLost,
+        )
+        from odoo.addons.incubacloud.models.restore_instance_executor import (
+            RestoreInstanceExecutor,
+        )
+        preview = self._preview()
+        job = self.env['cloud.job'].sudo().create({
+            'name': 'restore', 'host_id': self.host.id,
+            'instance_id': preview.id,
+            'job_type_id': self.env['cloud.job.type'].search(
+                [('code', '=', 'restore_instance')], limit=1,
+            ).id,
+            'payload': {'mode': 'from_job', 'source_job_id': 1},
+            'queue_job_uuid': 'preview-restore-closed',
+        })
+        apart = {'stop_on_failure': True, 'detached': True}
+        row = self.env['cloud.job.checkpoint'].sudo().create({
+            'job_id': job.id, 'host_id': self.host.id, 'next_index': 1,
+            'detached_started': detached_started, 'parked': parked,
+            'queue_job_uuid': 'preview-restore-closed',
+            'data': json.dumps({
+                'plan': [
+                    ['Restore database', 'restore', apart],
+                    [self._UPDATE, 'update', apart],
+                    ['Start Odoo service', 'start', {}],
+                ],
+                'results': {
+                    'Restore database': {'stdout': '', 'exit_status': 0},
+                },
+                'job_dir': None, 'private_uploads': [],
+                'carried': {'_moved': False},
+            }),
+        })
+        executor = RestoreInstanceExecutor(job, self.host)
+        executor._adopt_checkpoint(row)
+        # As the reconciliation hands the hook what had run, then what
+        # ``_close_on_server`` read of the step.
+        executor._step_results = dict(executor._checkpoint_data['results'])
+        if ended is not None:
+            executor._step_results[self._UPDATE] = {
+                'stdout': '', 'exit_status': ended,
+            }
+        with patch.object(RestoreInstanceExecutor, '_sys', autospec=True):
+            asyncio.run(executor.on_abort(JobWorkerLost('worker lost')))
+        return preview
+
+    def test_an_update_left_running_is_cut_off(self):
+        """It may still run on the server: the queue keeps it apart."""
+        preview = self._closed()
+        self.assertEqual(preview.status, 'error')
+        self.assertTrue(preview.pr_update_cut_off)
+        self.assertIn('did not end', preview.pr_update_error)
+
+    def test_an_attempt_that_died_with_it_running_is_cut_off(self):
+        """Not recorded as started apart, but the row is not parked."""
+        preview = self._closed(detached_started=False, parked=False)
+        self.assertTrue(preview.pr_update_cut_off)
+
+    def test_an_update_found_ended_well_is_no_cut(self):
+        """Exit 0 read on the server: nothing runs, nothing failed in it."""
+        preview = self._closed(ended=0)
+        self.assertEqual(preview.status, 'error')
+        self.assertFalse(preview.pr_update_cut_off)
+        self.assertFalse(preview.pr_update_error)
+
+    def test_an_update_found_failed_says_its_status(self):
+        """Exit 1 read on the server: a failed update, not a cut one."""
+        preview = self._closed(ended=1)
+        self.assertFalse(preview.pr_update_cut_off)
+        self.assertIn('exit status 1', preview.pr_update_error)
+
+    def test_an_update_never_started_is_no_cut(self):
+        """Parked before it, never started: the update is not counted."""
+        preview = self._closed(detached_started=False, parked=True)
+        self.assertFalse(preview.pr_update_cut_off)
+        self.assertFalse(preview.pr_update_error)
+
+
+class TestPreviewCommentFoundAgain(_CommentCase):
+    """A comment written by a try whose answer never came is not written twice.
+
+    The job writes the comment, GitHub takes it, the answer is lost on the
+    way and the job runs again: with no id kept, it wrote a second one. The
+    comment carries a hidden marker now, and is looked for by it.
+    """
+
+    def test_the_comment_carries_the_marker(self):
+        preview = self._preview()
+        self.assertIn(
+            preview._pr_note_marker(), preview._pr_preview_ready_body(),
+        )
+        self.assertTrue(preview._pr_note_marker().startswith('<!-- incubacloud:preview:'))
+
+    def test_a_comment_found_by_its_marker_is_rewritten(self):
+        preview = self._preview()
+        client, patcher = self._client()
+        client.get.side_effect = _github_get([
+            {'id': 5, 'body': preview._pr_note_marker(),
+             'performed_via_github_app': {'id': 999}},
+            {'id': 6, 'body': 'thanks ' + preview._pr_note_marker(),
+             'performed_via_github_app': {'id': 12345}},
+        ])
+        with patcher:
+            preview._job_pr_comment()
+        client.post_issue_comment.assert_not_called()
+        self.assertEqual(client.patch_issue_comment.call_args.args[2], 6)
+        self.assertEqual(preview.pr_comment_id, 6)
+
+    def test_a_marker_pasted_by_someone_else_is_not_taken(self):
+        preview = self._preview()
+        client, patcher = self._client()
+        client.get.side_effect = _github_get([
+            {'id': 5, 'body': preview._pr_note_marker(),
+             'user': {'login': 'someone'}},
+        ])
+        with patcher:
+            preview._job_pr_comment()
+        client.post_issue_comment.assert_called_once()
+        self.assertEqual(preview.pr_comment_id, 31)
+
+
+class TestPreviewCommentFailures(_CommentCase):
+    """Every way the comment's job can fail ends in an alert or a retry.
+
+    An answer cut short, a JSON GitHub did not send whole, a token answer
+    without its token ended the job failed, with no alert. A 401 with a
+    token kept and since revoked, and GitHub's secondary rate limit, are
+    worth another try.
+    """
+
+    def test_anything_else_raises_the_alert(self):
+        preview = self._preview()
+        client, patcher = self._client()
+        client.post_issue_comment.side_effect = KeyError('token')
+        with patcher:
+            preview._job_pr_comment()
+        alert = self._note_alert(self.prod)
+        self.assertEqual(len(alert), 1)
+        self.assertIn('KeyError', alert.message)
+
+    def test_a_401_is_tried_once_more_at_once(self):
+        preview = self._preview()
+        client, patcher = self._client()
+        client.post_issue_comment.side_effect = [
+            GitHubAPIError(401, 'Bad credentials'), {'id': 31},
+        ]
+        with patcher:
+            preview._job_pr_comment()
+        self.assertEqual(client.post_issue_comment.call_count, 2)
+        self.assertEqual(preview.pr_comment_id, 31)
+        self.assertFalse(self._note_alert(self.prod))
+
+    def test_a_second_401_raises_the_alert(self):
+        preview = self._preview()
+        client, patcher = self._client()
+        client.post_issue_comment.side_effect = GitHubAPIError(401, 'Bad credentials')
+        Note = type(self.env['cloud.gitlab.mr.note'])
+        with patcher, patch.object(Note, '_last_attempt', return_value=False):
+            preview._job_pr_comment()
+        self.assertEqual(client.post_issue_comment.call_count, 2)
+        self.assertTrue(self._note_alert(self.prod))
+
+    def test_the_secondary_rate_limit_is_tried_later(self):
+        preview = self._preview()
+        client, patcher = self._client()
+        client.post_issue_comment.side_effect = GitHubAPIError(
+            403, 'You have exceeded a secondary rate limit',
+        )
+        Note = type(self.env['cloud.gitlab.mr.note'])
+        with patcher, patch.object(Note, '_last_attempt', return_value=False), \
+                self.assertRaises(RetryableJobError):
+            preview._job_pr_comment()
+
+
+class TestPreviewOfAClosedPullRequest(_CommentCase):
+    """The comment's job asks GitHub whether the pull request is still open.
+
+    An open and a close at once: the close's search did not see the
+    preview the open had not committed yet, so nothing closed it, and its
+    restore queued the «ready» comment on a closed pull request. The job
+    runs after both, and a pull request closed meanwhile gets no comment
+    and loses its preview.
+    """
+
+    def _deletes(self, preview):
+        """Return the ``delete_instance`` jobs of *preview*."""
+        return self.env['cloud.job'].search([
+            ('instance_id', '=', preview.id),
+            ('job_type_id.code', '=', 'delete_instance'),
+        ])
+
+    def test_a_closed_pull_request_gets_no_comment_and_loses_its_preview(self):
+        preview = self._preview(pr_comment_id=31)
+        client, patcher = self._client()
+        client.get.side_effect = _github_get(state='closed')
+        with patcher:
+            preview._job_pr_comment()
+        client.get.assert_called_once_with(f'/repos/{REPO_FULL}/pulls/7')
+        client.post_issue_comment.assert_not_called()
+        client.patch_issue_comment.assert_not_called()
+        client.delete_issue_comment.assert_called_once_with('owner', 'repo', 31)
+        self.assertEqual(preview.pr_state, 'closed')
+        self.assertEqual(len(self._deletes(preview)), 1)
+
+    def test_it_resolves_the_alert_of_its_comment(self):
+        preview = self._preview()
+        self.env['cloud.alert'].sudo().raise_alert(
+            PR_PREVIEW_NOTE_FAILED_CODE, 'x', level='warning', instance=self.prod,
+            key=f'github_pr:{REPO_FULL}:7',
+        )
+        client, patcher = self._client()
+        client.get.side_effect = _github_get(state='closed')
+        client.post_issue_comment.side_effect = GitHubAPIError(403, 'Forbidden')
+        with patcher:
+            preview._job_pr_comment()
+        self.assertFalse(self._note_alert(self.prod))
+
+    def test_a_delete_that_cannot_be_queued_leaves_it_closed(self):
+        """Closed before the delete's savepoint: the note's job and the
+        restore see it closed; a lost race reaches queue_job's retry."""
+        preview = self._preview()
+        client, patcher = self._client()
+        client.get.side_effect = _github_get(state='closed')
+        Instance = type(self.env['cloud.instance'])
+        with patcher, patch.object(
+            Instance, '_remove_closed_preview', side_effect=UserError('Full.'),
+        ):
+            preview._job_pr_comment()
+        self.assertEqual(preview.pr_state, 'closed')
+        client.post_issue_comment.assert_not_called()
+        other = self._preview(name='pr-8', pr_number=8)
+        with patcher, patch.object(
+            Instance, '_remove_closed_preview', side_effect=_LostRace('lost'),
+        ), self.assertRaises(pg_errors.SerializationFailure):
+            other._job_pr_comment()
+
+    def test_a_pull_request_that_cannot_be_read_gets_its_comment(self):
+        """A read that fails, or says nothing usable, costs no retry and no alert."""
+        Note = type(self.env['cloud.gitlab.mr.note'])
+        for i, state in enumerate((
+            GitHubAPIError(502, 'Bad gateway'), GitHubAPIError(404, 'Not Found'),
+            OSError('unreachable'), [], {'number': 7},
+        )):
+            with self.subTest(state=state):
+                preview = self._preview(name=f'pr-7-{i}')
+                client, patcher = self._client()
+                client.get.side_effect = _github_get(state=state)
+                with patcher, patch.object(Note, '_last_attempt', return_value=False):
+                    preview._job_pr_comment()
+                client.post_issue_comment.assert_called_once()
+                self.assertEqual(preview.pr_state, 'open')
+                self.assertFalse(self._note_alert(self.prod))
+
+    def test_a_401_on_the_read_is_tried_once_more_at_once(self):
+        """The client dropped the token it had kept, which GitHub may have revoked."""
+        preview = self._preview()
+        client, patcher = self._client()
+        answers = iter((GitHubAPIError(401, 'Bad credentials'), 'closed'))
+        reads = _github_get(state='closed')
+
+        def get(endpoint, **kwargs):
+            """Refuse the first read of the pull request with a 401."""
+            answer = next(answers)
+            if isinstance(answer, Exception):
+                raise answer
+            return reads(endpoint, **kwargs)
+
+        client.get.side_effect = get
+        with patcher:
+            preview._job_pr_comment()
+        self.assertEqual(client.get.call_count, 2)
+        client.post_issue_comment.assert_not_called()
+        self.assertEqual(preview.pr_state, 'closed')
+
+    def test_a_repository_without_a_slash_is_not_read_and_counts_as_open(self):
+        """There is no account and repository to ask about: no error, no read."""
+        for i, repo in enumerate(('', 'norepo', '/repo', 'owner/')):
+            with self.subTest(repo=repo):
+                preview = self._preview(name=f'pr-7-{i}', pr_repo=repo)
+                client, patcher = self._client()
+                with patcher:
+                    self.assertFalse(preview._pr_closed_on_github())
+                client.get.assert_not_called()
+
+    def test_the_failures_to_expect_are_logged_as_information(self):
+        """GitHub's answer, the network and the installation: no warning."""
+        for i, error in enumerate((
+            GitHubAPIError(502, 'Bad gateway'), OSError('unreachable'),
+            UserError('No GitHub App.'),
+        )):
+            with self.subTest(error=error):
+                preview = self._preview(name=f'pr-7-{i}')
+                client, patcher = self._client()
+                client.get.side_effect = _github_get(state=error)
+                with patcher, self.assertLogs(
+                    cloud_instance._logger.name, level=logging.INFO,
+                ) as logs:
+                    self.assertFalse(preview._pr_closed_on_github())
+                self.assertEqual([r.levelname for r in logs.records], ['INFO'])
+
+    def test_any_other_failure_is_a_warning_with_its_traceback(self):
+        """A bug in what reads the pull request is not hidden at INFO."""
+        preview = self._preview()
+        client, patcher = self._client()
+        client.get.side_effect = _github_get(state=RuntimeError('boom'))
+        with patcher, self.assertLogs(
+            cloud_instance._logger.name, level=logging.INFO,
+        ) as logs:
+            self.assertFalse(preview._pr_closed_on_github())
+        self.assertEqual([r.levelname for r in logs.records], ['WARNING'])
+        self.assertIsNotNone(logs.records[0].exc_info)
+        self.assertIs(logs.records[0].exc_info[0], RuntimeError)
+
+
+class TestPreviewReopenedAtOnce(_CommentCase):
+    """A pull request closed and reopened at once gets a new preview.
+
+    The closed preview still being deleted counted as the pull request's:
+    the reopened one was left without a preview or a comment. It does
+    not count now, and the new one takes another name while it holds its
+    own, as a merge request's does.
+    """
+
+    def test_closed_and_reopened_at_once_it_gets_a_new_preview(self):
+        old = self._preview(name='pr-7', state='deploying', pr_state='closed')
+        with self._clone_patch(return_value={}) as clone:
+            self._event(action='reopened')._process_pull_request_event()
+        clone.assert_called_once()
+        self.assertEqual(clone.call_args.args, ('pr-7-2',))
+        self.assertTrue(old.exists())
+
+    def test_a_push_rebuilds_only_the_open_preview(self):
+        closed = self._preview(name='pr-7', pr_state='closed')
+        reopened = self._preview(name='pr-7-2')
+        Job = type(self.env['cloud.job'])
+        with patch.object(Job, 'enqueue', autospec=True) as enqueue:
+            self._event(action='synchronize')._process_pull_request_event()
+        rebuilt = [c.args[2] for c in enqueue.call_args_list]
+        self.assertEqual(rebuilt, [reopened.id])
+        self.assertNotIn(closed.id, rebuilt)
+
+    def test_two_deliveries_at_once_leave_one_preview_and_no_alert(self):
+        """The loser of the unique name finds the winner's preview and says nothing."""
+        self.registry_enter_test_mode()
+        self._preview(name='pr-7', state='deploying')
+        Event = type(self.env['cloud.github.event'])
+        with patch.object(
+            Event, '_pr_previews', return_value=self.env['cloud.instance'],
+        ), patch.object(
+            Event, '_free_preview_name', return_value='pr-7',
+        ), patch.object(
+            type(self.env['cloud.job']), 'enqueue_chain', return_value=[1, 2, 3],
+        ):
+            event = self._event()
+            event._process_pull_request_event()
+        self.assertTrue(event.processed)
+        self.assertFalse(self._alert())
+
+
+class TestPreviewCommentAlertKey(_CommentCase):
+    """The alert of a pull request's comment is that pull request's.
+
+    Two pull requests previewing one production shared one alert: the
+    comment of one that went through resolved the other's, and the close
+    of the pull request left its alert open for good.
+    """
+
+    def test_two_pull_requests_have_an_alert_each(self):
+        first = self._preview()
+        second = self._preview(name='pr-8', pr_number=8)
+        client, patcher = self._client()
+        client.post_issue_comment.side_effect = GitHubAPIError(403, 'Forbidden')
+        with patcher:
+            first._job_pr_comment()
+            second._job_pr_comment()
+        alerts = self._note_alert(self.prod)
+        self.assertEqual(len(alerts), 2)
+        self.assertEqual(
+            set(alerts.mapped('dedup_key')),
+            {f'github_pr:{REPO_FULL}:7', f'github_pr:{REPO_FULL}:8'},
+        )
+        client.post_issue_comment.side_effect = None
+        with patcher:
+            second._job_pr_comment()
+        self.assertEqual(
+            self._note_alert(self.prod).dedup_key, f'github_pr:{REPO_FULL}:7',
+        )
+
+    def test_the_close_of_the_pull_request_resolves_it(self):
+        preview = self._preview()
+        client, patcher = self._client()
+        client.post_issue_comment.side_effect = GitHubAPIError(403, 'Forbidden')
+        with patcher:
+            preview._job_pr_comment()
+        self.assertTrue(self._note_alert(self.prod))
+        Instance = type(self.env['cloud.instance'])
+        with patch.object(Instance, '_remove_closed_preview'):
+            self._event(action='closed')._process_pull_request_event()
+        self.assertFalse(self._note_alert(self.prod))
+
+
+class TestPreviewCommentDeleteLogs(_CommentCase):
+    """A comment that cannot be deleted is a warning in the log, not an error:
+    the App uninstalled from the account is the usual reason."""
+
+    def test_a_refused_delete_is_a_warning(self):
+        preview = self._preview(pr_comment_id=31)
+        client, patcher = self._client()
+        client.delete_issue_comment.side_effect = GitHubAPIError(404, 'Not Found')
+        with patcher, self.assertLogs(cloud_instance._logger, 'WARNING') as logs:
+            preview._delete_pr_comment()
+        self.assertTrue(logs.records)
+        self.assertTrue(all(r.levelname == 'WARNING' for r in logs.records))
+        self.assertFalse(any(r.exc_info for r in logs.records))
+
+
+class TestPullRequestOfAnotherInstallation(_PreviewBase):
+    """A pull request through another installation of the App is said aloud.
+
+    The panel acts on one installation of its App. A pull request through
+    another one, on a repository a production of the panel follows, was
+    ignored with a line in the log: whoever opened it waited for a preview
+    that never came. An alert on that production says so now, naming the
+    account, keyed by the installation; choosing that installation
+    resolves it.
+    """
+
+    OTHER = INSTALLATION_ID + 1
+
+    def _alerts(self):
+        """Return the active alerts of another installation on production."""
+        return self.env['cloud.alert'].search([
+            ('code', '=', PR_OTHER_INSTALLATION_CODE),
+            ('instance_id', '=', self.prod.id),
+            ('state', '=', 'active'),
+        ])
+
+    def test_an_opened_pull_request_raises_a_warning_on_production(self):
+        with self._clone_patch(return_value={}) as clone:
+            self._event(installation=self.OTHER)._process_pull_request_event()
+        clone.assert_not_called()
+        alert = self._alerts()
+        self.assertEqual(len(alert), 1)
+        self.assertEqual(alert.level, 'warning')
+        self.assertEqual(alert.dedup_key, str(self.OTHER))
+        self.assertIn(REPO_FULL.split('/')[0], alert.message)
+        self.assertIn('#7', alert.message)
+        self.assertIn('no preview', alert.message)
+        self.assertNotIn('Check installation', alert.message)
+
+    def test_a_repository_no_production_follows_makes_no_noise(self):
+        self._event(
+            installation=self.OTHER, base=(FORK_FULL, FORK_URL), head=(FORK_FULL, FORK_URL),
+        )._process_pull_request_event()
+        self.assertFalse(self.env['cloud.alert'].search([
+            ('code', '=', PR_OTHER_INSTALLATION_CODE),
+        ]))
+
+    def test_a_fork_makes_no_noise(self):
+        self._event(
+            installation=self.OTHER, head=(FORK_FULL, FORK_URL),
+        )._process_pull_request_event()
+        self.assertFalse(self._alerts())
+
+    def test_a_push_to_it_makes_no_noise(self):
+        self._event(
+            installation=self.OTHER, action='synchronize',
+        )._process_pull_request_event()
+        self.assertFalse(self._alerts())
+
+    def test_choosing_that_installation_resolves_it(self):
+        self._event(installation=self.OTHER)._process_pull_request_event()
+        self.assertTrue(self._alerts())
+        self.env['cloud.github.app'].search([]).write(
+            {'installation_id': str(self.OTHER)},
+        )
+        self.assertFalse(self._alerts())

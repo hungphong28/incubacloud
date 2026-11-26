@@ -1,0 +1,167 @@
+# Contributing to IncubaCloud Core
+
+Thanks for your interest in contributing. Please read this document before opening a pull request.
+
+---
+
+## Before you start
+
+- For **bug reports**, open a GitHub issue with a clear reproduction case.
+- For **new features or significant changes**, open an issue first to discuss the approach. This saves both sides from wasted work.
+- For **security vulnerabilities**, do **not** open a public issue. See [SECURITY.md](SECURITY.md).
+
+---
+
+## Development setup
+
+### Requirements
+
+- Docker + Docker Compose
+- Python 3.10+ (CI runs the test suite on 3.10; lint and type-check run on 3.12)
+- [invoke](https://www.pyinvoke.org/)
+
+### Clone and run
+
+```bash
+git clone https://github.com/incubacloud/incubacloud /path/to/addons/incubacloud
+```
+
+Place the cloned folder inside an Odoo `addons_path`. For a Doodba-based setup:
+
+```bash
+# From the doodba project root:
+invoke install -m incubacloud
+invoke restart
+```
+
+For a standard Odoo setup, add the path to `odoo.conf` and install via CLI or UI.
+
+### Python dependencies
+
+The panel's pinned packages, OCA/queue's (`queue_job` does not install without
+`openupgradelib`), and the linter:
+
+```bash
+pip install -r requirements.txt -r /path/to/OCA/queue/requirements.txt refurb
+```
+
+Running a full panel, with the Odoo settings its jobs need:
+[INSTALL.md](INSTALL.md).
+
+---
+
+## Coding standards
+
+### Python
+
+- Target **Python 3.10+** (the CI test image runs 3.10) and **Odoo 19.0** APIs.
+- Follow [refurb](https://github.com/dosisod/refurb) idioms:
+  - `str.removeprefix()` / `str.removesuffix()` instead of conditional slicing
+  - `with suppress(ExcType):` instead of `try/except: pass`
+  - `Path(x)` instead of `os.path.*` / `open(x)`
+  - `a | b` instead of `{**a, **b}` for dict merges
+  - Tuples for membership tests: `x in (a, b)` not `x in [a, b]`
+- Run `refurb incubacloud/ incubacloud_connect/` before opening a PR. The CI will fail if there are warnings.
+
+### JavaScript / OWL
+
+- Use the existing **OWL patterns** in the codebase (hooks, `useState`, `onWillStart`).
+- For confirmation dialogs, use the **project's own confirm dialog** (`static/src/components/ic_confirm_dialog/`) — never Odoo's `ConfirmationDialog`.
+- Do not add new external JS dependencies.
+
+### Odoo-specific
+
+- New SSH job types require:
+  1. A new `AbstractSSHExecutor` subclass with `_job_type` set.
+  2. A matching `cloud.job.type` record in `data/job_type.xml`.
+  3. Tests covering `get_commands()`, `parse_results()`, and the `on_success()` / `on_failure()` paths.
+- **An executor never writes in its job's transaction.** Outside `on_success` / `on_failure`, every write goes through `self._durable_env()`, or `self._persist()` when the rest of the job must read it back (see [architecture docs](docs/architecture.md#transaction-model)). Never open a cursor yourself: `test_executor_write_rules` fails the build. A model helper meant for executors writes through the environment of the record it is called on.
+- **A row is locked `FOR NO KEY UPDATE`, never `FOR UPDATE`** (`lock_for_update(allow_referencing=True)` in the ORM), unless the lock is there to delete the row or change a column of one of its unique indexes. Held `FOR UPDATE` and then written, the row counts as having its key changed, and any older REPEATABLE READ transaction that stores a row pointing at it fails to serialize (a move, 7-nov-2026). Writing a plain column of a unique index that is not partial is a change of the key whatever the lock, or with none: the soft lock does not save that write. A rule of uniqueness over a column that moves is therefore a partial unique index, which is no key (`cloud_instance_name_project_uniq`, `(project_id, name) WHERE project_id IS NOT NULL`, since 1.0.228). A strong lock that is really needed carries `# lock: key-update needed — <why>` on the line before its statement or on one of the statement's lines; `test_row_lock_rule` fails the build otherwise.
+- Bus notifications must be sent **inside a transaction** (PostgreSQL `NOTIFY` delivers on commit) — inside executors, through `_durable_env()` like log flushes. Never from postcommit hooks.
+
+---
+
+## Running tests
+
+```bash
+# All tests
+odoo --test-enable --stop-after-init --workers=0 \
+     -u incubacloud \
+     --test-tags /incubacloud
+
+# Single test file
+odoo --test-enable --stop-after-init --workers=0 \
+     -u incubacloud \
+     --test-tags /incubacloud:TestCloudJob
+```
+
+All new code must be covered by tests. We use three tiers:
+
+| Tier | Base class | When to use |
+|---|---|---|
+| 1 | `odoo.tests.common.BaseCase` | Pure Python logic (no DB) |
+| 2 | `TransactionCase` | ORM behaviour, model methods |
+| 3 | `HttpCase` | Controllers, HTTP routes |
+
+### Test rules
+
+These are enforced habits, born from real incidents in this codebase:
+
+- **Every mock is spec'd against the real class**:
+  `MagicMock(spec=RealClass)`, never a bare `MagicMock()` and never a
+  hand-rolled `_FakeXxx` class. A bare mock answers yes to everything —
+  one once confirmed a method the real API did not have, the test
+  passed, and production crashed. CI enforces this as a ratchet (the
+  bare-mock count may only go down; see the *Mock-spec ratchet* step).
+  When mocking an Odoo model, spec against the model class:
+  `MagicMock(spec=type(env['cloud.job']))`.
+- **Pure-Python tests inherit `BaseCase`**, not `unittest.TestCase` —
+  they integrate with Odoo's runner, tags and logging.
+- **Assert what survives the job, not what the same environment reads
+  back.** A pending write looks exactly like a saved one to the
+  environment that made it. End the job the way the runner does and read
+  the row by SQL: `JobEndAssertions` in
+  `tests/test_executor_durable_writes.py` (`end_job()`, `stored()`).
+- **Never assert against SQL `NOW()`** or freshly-written timestamps
+  via raw SQL — the transaction clock and the write clock differ and
+  the test goes flaky. Assert through the ORM.
+
+---
+
+## Pull request process
+
+1. **Fork** the repository and create a branch from `19.0`:
+   ```bash
+   git checkout -b feature/my-feature 19.0
+   ```
+
+2. **Write tests** for your changes. PRs without tests for new behaviour will not be merged.
+
+3. **Run the linter** and fix any warnings:
+   ```bash
+   refurb incubacloud/ incubacloud_connect/
+   ```
+
+4. **Open the PR** against the `19.0` branch. Fill in the PR template.
+
+5. A maintainer will review within a reasonable time. Please be patient.
+
+---
+
+## What we will not merge
+
+- Code that breaks existing tests.
+- Code with `refurb` warnings.
+- New features without tests.
+- Changes that tie the platform to a specific deployment tool (e.g. hardcoded Doodba assumptions in core).
+- Changes to the license or copyright headers.
+
+---
+
+## License and Contributor License Agreement
+
+IncubaCloud Core is licensed under the [Elastic License 2.0](LICENSE).
+
+All contributions require agreeing to the [Contributor License Agreement](CLA.md). Signing is automatic: the first time you open a pull request, a bot will ask you to sign by posting a comment. You only need to sign once, and you keep the copyright to your contribution.
+
+Why a CLA? The Elastic License 2.0 restricts offering the software as a hosted or managed service. Without a CLA, contributed code would carry that restriction for everyone — including the project itself. The CLA lets the project keep operating its hosted service while your contribution remains available to the whole community under ELv2.

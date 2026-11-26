@@ -1,0 +1,188 @@
+import { describe, expect, test } from "@odoo/hoot";
+import {
+    approvalNote,
+    canRevoke,
+    credentialDetail,
+    credentialText,
+    grantPayload,
+    grantReady,
+    noEndChosen,
+    ownRuleActive,
+    periodEnd,
+    periodPayload,
+    RULE_STATES,
+} from "@incubacloud_mcp/auto_approval/auto_approval_format";
+
+/**
+ * auto_approval_format — what the screens of auto-approval show.
+ *
+ * The grant dialog's button, the period it sends, the states of a rule
+ * and the marks the audit and the jobs show all come from these
+ * functions.
+ */
+
+/** A grant form with everything chosen and the box ticked. */
+function readyForm(overrides = {}) {
+    return {
+        userId: 7,
+        credential: "API key #12",
+        period: "30",
+        date: "",
+        acknowledged: true,
+        busy: false,
+        ...overrides,
+    };
+}
+
+describe("Auto-approval — the grant dialog", () => {
+    test("the button stays disabled until the box is ticked", () => {
+        expect(grantReady(readyForm({ acknowledged: false }))).toBe(false);
+        expect(grantReady(readyForm())).toBe(true);
+    });
+
+    test("nothing is chosen beforehand: an empty form cannot be confirmed", () => {
+        const empty = {
+            userId: null,
+            credential: "",
+            period: "",
+            date: "",
+            acknowledged: true,
+        };
+        expect(grantReady(empty)).toBe(false);
+        expect(grantReady(readyForm({ userId: null }))).toBe(false);
+        expect(grantReady(readyForm({ credential: "" }))).toBe(false);
+        expect(grantReady(readyForm({ period: "" }))).toBe(false);
+        expect(grantReady(readyForm({ period: "date", date: "" }))).toBe(false);
+    });
+
+    test("a box ticked by anything but true does not count", () => {
+        expect(grantReady(readyForm({ acknowledged: "yes" }))).toBe(false);
+    });
+
+    test("a grant on its way cannot be sent again", () => {
+        expect(grantReady(readyForm({ busy: true }))).toBe(false);
+    });
+
+    test("the period is sent as days or as the last day", () => {
+        expect(periodPayload(readyForm({ period: "7" }))).toEqual({ days: 7 });
+        expect(periodPayload(readyForm({ period: "date", date: "2026-12-01" }))).toEqual({
+            expires_on: "2026-12-01",
+        });
+        expect(periodPayload(readyForm({ period: "" }))).toBe(null);
+    });
+
+    test("no end date is sent as such, and the button takes it", () => {
+        const form = readyForm({ period: "never" });
+        expect(periodPayload(form)).toEqual({ no_expiry: true });
+        expect(noEndChosen(form)).toBe(true);
+        expect(noEndChosen(readyForm({ period: "90" }))).toBe(false);
+        expect(grantReady(form)).toBe(true);
+        expect(grantPayload(form, "v").no_expiry).toBe(true);
+        expect(grantPayload(form, "v").days).toBe(undefined);
+    });
+
+    test("the request carries the notice's version and the box", () => {
+        expect(grantPayload(readyForm({ period: "90" }), "2026-11-10")).toEqual({
+            user_id: 7,
+            credential: "API key #12",
+            days: 90,
+            acknowledged: true,
+            notice_version: "2026-11-10",
+            include_charges: false,
+        });
+    });
+
+    test("charges are included only when their box is ticked", () => {
+        expect(grantPayload(readyForm({ includeCharges: true }), "v").include_charges).toBe(
+            true
+        );
+        expect(grantPayload(readyForm({ includeCharges: "yes" }), "v").include_charges).toBe(
+            false
+        );
+    });
+
+    test("the notice says the day the rule ends", () => {
+        const now = new Date("2026-11-10T12:00:00Z");
+        expect(periodEnd(readyForm({ period: "7" }), now)).toBe("2026-11-17");
+        expect(periodEnd(readyForm({ period: "date", date: "2026-11-20" }), now)).toBe(
+            "2026-11-20"
+        );
+        expect(periodEnd(readyForm({ period: "" }), now)).toBe("");
+        expect(periodEnd(readyForm({ period: "never" }), now)).toBe("");
+    });
+});
+
+describe("Auto-approval — the rules", () => {
+    test("only a rule that has not ended can be revoked", () => {
+        expect(canRevoke({ state: "active" })).toBe(true);
+        expect(canRevoke({ state: "paused_role" })).toBe(true);
+        expect(canRevoke({ state: "paused_platform" })).toBe(true);
+        expect(canRevoke({ state: "expired" })).toBe(false);
+        expect(canRevoke({ state: "revoked" })).toBe(false);
+    });
+
+    test("the states the server names are the ones the screens know", () => {
+        expect(RULE_STATES).toEqual([
+            "active",
+            "paused_role",
+            "paused_platform",
+            "expired",
+            "revoked",
+        ]);
+    });
+
+    test("a credential reads with the name its client declares", () => {
+        expect(credentialText({ credential_label: "API key ci" })).toBe("API key ci");
+        expect(credentialText({ label: "client_id x", client_name: "Claude Code" })).toBe(
+            "client_id x (Claude Code)"
+        );
+    });
+
+    test("two keys with the same name are told apart by their id and last connection", () => {
+        const first = {
+            credential: "API key #12",
+            label: "API key ci",
+            last_seen: "2026-11-10 14:03:27",
+        };
+        const second = { ...first, credential: "API key #13", last_seen: "2026-11-09 08:15:00" };
+        expect(credentialText(first)).toBe(credentialText(second));
+        expect(credentialDetail(first)).toEqual({
+            key: "API key #12",
+            lastSeen: "2026-11-10 14:03",
+        });
+        expect(credentialDetail(second)).toEqual({
+            key: "API key #13",
+            lastSeen: "2026-11-09 08:15",
+        });
+    });
+
+    test("the panel's assistant, never connected, has no detail", () => {
+        expect(
+            credentialDetail({ credential: "assistant", label: "Panel assistant", last_seen: "" })
+        ).toBe(null);
+    });
+
+    test("Connect an agent says whether the rule acts now", () => {
+        expect(ownRuleActive({ state: "active" })).toBe(true);
+        expect(ownRuleActive({ state: "paused_role" })).toBe(false);
+        expect(ownRuleActive({ state: "paused_platform" })).toBe(false);
+    });
+});
+
+describe("Auto-approval — the audit's and the jobs' marks", () => {
+    test("auto-approved names the rule and who granted it", () => {
+        expect(
+            approvalNote({ approval: "auto", approval_rule_id: 4, approval_granted_by: "Ada" })
+        ).toEqual({ kind: "auto", rule: 4, by: "Ada" });
+    });
+
+    test("approved by the person, and nothing when no approval was needed", () => {
+        expect(approvalNote({ approval: "person" })).toEqual({
+            kind: "person",
+            rule: null,
+            by: "",
+        });
+        expect(approvalNote({ approval: "" })).toBe(null);
+        expect(approvalNote({})).toBe(null);
+    });
+});

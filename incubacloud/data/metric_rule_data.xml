@@ -1,0 +1,431 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!--
+        Seed rules for observability v1.
+
+        NOT ``noupdate``: these are tuning knobs, not user data. Shipping
+        them updatable means a better threshold reaches existing installs
+        on upgrade instead of only new ones — the trap that made a
+        sleep timeout stale in production.
+
+        Every expression carries ``host_id`` because that is how a sample
+        is mapped back to a cloud.host (see cloud_metric_rule.host_label).
+    -->
+
+    <record id="metric_rule_host_down" model="cloud.metric.rule">
+        <field name="name">Host stopped reporting</field>
+        <field name="sequence">1</field>
+        <field name="code">metrics_host_absent</field>
+        <!-- Measures over its own window: one sample is already a verdict. -->
+        <field name="confirm_cycles">1</field>
+        <!-- Age, per host, of the last sample that arrived.
+             Two earlier attempts were wrong, both verified against a
+             live VictoriaMetrics rather than by reading:
+
+             ``absent(up{job="node"})`` returns a series carrying only
+             the equality matchers of its selector, so it has no
+             ``host_id`` and the evaluator drops the sample — nothing
+             could ever be raised. It also only turns 1 when EVERY host
+             is silent, the opposite of a per-host watchdog.
+
+             ``timestamp(last_over_time(up[1h]))`` returns an EMPTY
+             result in VictoriaMetrics v1.102 even with a live host, so
+             it would never have fired either.
+
+             The subquery below is what actually works: it samples
+             ``timestamp(up)`` every minute for an hour and keeps the
+             last one that existed, which survives the series going
+             stale. Measured on a host silenced for six minutes: the
+             plain form returned nothing, this returned 341 s with
+             ``host_id`` and ``host`` intact. -->
+        <field name="expression">time() - max by (host_id, host) (last_over_time(timestamp(up{job="node"})[1h:1m]))</field>
+        <field name="comparator">gt</field>
+        <!-- ~10 missed pushes at the 30 s scrape interval. -->
+        <field name="threshold">300</field>
+        <field name="level">critical</field>
+        <field name="message">Host %(host)s has stopped reporting metrics.</field>
+    </record>
+
+    <record id="metric_rule_disk_critical" model="cloud.metric.rule">
+        <field name="name">Disk almost full</field>
+        <field name="sequence">10</field>
+        <field name="code">metrics_disk_critical</field>
+        <!-- An instant reading: a lone spike must not page anyone. -->
+        <field name="confirm_cycles">2</field>
+        <field name="expression">100 - (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} * 100)</field>
+        <field name="comparator">gt</field>
+        <field name="threshold">90</field>
+        <field name="level">critical</field>
+        <field name="message">Disk on %(host)s is %(value)s%% full.</field>
+    </record>
+
+    <record id="metric_rule_memory_high" model="cloud.metric.rule">
+        <field name="name">Memory nearly exhausted</field>
+        <field name="sequence">20</field>
+        <field name="code">metrics_memory_high</field>
+        <!-- An instant reading: a lone spike must not page anyone. -->
+        <field name="confirm_cycles">2</field>
+        <field name="expression">100 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100)</field>
+        <field name="comparator">gt</field>
+        <field name="threshold">92</field>
+        <field name="level">warning</field>
+        <field name="message">Memory on %(host)s is %(value)s%% used.</field>
+    </record>
+
+    <record id="metric_rule_load_high" model="cloud.metric.rule">
+        <field name="name">Sustained CPU saturation</field>
+        <field name="sequence">30</field>
+        <field name="code">metrics_cpu_saturated</field>
+        <!-- An instant reading: a lone spike must not page anyone. -->
+        <field name="confirm_cycles">2</field>
+        <!-- Load per core over 15 min: survives a burst, catches a stuck host. -->
+        <field name="expression">node_load15 / count without (cpu, mode) (node_cpu_seconds_total{mode="idle"})</field>
+        <field name="comparator">gt</field>
+        <field name="threshold">2</field>
+        <field name="level">warning</field>
+        <field name="message">CPU on %(host)s has been saturated (load/core %(value)s).</field>
+    </record>
+
+    <record id="metric_rule_proxy_down" model="cloud.metric.rule">
+        <field name="name">Host proxy not running</field>
+        <field name="sequence">35</field>
+        <field name="code">metrics_proxy_absent</field>
+        <!-- An instant reading: a proxy recreated by a deploy is gone for
+             seconds, and must not page anyone. -->
+        <field name="confirm_cycles">2</field>
+        <!-- A host that still reports, minus the hosts whose proxy
+             container does: what is left is a host with no proxy, and
+             with it no instance answering. The container's samples go
+             stale minutes after it stops or is removed, which is when
+             its host appears here. On 2 November 2026 a host ran nine
+             hours without its proxy and nothing said so: every check
+             reached the host over SSH, never through the proxy.
+             Verified on the live backend: with every proxy up this is
+             empty; asked for a container no host runs, it names every
+             host, with ``host_id`` and ``host``. -->
+        <field name="expression">(max by (host_id, host) (up{job="node"})) unless on (host_id) (max by (host_id) (container_last_seen{name="inverseproxy-proxy-1"}))</field>
+        <field name="comparator">gt</field>
+        <field name="threshold">0</field>
+        <field name="level">critical</field>
+        <field name="message">The proxy on %(host)s is not running: no instance on it answers.</field>
+    </record>
+
+    <!-- Waits measured by the kernel (PSI, node_exporter's pressure
+         collector): the share of the time tasks of the whole server
+         stalled for the disk or for memory. A load or a percentage
+         says how busy a server is; these say that it is too busy for
+         its instances, which is what makes them slow. Added
+         12-nov-2026 with the server's Metrics tab (plan of observability,
+         section 2.6), thresholds to tune in QA with real data. -->
+    <record id="metric_rule_host_io_pressure" model="cloud.metric.rule">
+        <field name="name">Disk saturated</field>
+        <field name="sequence">32</field>
+        <field name="code">metrics_host_io_pressure</field>
+        <!-- Three evaluations, fifteen minutes: a backup or a rebuild
+             saturates a disk for a few minutes and is not a fault. -->
+        <field name="confirm_cycles">3</field>
+        <!-- "some": at least one task waited for the disk. -->
+        <field name="expression">round(100 * max by (host_id, host) (rate(node_pressure_io_waiting_seconds_total[5m])))</field>
+        <field name="comparator">gt</field>
+        <!-- A fifth of the time: every instance of the server feels it
+             (the same threshold as the boards' diagnosis). -->
+        <field name="threshold">20</field>
+        <field name="level">warning</field>
+        <field name="message">The disk of %(host)s has been saturated for 15 minutes: tasks waited for it %(value)s%% of the time, so every instance on it is slow. If a backup or a migration is running, wait for it to end; otherwise the server needs a faster disk.</field>
+    </record>
+
+    <record id="metric_rule_host_memory_pressure" model="cloud.metric.rule">
+        <field name="name">Server out of memory</field>
+        <field name="sequence">33</field>
+        <field name="code">metrics_host_memory_pressure</field>
+        <!-- An instant reading over five minutes: a lone spike must not
+             page anyone. -->
+        <field name="confirm_cycles">2</field>
+        <!-- "full": every task that was not idle stalled for memory at
+             once, the kernel reclaiming pages instead of running them. -->
+        <field name="expression">round(100 * max by (host_id, host) (rate(node_pressure_memory_stalled_seconds_total[5m])))</field>
+        <field name="comparator">gt</field>
+        <!-- A tenth of the time with nothing running for lack of memory:
+             the server is evicting the pages of every instance. -->
+        <field name="threshold">10</field>
+        <field name="level">critical</field>
+        <field name="message">%(host)s has run out of memory: its tasks all stalled waiting for it %(value)s%% of the time, so every instance on it slows down. Move an instance to another server or give this one more memory.</field>
+    </record>
+
+    <!-- ── Instance-scoped rules ──────────────────────────────────────
+         These raise against the instance, so the alert lands on its own
+         page instead of being buried in its host's. All depend on the
+         agents' relabelling attaching ``instance_id``.
+
+         Note what is deliberately NOT here: a disk-usage rule per
+         instance. The textfile collector reports bytes used, not a
+         percentage, and a byte threshold means nothing across instances
+         of different sizes — it would either never fire or fire on the
+         big ones permanently. Disk stays a host-level rule until there
+         is a per-instance quota to compare against.
+    -->
+
+    <record id="metric_rule_instance_down" model="cloud.metric.rule">
+        <field name="name">Instance stopped reporting</field>
+        <field name="sequence">40</field>
+        <field name="code">metrics_instance_absent</field>
+        <!-- An instant reading: a lone spike must not page anyone. -->
+        <field name="confirm_cycles">2</field>
+        <field name="scope">instance</field>
+        <!-- Age of the newest container sample for this instance. Same
+             shape as the host watchdog, and for the same reason: a
+             plain absent() carries no instance label, so nothing could
+             be attributed and no alert could ever be raised. -->
+        <field name="expression">max by (instance_id, instance) (time() - container_last_seen{instance_id!=""})</field>
+        <field name="comparator">gt</field>
+        <!-- Generous on purpose. A rebuild stops containers for a while,
+             and a deploy that takes four minutes must not page anyone. -->
+        <field name="threshold">300</field>
+        <field name="level">critical</field>
+        <field name="message">Instance %(host)s has stopped reporting containers.</field>
+    </record>
+
+    <record id="metric_rule_instance_errors" model="cloud.metric.rule">
+        <field name="name">Instance returning server errors</field>
+        <field name="sequence">50</field>
+        <field name="code">metrics_instance_5xx</field>
+        <!-- Measures over its own window: one sample is already a verdict. -->
+        <field name="confirm_cycles">1</field>
+        <field name="scope">instance</field>
+        <!-- Server errors per second over five minutes, attributed by
+             the Traefik relabelling. This is the signal that says "the
+             instance is up and failing", which no container metric can
+             express — an Odoo throwing 500s looks perfectly healthy to
+             cAdvisor. -->
+        <field name="expression">sum by (instance_id, instance) (rate(traefik_service_requests_total{code=~"5..",instance_id!=""}[5m]))</field>
+        <field name="comparator">gt</field>
+        <!-- Roughly one server error every two seconds, sustained. Low
+             enough to catch a broken deploy, high enough that the odd
+             500 from a crawler hitting a bad URL does not page. -->
+        <field name="threshold">0.5</field>
+        <field name="level">warning</field>
+        <field name="message">Instance %(host)s is returning %(value)s server errors per second.</field>
+    </record>
+
+    <record id="metric_rule_instance_oom" model="cloud.metric.rule">
+        <field name="name">Instance container out of memory</field>
+        <field name="sequence">60</field>
+        <field name="code">metrics_instance_oom</field>
+        <!-- Measures over its own window: one sample is already a verdict. -->
+        <field name="confirm_cycles">1</field>
+        <field name="scope">instance</field>
+        <!-- Processes the kernel killed for lack of memory in the odoo,
+             db or smtp container, over fifteen minutes (three ticks of
+             the cron, so none falls between two evaluations). A kill is
+             the fact that matters, and nothing reported one: on
+             5-Nov-2026 a panel's smtp counted 36 in a month with no
+             alert. The memory percentage cannot stand in for it: a
+             database's usage is mostly cache and always reads 90-95 %.
+             See docs/architecture.md, "Memory an instance is deployed
+             with".
+
+             increase_prometheus, not increase (review of 5-Nov-2026):
+             VictoriaMetrics' increase takes a series that appears inside
+             the window as starting from 0, so a series that appears, or
+             comes back after a gap in its samples, with a counter that
+             already reads 1 to 5 counted that many kills just now;
+             checked against v1.102.0, the central's version, on
+             5-Nov-2026. increase_prometheus reads only the samples
+             inside the window: it still sees a kill after a counter
+             reset, and misses only one before a series' first two
+             samples. -->
+        <field name="expression">sum by (instance_id, instance) (increase_prometheus(container_oom_events_total{instance_id!="", container_label_com_docker_compose_service=~"odoo|db|smtp"}[15m]))</field>
+        <field name="comparator">gt</field>
+        <field name="threshold">0</field>
+        <field name="level">critical</field>
+        <field name="message">Instance %(host)s ran out of memory: the kernel killed %(value)s process(es) of its odoo, db or smtp container in the last 15 minutes.</field>
+    </record>
+
+    <record id="metric_rule_instance_cpu_throttled" model="cloud.metric.rule">
+        <field name="name">Instance held back by its CPU quota</field>
+        <field name="sequence">70</field>
+        <field name="code">metrics_instance_cpu_throttled</field>
+        <!-- Three evaluations, fifteen minutes: an import or a report
+             takes the quota for a while, and that is what it is for. -->
+        <field name="confirm_cycles">3</field>
+        <field name="scope">instance</field>
+        <!-- Share of the scheduler's periods in which the odoo container
+             wanted CPU and its quota (cpus) said no, its one-off runs
+             left out. Added 12-nov-2026 (plan of observability, section
+             2.6); the instance board's diagnosis reads the same share. -->
+        <field name="expression">round(100 * sum by (instance_id, instance) (rate(container_cpu_cfs_throttled_periods_total{instance_id!="", container_label_com_docker_compose_service="odoo", name!~".+-run-[0-9a-f]{12}|ic_boot_odoo_[0-9]+"}[5m])) / sum by (instance_id, instance) (rate(container_cpu_cfs_periods_total{instance_id!="", container_label_com_docker_compose_service="odoo", name!~".+-run-[0-9a-f]{12}|ic_boot_odoo_[0-9]+"}[5m])))</field>
+        <field name="comparator">gt</field>
+        <!-- A quarter of the time: requests queue behind the quota most
+             of the time (the instance board's threshold, 10-nov-2026). -->
+        <field name="threshold">25</field>
+        <field name="level">warning</field>
+        <field name="message">Instance %(host)s has been held back by its CPU quota for 15 minutes (%(value)s%% of the time): its requests wait. Raise the quota in Resources or spread the instances over more servers.</field>
+    </record>
+
+    <!-- The database collector's (collect_pg.sh, every minute). Both
+         read only a file the collector wrote in the last three minutes
+         (node_textfile_mtime_seconds): node_exporter keeps serving the
+         last file it found, so a collector that stopped would otherwise
+         repeat its last reading for ever. No fresh file, no sample: no
+         alert and no failure. Added 12-nov-2026 (plan of observability,
+         section 2.6, and its review of the same day), thresholds to tune
+         in QA with real data. -->
+    <record id="metric_rule_instance_db_lock_wait" model="cloud.metric.rule">
+        <field name="name">Instance's database waiting on locks</field>
+        <field name="sequence">80</field>
+        <field name="code">metrics_instance_db_lock_wait</field>
+        <!-- Measures over its own window: one sample is already a verdict. -->
+        <field name="confirm_cycles">1</field>
+        <field name="scope">instance</field>
+        <!-- The fewest sessions waiting for a lock in any minute of the
+             last ten: above 0 means somebody waited all ten minutes, not
+             that two readings five minutes apart each caught a wait. -->
+        <field name="expression">max by (instance_id, host_id) (min_over_time(ic_pg_waiting_lock{instance_id!=""}[10m])) and on (host_id) (time() - node_textfile_mtime_seconds{file=~".*ic_pg.prom"} &lt; 180)</field>
+        <field name="comparator">gt</field>
+        <field name="threshold">0</field>
+        <field name="level">warning</field>
+        <field name="message">In %(host)s, queries have been waiting for a lock for 10 minutes (%(value)s at least at every reading). See "Queries now" in its Metrics tab.</field>
+    </record>
+
+    <record id="metric_rule_instance_db_connections" model="cloud.metric.rule">
+        <field name="name">Instance's database near its connection ceiling</field>
+        <field name="sequence">90</field>
+        <field name="code">metrics_instance_db_connections</field>
+        <!-- An instant reading: a lone spike must not page anyone. -->
+        <field name="confirm_cycles">2</field>
+        <field name="scope">instance</field>
+        <field name="expression">round(100 * max by (instance_id, host_id) (ic_pg_connections{instance_id!=""} / ic_pg_max_connections{instance_id!=""})) and on (host_id) (time() - node_textfile_mtime_seconds{file=~".*ic_pg.prom"} &lt; 180)</field>
+        <field name="comparator">gt</field>
+        <!-- 85 % of max_connections: the next workers or a cron burst
+             start being refused a connection, and Odoo answers errors. -->
+        <field name="threshold">85</field>
+        <field name="level">warning</field>
+        <field name="message">The database of %(host)s uses %(value)s%% of its connections: new ones will soon be refused. Check its workers and crons, or raise max_connections.</field>
+    </record>
+
+    <!-- ── The servers' security (#84, F4) ─────────────────────────────
+         Read from the counters Fluent Bit keeps where a server sends its
+         security logs (security_logs_enabled): with the switch off the
+         series do not exist, so these rules say nothing about it.
+
+         The thresholds are provisional (14-nov-2026): the measurements
+         that fix them (plan #84, step M: the noise of normal use, the
+         fleet's already_banned and failed web logins) have not been
+         taken. Each one says what it is a guess from; the table in
+         docs/observability-operations.md, "Tuning alerts", too.
+
+         Every expression groups by host_id alone, not with the name: a
+         server renamed in the last window would give two samples for one
+         host, and the first would resolve what the second raises.
+
+         Every expression ends in "or (… * 0)": a 0 for each target seen
+         in the last hour (the last 15 minutes for the silence rule).
+         The evaluator only resolves a target the answer names, and a
+         counter of Fluent Bit vanishes when it restarts, until the next
+         line of its kind: without the 0, an alert raised before a
+         restart would stay open for ever. Checked against
+         VictoriaMetrics v1.102.0, the central's version, with synthetic
+         series (14-nov-2026). -->
+
+    <record id="metric_rule_security_ssh_bruteforce" model="cloud.metric.rule">
+        <field name="name">SSH brute force</field>
+        <field name="sequence">100</field>
+        <field name="code">security_ssh_bruteforce</field>
+        <!-- Two windows in a row: a burst is not an attack that lasts. -->
+        <field name="confirm_cycles">2</field>
+        <field name="expression">round(sum by (host_id) (increase(ic_ssh_auth_failed_total[10m]))) or (max by (host_id) (last_over_time(ic_ssh_auth_failed_total[1h])) * 0)</field>
+        <field name="comparator">gt</field>
+        <!-- Ten a minute. A person who mistypes makes a few; a scanner
+             of the internet makes hundreds (F0's burst: 600 a minute). -->
+        <field name="threshold">100</field>
+        <field name="level">warning</field>
+        <field name="message">%(host)s has received %(value)s failed SSH logins in 10 minutes. The detail is in Metrics → Security; to keep them from reaching the server, limit the addresses that may connect in Servers → Hardening.</field>
+    </record>
+
+    <record id="metric_rule_security_f2b_ineffective" model="cloud.metric.rule">
+        <field name="name">fail2ban bans not taking effect</field>
+        <field name="sequence">101</field>
+        <field name="code">security_f2b_ineffective</field>
+        <!-- Two windows in a row: a critical alert, on a threshold not
+             yet measured. -->
+        <field name="confirm_cycles">2</field>
+        <!-- fail2ban writes "already banned" when an address it banned
+             is found again: the ban did not stop it. -->
+        <field name="expression">round(sum by (host_id) (increase(ic_f2b_total{action="already_banned"}[30m]))) or (max by (host_id) (last_over_time(ic_f2b_total{action="already_banned"}[1h])) * 0)</field>
+        <field name="comparator">gt</field>
+        <!-- The plan's figure. Under a heavy attack a few repeats while
+             a ban is applied may be normal (review M7); step M-b
+             measures the fleet before it is fixed. -->
+        <field name="threshold">20</field>
+        <field name="level">critical</field>
+        <field name="message">fail2ban banned addresses on %(host)s but they keep arriving (%(value)s attempts from banned addresses in 30 minutes): the bans are not taking effect. Re-apply the hardening (Servers → Hardening) and, if it persists, check nftables.</field>
+    </record>
+
+    <record id="metric_rule_security_weblogin_bruteforce" model="cloud.metric.rule">
+        <field name="name">Web login brute force</field>
+        <field name="sequence">102</field>
+        <field name="code">security_weblogin_bruteforce</field>
+        <!-- As the SSH rule: a burst is not an attack that lasts. -->
+        <field name="confirm_cycles">2</field>
+        <!-- Per instance: the proxy's access log names the router, and
+             with it the instance (C1.9). instance_id="0" is an attempt
+             no instance was identified for (a proxy kept by hand, the
+             sleeping instances' router): it is seen in the viewer, not
+             alerted on. The alert's text adds the addresses with the
+             most attempts, read from the logs only when this fires
+             (cloud_metric_rule._weblogin_extra). -->
+        <field name="scope">instance</field>
+        <field name="expression">round(sum by (host_id, instance_id) (increase(ic_weblogin_failed_total{instance_id!="0"}[10m]))) or (max by (host_id, instance_id) (last_over_time(ic_weblogin_failed_total{instance_id!="0"}[1h])) * 0)</field>
+        <field name="comparator">gt</field>
+        <!-- Five a minute against one instance: more than a person who
+             forgot a password, well under what the jail bans an address
+             for. Step M-e measures the normal failed logins per instance
+             before it is fixed. -->
+        <field name="threshold">50</field>
+        <field name="level">warning</field>
+        <field name="message">%(host)s has received %(value)s failed web logins in 10 minutes.%(sources)s Check that its users have strong passwords or two-factor authentication; the detail is in Metrics → Security of its server.</field>
+    </record>
+
+    <record id="metric_rule_security_logs_silent" model="cloud.metric.rule">
+        <field name="name">Security logs not arriving</field>
+        <field name="sequence">103</field>
+        <field name="code">security_logs_silent</field>
+        <!-- Two readings, as the other silence rules that read an
+             instant: a line counted and not yet delivered when the
+             counters were scraped, or a Loki down for a minute while
+             VictoriaMetrics is up, must not tell every server to install
+             its agents again (Fable's final review of F4, B6). -->
+        <field name="confirm_cycles">2</field>
+        <!-- 1 for a server whose security logs are on, when any of three
+             holds (review M3):
+             1. Fluent Bit's exporter has not answered once in 15 minutes;
+             2. its Loki output dropped lines in the last 30 minutes;
+             3. it read lines in the last 30 minutes and its Loki output
+                delivered none. "up" says Fluent Bit lives, not that Loki
+                takes what it sends: with retry_limit no_limits a 401 (a
+                credential rotated) drops nothing for hours.
+             Each condition is kept only where it holds (> 0) before the
+             "or", which otherwise keeps the left side's 0 over the
+             right side's 1; the last term is the 0 of every server that
+             reports (job "node"), so one whose switch was turned off
+             resolves. The lines of 3 are those of sshd, sudo and
+             weblogin, which are always sent (weblogin, up to its cap a
+             minute): auditd's records off the watched files and the
+             lines of other jails are counted and dropped on purpose.
+             The outputs are named by plugin, loki.0. -->
+        <field name="expression">max by (host_id) ((max by (host_id) (max_over_time(up{job="security"}[15m])) &lt; bool 1) &gt; 0 or (max by (host_id) (increase(fluentbit_output_dropped_records_total{name=~"loki.*"}[30m])) &gt; bool 0) &gt; 0 or ((sum by (host_id) (increase(ic_security_lines_total{source=~"sshd|sudo|weblogin"}[30m])) &gt; bool 0) * on (host_id) (max by (host_id) (increase(fluentbit_output_proc_records_total{name=~"loki.*"}[30m])) == bool 0)) &gt; 0 or (max by (host_id) (max_over_time(up{job="node"}[15m])) * 0))</field>
+        <field name="comparator">gt</field>
+        <field name="threshold">0</field>
+        <field name="level">warning</field>
+        <field name="message">%(host)s sends its security logs, but they are not reaching the central: its collector stopped answering, dropped lines or cannot deliver the lines it reads. Without them no access or change on it is detected. Run Install Observability again from the server's page.</field>
+    </record>
+
+    <record id="cron_cloud_metric_rule_evaluate" model="ir.cron">
+        <field name="name">Evaluate metric rules</field>
+        <field name="model_id" ref="model_cloud_metric_rule"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_evaluate()</field>
+        <field name="interval_number">5</field>
+        <field name="interval_type">minutes</field>
+    </record>
+</odoo>

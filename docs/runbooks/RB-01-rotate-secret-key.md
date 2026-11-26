@@ -1,0 +1,279 @@
+# RB-01: Rotate `INCUBACLOUD_SECRET_KEY` (MultiFernet)
+
+**Severity:** planned
+**Typical trigger:** scheduled rotation (quarterly), or suspected key leak.
+**Who runs it:** ops + security.
+
+Encrypted secrets (`s3_secret_access_key`, `passphrase`, SSH
+credentials, SMTP passwords, …) are encrypted with Fernet. The
+panel's encryption key is a comma-separated list of Fernet keys; the
+first entry is the **primary** (used for encryption), the rest are
+legacy keys still accepted for decryption. Rotation moves every
+ciphertext from the old primary to a new primary and then drops the
+old key from the list.
+
+The list is read from the first of four places that is set: the
+`INCUBACLOUD_SECRET_KEY` environment variable; the file
+`INCUBACLOUD_SECRET_KEY_FILE` names; the file `secret_key_file` names,
+or else `secret_key`, in the `[incubacloud]` section of `odoo.conf`
+([INSTALL](../../INSTALL.md#the-encryption-key)). The steps below say
+what to change in each.
+
+## Symptoms / triggers
+
+- Scheduled 90-day rotation calendar event.
+- Incident response after a leak: the old key may have been read.
+- Before re-homing a deployment to a new secret store.
+
+## Diagnosis
+
+Check which keys are active and how many rows are still encrypted
+with a legacy key:
+
+```sql
+db$ SELECT
+       CASE WHEN s3_secret_access_key LIKE 'enc:%' THEN 'encrypted'
+            ELSE 'other' END AS state,
+       COUNT(*)
+    FROM cloud_backup_backend
+    GROUP BY 1;
+```
+
+`odoo log` will show `Encryption key read from <source>: N keys (rotation
+in progress); new values will be encrypted with the first key.` at boot
+when more than one key is configured, where `<source>` names the place
+the list was read from.
+
+## Pre-flight — do this before anything else
+
+**Measure the pending count while the chain still holds one key.**
+
+```python
+env['cloud.settings']._get_system().rotation_pending_count()
+# {'total': 0, 'by_column': {}}   ← clear to start
+```
+
+With a single key configured this MUST be zero. Anything else is a
+value the *current* key cannot open, and it will still be there at
+step 6 — whose gate is this number reaching zero. Start a rotation
+with one of those inside and the gate never opens: you either wait
+forever, or you get tired and retire the old key while something
+legitimately still needs it.
+
+The 2026-09-10 rotation found exactly one:
+`cloud_instance(118).odoo_admin_user_password`, unreadable since April.
+It was dead data — that instance is the panel itself, it has no customer
+attached, and the panel has no `admin` user at all — so regenerating it
+cost nothing. But had it been missed, step 6 would have been
+unreachable.
+
+Fix every row this reports before continuing; see *When a secret will
+not decrypt* below for how.
+
+## Resolution
+
+1. **Generate the new primary key** (on your workstation, not on
+   production):
+
+   ```bash
+   $ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+   ```
+
+2. **Prepend the new key** to the list, in the place the panel reads
+   it from. Keep the current primary as the second entry so existing
+   ciphertext keeps decrypting:
+
+   - **The environment variable**, in the production env file:
+
+     ```bash
+     # BEFORE:  INCUBACLOUD_SECRET_KEY=OLD
+     # AFTER:   INCUBACLOUD_SECRET_KEY=NEW,OLD
+     ```
+
+   - **A key file** (`INCUBACLOUD_SECRET_KEY_FILE`, or `secret_key_file`
+     in `odoo.conf`): edit the file the setting names, so that it holds
+     `NEW,OLD` on one line. Keep it readable by Odoo's user only.
+   - **`secret_key` in `odoo.conf`**: edit that line, on one line:
+
+     ```ini
+     # BEFORE:  secret_key = OLD
+     # AFTER:   secret_key = NEW,OLD
+     ```
+
+3. **Restart every Odoo process that loads the panel**, so the new list
+   is read: the web server, the gevent (long-polling) one and the one
+   that runs the jobs. All of them, before the next step:
+
+   ```bash
+   $ invoke restart
+   ```
+
+   (On a setup with the processes apart, restart each one.) A process
+   reads the list once and keeps it until it restarts, whichever place
+   it came from. One left running holds only `OLD`: once the cron has
+   re-encrypted values with `NEW`, that process cannot read them (its
+   reads fail and open `encrypted_value_unreadable` alerts), and what it
+   writes is encrypted with `OLD` and is pending again. Do not enable
+   the cron until every process has restarted.
+
+4. **Enable the rotation cron** (disabled by default). In Odoo UI:
+   Settings → Technical → Scheduled Actions → "Rotate Encrypted
+   Secrets (MultiFernet)" → set Active = True. It runs hourly and
+   re-encrypts one batch per tick so nothing moves all at once.
+
+5. **Monitor progress** with the pending count, and only with it:
+
+   ```python
+   env['cloud.settings']._get_system().rotation_pending_count()
+   # {'total': 0, 'by_column': {}}   ← done, safe to retire the old key
+   # {'total': 7, 'by_column': {'cloud_host.password': 7}}  ← not yet
+   ```
+
+   Every rotation pass also writes this line to the log:
+
+   ```
+   Rotation status: N value(s) still not on the primary key.
+   ```
+
+   > **Do not wait for the "rotated" tally to reach zero — it never
+   > will.** A Fernet token carries a timestamp and a random IV, so
+   > re-encrypting the same secret with the same key produces a
+   > different string every time. The sweep compares the new string
+   > with the old one, they never match, and it therefore rewrites
+   > every row on every pass for as long as the cron runs. Measured on
+   > 2026-09-09: two consecutive passes over the same six seeded
+   > secrets each reported 12 rotated values. That tally answers "how
+   > much did I rewrite", not "how much is left".
+   > `rotation_pending_count` asks which key opens each ciphertext,
+   > which is a property of the data, so it converges.
+   >
+   > A value nothing can decrypt counts as **pending**. That is
+   > deliberate: it keeps the old key in the chain instead of
+   > stranding the row. Investigate those before continuing — see
+   > *When a secret will not decrypt* below.
+
+   > **The token's timestamp is not evidence of anything.** Fernet
+   > stamps each token, but `MultiFernet.rotate` deliberately
+   > *preserves* the original stamp when it re-encrypts. After a
+   > successful rotation the tokens still read April, May, whenever
+   > they were first written. Reading those stamps and concluding the
+   > rotation never ran is a trap that cost real time on 10-sep. The
+   > only valid checks are `rotation_pending_count` and trying to
+   > decrypt with each key in the chain.
+
+
+6. **Disable the rotation cron** once `rotation_pending_count()` returns
+   `{'total': 0, ...}`. Anything else means at least one secret still
+   needs the old key, and step 7 would make it unreadable forever.
+   If it will not reach zero, you skipped the pre-flight: something was
+   already stranded before you started.
+
+7. **Remove the old key** from the list, in the same place as in step 2:
+
+   ```bash
+   # INCUBACLOUD_SECRET_KEY=NEW
+   ```
+
+   (or the key file's content, or `secret_key = NEW` in `odoo.conf`).
+   Restart every Odoo process once more, as in step 3. From this moment the old key cannot decrypt
+   anything anymore — the window is closed.
+
+## Rollback
+
+If step 3 fails (service won't start), restore the previous list
+(in the place you changed in step 2) and restart. No ciphertext has been
+touched yet.
+
+If step 5 is in-flight and a row fails to re-encrypt, keep both
+keys in the list. The row stays decryptable under OLD and will
+be retried next tick. Do **not** remove OLD until the rotation cron
+has completed a full pass with zero errors.
+
+## Key custody
+
+The key is not recoverable. Lose it and every stored secret — host
+passwords, backup passphrases, GitHub credentials — is permanently
+unreadable, and a restore of the database alone will not bring the
+panel back. Treat it as a separate artifact from the backups.
+
+Rules:
+
+- **At least two copies, in different places.** A password manager
+  entry plus an offline copy kept somewhere physically different is
+  enough. One copy is not a copy.
+- **Never store the key alongside the database backup.** Whoever
+  obtains that bucket must not obtain the key with it — that is the
+  whole point of encrypting the columns.
+- **Write down *where* the copies are, never the value itself.** The
+  restore procedure needs to tell an operator where to look; it must
+  never be the thing that leaks the key.
+- **Verify the copies work.** A key you have never restored from is a
+  key you are assuming works. The panel restore drill exercises this
+  end to end.
+- **A retired key is kept, not destroyed.** Every backup taken before
+  the rotation holds ciphertext only the old key opens. Restore one
+  without it and all stored secrets are unreadable — including the
+  `cloud_host.key_file` rows, which are the only copy of those VPSs'
+  SSH key, so those machines become unreachable for good. Keep it in
+  custody labelled with the date it stopped being primary.
+- **Take a backup right after step 7.** Until one runs, no backup in
+  existence can be restored with the key the panel is now using. The
+  daily job closes this on its own within a day; triggering it closes
+  it in a minute.
+
+## When a secret will not decrypt
+
+If a value was written with a key that is no longer in the chain (or
+its ciphertext is corrupted), any read of it raises **and** opens a
+critical `cloud.alert` with code
+`encrypted_value_unreadable:<model>.<field>`, pointing at the record.
+
+The value cannot be recovered without the original key. Resolution:
+put the old key back in the encryption key's list (as a trailing entry)
+if you still have it, or set the secret again from source — regenerate
+the host password, re-enter the backup passphrase, re-issue the token.
+The alert closes by itself once the value reads again: an hourly pass,
+and one at every start (`_cron_resolve_readable_secrets`), decrypts it
+again and dismisses the alert. There is nothing to dismiss by hand.
+
+## The instances' own keys
+
+An instance that runs this module (a panel this panel deploys) encrypts
+its own secrets with the `INCUBACLOUD_SECRET_KEY` in its
+`.docker/incubacloud.env`. Since 1.0.189 this panel keeps a copy of each
+(`cloud.instance.secret_key`, encrypted with **this** panel's key) and
+writes it to the host on every deploy and rebuild, merged with what the
+host holds — see `docs/architecture.md`, "Each instance's own key".
+
+- **This panel's key is now the root of trust of every instance's.**
+  Lose it and the copies are lost with it: keep a copy of this panel's
+  `INCUBACLOUD_SECRET_KEY` **off its host**, with the date it became
+  primary, as you keep a retired key.
+- **Rotating an instance's key** — the merge puts the host's keys first,
+  so the order on the host decides which key is primary:
+  1. On the instance's host, prepend the new key in
+     `.docker/incubacloud.env` (`INCUBACLOUD_SECRET_KEY=NEW,OLD`).
+  2. Rebuild the instance from the panel. The rebuild reads that file,
+     keeps `NEW,OLD` as the panel's copy and restarts the instance with
+     it.
+  3. Run this runbook's rotation on that instance, up to its step 6.
+
+  Setting the panel's `secret_key` to `"NEW,OLD"` instead does **not**
+  rotate anything: the host's `OLD` comes first in the merge and stays
+  primary.
+- **Retiring an instance's old key** (its step 7): nothing drops a key
+  on its own, so remove it in both places before the rebuild — set the
+  panel's `secret_key` to `"NEW"` (developer, in a shell) and the host's
+  file to `INCUBACLOUD_SECRET_KEY=NEW` — then rebuild. Removing it from
+  one place only brings it back from the other.
+- An instance deployed before 1.0.189 has its key read once by the
+  daily capture (`cron_capture_secret_keys`). `secret_key_not_escrowed`
+  on an instance means its host could not be read two days running:
+  its key still exists there only.
+
+## References
+
+- [`models/password_utils.py`](../../incubacloud/models/password_utils.py) — MultiFernet loader & `rotate_value()`.
+- [`models/encrypted_char.py`](../../incubacloud/models/encrypted_char.py) — read path and the unreadable-secret alert.
+- [`data/rotate_secrets_cron.xml`](../../incubacloud/data/rotate_secrets_cron.xml) — the rotation cron definition.
+- `tests/test_password_utils.py::TestMultiFernetRotation` — integration tests of the mechanism.

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- noupdate: an update would write nextcall again, a date in the
+         past, and the prune would run at once on every server. A change
+         to this record reaches existing databases by a migration. -->
+    <data noupdate="1">
+
+        <record id="cron_docker_prune" model="ir.cron">
+            <field name="name">Docker Prune — All Hosts</field>
+            <field name="model_id" ref="model_cloud_host"/>
+            <field name="state">code</field>
+            <field name="code">model.cron_docker_prune()</field>
+            <field name="interval_number">1</field>
+            <field name="interval_type">days</field>
+            <field name="nextcall">2025-01-01 03:00:00</field>
+        </record>
+
+    </data>
+</odoo>

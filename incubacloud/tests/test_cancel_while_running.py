@@ -1,0 +1,379 @@
+"""A job a person cancels while it runs ends cancelled, not failed.
+
+queue_job cannot stop a started job, so ``cancel_job`` sets a flag the
+executor polls and the executor stops by raising — which queue_job
+stores as a failure. A customer who cancelled a rebuild to try the
+button got a failure alert and a "failed" mail, then a "Resolved" one
+when his next rebuild finished (12-oct-2026). Stored as a cancellation
+from then on, the stop still reached queue_job as an exception, which
+queue_job logs with its traceback: the log scraper raised an
+``instance_error_logs`` alert on the customer's panel for it. ``execute``
+now returns the stop instead.
+"""
+from unittest.mock import patch
+
+from psycopg2 import OperationalError
+
+from odoo.tests.common import TransactionCase
+from odoo.tools import mute_logger
+
+from odoo.addons.queue_job.job import Job
+
+from odoo.addons.incubacloud.models.abstract_executor import (
+    CANCELLED_WHILE_RUNNING,
+    JobCancelled,
+)
+from odoo.addons.incubacloud.models.host_probe_executor import HostProbeExecutor
+
+
+class _Conflict(OperationalError):
+    """A serialization failure, as PostgreSQL reports one."""
+
+    pgcode = "40001"
+
+
+class TestCancelWhileRunning(TransactionCase):
+
+    def setUp(self):
+        super().setUp()
+        self.registry_enter_test_mode()
+        self.host = self.env['cloud.host'].create({
+            'name': 'cancel-host',
+            'ip_address': '10.0.0.61',
+            'user': 'ubuntu',
+            'wildcard_domain': 'cancel.example.com',
+        })
+        self.cjob, self.qjob = self._started('uuid-cancel-running')
+
+    def _started(self, uuid, graph_uuid=False, state='started'):
+        """A cloud job and its queue job, in *state*.
+
+        :return: ``(cloud.job, queue.job)``.
+        """
+        job_type = self.env['cloud.job.type'].search(
+            [('code', '=', 'host_probe')], limit=1,
+        ) or self.env['cloud.job.type'].create({
+            'name': 'host_probe', 'code': 'host_probe', 'apply_to': 'host',
+        })
+        qjob = self.env['queue.job'].sudo().create({
+            'uuid': uuid,
+            'name': f'qj-{uuid}',
+            'state': state,
+            'graph_uuid': graph_uuid,
+            'method_name': 'noop',
+            'model_name': 'cloud.job',
+            'func_string': 'noop()',
+        })
+        cjob = self.env['cloud.job'].sudo().create({
+            'host_id': self.host.id,
+            'job_type_id': job_type.id,
+            'name': f'Job {uuid}',
+            'queue_job_uuid': uuid,
+            'queue_job_id': qjob.id,
+        })
+        return cjob, qjob
+
+    def _queue_job_stores_the_stop(self, qjob):
+        """What queue_job writes when the executor raised on the flag."""
+        qjob.write({
+            'state': 'failed',
+            'exc_name': 'odoo.addons.queue_job.exception.JobError',
+            'exc_message': 'Job cancelled',
+            'exc_info': 'Traceback (most recent call last): ... Job cancelled',
+        })
+        self.env['cloud.job'].invalidate_model(['state'])
+
+    def _failure_alerts(self, cjob):
+        return self.env['cloud.alert'].search([
+            ('job_id', '=', cjob.id), ('code', '=', 'job_failed'),
+        ])
+
+    def test_the_executor_stops_with_its_own_exception(self):
+        self.cjob.cancel_job()
+        self.env.flush_all()
+        executor = HostProbeExecutor(self.cjob, self.host)
+        with self.assertRaises(JobCancelled):
+            executor._check_cancel()
+
+    def test_a_job_cancelled_while_it_ran_ends_cancelled(self):
+        self.assertEqual(self.cjob.state, 'started')
+        self.cjob.cancel_job()
+        self.env.flush_all()
+        self._queue_job_stores_the_stop(self.qjob)
+        self.assertEqual(self.qjob.state, 'cancelled')
+        self.assertTrue(self.qjob.date_cancelled)
+        self.assertFalse(self.qjob.exc_info)
+        self.assertEqual(self.cjob.state, 'cancelled')
+        self.assertFalse(
+            self._failure_alerts(self.cjob),
+            "a job the customer stopped must not raise a failure alert",
+        )
+
+    def test_a_failure_nobody_asked_for_is_still_a_failure(self):
+        self._queue_job_stores_the_stop(self.qjob)
+        self.assertEqual(self.qjob.state, 'failed')
+        self.assertEqual(self.cjob.state, 'failed')
+        self.assertTrue(self._failure_alerts(self.cjob))
+
+    def test_what_waits_on_it_is_cancelled_too(self):
+        cjob, qjob = self._started('uuid-head', graph_uuid='graph-cancel')
+        waiting, waiting_q = self._started(
+            'uuid-tail', graph_uuid='graph-cancel', state='wait_dependencies',
+        )
+        cjob.cancel_job()
+        self.env.flush_all()
+        self._queue_job_stores_the_stop(qjob)
+        waiting_q.invalidate_recordset(['state'])
+        self.assertEqual(waiting.state, 'cancelled')
+        self.assertEqual(waiting_q.state, 'cancelled')
+        self.assertFalse(self._failure_alerts(waiting))
+
+    def test_execute_returns_the_stop_without_a_traceback(self):
+        with patch.object(
+            HostProbeExecutor, 'pre_run_checks', autospec=True,
+        ), patch.object(
+            HostProbeExecutor, '_publish_bus', autospec=True,
+        ), patch.object(
+            HostProbeExecutor, 'run', autospec=True,
+            side_effect=JobCancelled('Job cancelled'),
+        ), self.assertNoLogs('odoo.addons.incubacloud', level='ERROR'):
+            result = self.cjob.execute()
+        self.assertEqual(result, CANCELLED_WHILE_RUNNING)
+
+    def test_a_stop_stored_as_done_ends_cancelled(self):
+        self.cjob.cancel_job()
+        self.env.flush_all()
+        # What queue_job writes once ``execute`` returned the stop.
+        self.qjob.write({
+            'state': 'done',
+            'result': CANCELLED_WHILE_RUNNING,
+            'date_done': '2026-10-13 00:00:00',
+        })
+        self.env['cloud.job'].invalidate_model(['state'])
+        self.assertEqual(self.qjob.state, 'cancelled')
+        self.assertTrue(self.qjob.date_cancelled)
+        self.assertFalse(self.qjob.date_done)
+        self.assertEqual(self.cjob.state, 'cancelled')
+        self.assertFalse(self._failure_alerts(self.cjob))
+
+    def test_a_stop_queue_job_puts_back_in_the_queue_ends_cancelled(self):
+        """Storing the stop collides with the flag's own write; queue_job
+        postponed the job and ran it again from the start (16-oct-2026)."""
+        self.cjob.cancel_job()
+        self.env.flush_all()
+        # What queue_job's ``retry_postpone`` writes after PostgreSQL
+        # refused to store the end.
+        self.qjob.write({
+            'state': 'pending',
+            'eta': '2026-10-16 08:12:30',
+            'date_started': False,
+            'result': 'could not serialize access due to concurrent update',
+        })
+        self.env['cloud.job'].invalidate_model(['state'])
+        self.assertEqual(self.qjob.state, 'cancelled')
+        self.assertEqual(self.qjob.result, CANCELLED_WHILE_RUNNING)
+        self.assertTrue(self.qjob.date_cancelled)
+        self.assertEqual(self.cjob.state, 'cancelled')
+        self.assertFalse(self._failure_alerts(self.cjob))
+
+    def test_a_retry_nobody_cancelled_goes_back_to_the_queue(self):
+        self.qjob.write({'state': 'pending', 'eta': '2026-10-16 08:12:30'})
+        self.env['cloud.job'].invalidate_model(['state'])
+        self.assertEqual(self.qjob.state, 'pending')
+        self.assertEqual(self.cjob.state, 'pending')
+
+    def test_a_cancelled_job_requeued_by_hand_goes_back_to_the_queue(self):
+        cjob, qjob = self._started('uuid-requeued', state='cancelled')
+        self.assertEqual(cjob.state, 'cancelled')
+        # What queue_job's ``requeue`` stores.
+        qjob.write({'state': 'pending', 'date_cancelled': False, 'retry': 0})
+        self.env['cloud.job'].invalidate_model(['state'])
+        self.assertEqual(qjob.state, 'pending')
+        self.assertEqual(cjob.state, 'pending')
+
+    def test_a_job_that_finished_as_cancel_was_pressed_stays_done(self):
+        self.cjob.cancel_job()
+        self.env.flush_all()
+        # The executor ended before it saw the flag: no marker.
+        self.qjob.write({'state': 'done', 'result': False})
+        self.env['cloud.job'].invalidate_model(['state'])
+        self.assertEqual(self.qjob.state, 'done')
+        self.assertEqual(self.cjob.state, 'done')
+
+    def _succeeded_then_cancelled(self):
+        """``on_success`` returned, and the cancel had reached the job."""
+        self.cjob.cancel_job()
+        self.env.flush_all()
+        HostProbeExecutor(self.cjob, self.host)._mark_success_before_cancel()
+        self.cjob.invalidate_recordset(['succeeded_before_cancel'])
+        self.assertTrue(self.cjob.succeeded_before_cancel)
+
+    def test_a_success_put_back_in_the_queue_ends_done(self):
+        """The store of ``done`` collided with the flag's write: queue_job
+        postponed it, and the stop stored over it ended its chain."""
+        self._succeeded_then_cancelled()
+        self.qjob.write({
+            'state': 'pending',
+            'eta': '2026-11-06 08:12:30',
+            'date_started': False,
+            'result': 'could not serialize access due to concurrent update',
+        })
+        self.env['cloud.job'].invalidate_model(['state'])
+        self.assertEqual(self.qjob.state, 'done')
+        self.assertTrue(self.qjob.date_done)
+        self.assertFalse(self.qjob.eta)
+        self.assertFalse(self.qjob.date_cancelled)
+        self.assertFalse(self.qjob.result)
+        self.assertEqual(self.cjob.state, 'done')
+
+    def test_a_failure_stored_after_a_success_ends_done(self):
+        """Something raised once ``on_success`` had returned: done, with no
+        failure alert."""
+        self._succeeded_then_cancelled()
+        self._queue_job_stores_the_stop(self.qjob)
+        self.assertEqual(self.qjob.state, 'done')
+        self.assertFalse(self.qjob.exc_info)
+        self.assertEqual(self.cjob.state, 'done')
+        self.assertFalse(self._failure_alerts(self.cjob))
+
+    def test_what_waits_on_a_success_is_not_cancelled(self):
+        cjob, qjob = self._started('uuid-head-ok', graph_uuid='graph-ok')
+        waiting, _waiting_q = self._started(
+            'uuid-tail-ok', graph_uuid='graph-ok', state='wait_dependencies',
+        )
+        self.cjob, self.qjob = cjob, qjob
+        self._succeeded_then_cancelled()
+        qjob.write({'state': 'pending', 'eta': '2026-11-06 08:12:30'})
+        self.env['cloud.job'].invalidate_model(['state'])
+        self.assertEqual(qjob.state, 'done')
+        self.assertEqual(waiting.state, 'wait_dependencies')
+
+    def test_a_success_nobody_cancelled_is_not_marked(self):
+        """The mark is written on a cancelled job alone: on another, the
+        write of its row aside would make the store of ``done`` fail."""
+        HostProbeExecutor(self.cjob, self.host)._mark_success_before_cancel()
+        self.cjob.invalidate_recordset(['succeeded_before_cancel'])
+        self.assertFalse(self.cjob.succeeded_before_cancel)
+
+    def test_a_new_attempt_is_done_without_running_again(self):
+        """Its worker died after the success and queue_job put it back in
+        the queue: it starts still cancelled and marked, does not run
+        again, and is stored done (6-nov-2026). It ran again from the
+        start before, its mark cleared."""
+        self._succeeded_then_cancelled()
+        self.qjob.write({'state': 'started'})
+        self.cjob.invalidate_recordset()
+        self.assertEqual(self.cjob.state, 'cancelled')
+        self.assertTrue(self.cjob.succeeded_before_cancel)
+        with patch.object(
+            HostProbeExecutor, 'run', autospec=True,
+        ) as run, patch.object(
+            HostProbeExecutor, '_publish_bus', autospec=True,
+        ):
+            result = self.cjob.execute()
+        run.assert_not_called()
+        self.assertEqual(result, CANCELLED_WHILE_RUNNING)
+        self.qjob.write({'state': 'done', 'result': result})
+        self.env['cloud.job'].invalidate_model(['state'])
+        self.assertEqual(self.qjob.state, 'done')
+        self.assertEqual(self.cjob.state, 'done')
+
+    def _run_with_entry(self, entry):
+        """Run a probe's ``run`` with *entry* in place of its workflow.
+
+        :param entry: coroutine function of the executor, run as
+            ``_async_entry``
+        :return: the executor
+        """
+        executor = HostProbeExecutor(self.cjob, self.host)
+        executor.sleep_interval = 0.01
+        with patch.object(
+            HostProbeExecutor, "_flush_logs", autospec=True, return_value=False,
+        ), patch.object(HostProbeExecutor, "_publish_bus", autospec=True):
+            executor._async_entry = entry.__get__(executor)
+            executor.run()
+        return executor
+
+    def test_a_stop_after_the_success_mark_is_marked_at_the_run_s_end(self):
+        """``on_success`` returned and found nothing to mark; the stop came
+        while the staging was discarded. The end of ``run`` marks it."""
+        cjob = self.cjob
+
+        async def entry(executor):
+            executor._outcome_started = executor._outcome_dispatched = True
+            cjob.cancel_job()
+            cjob.env.flush_all()
+
+        self._run_with_entry(entry)
+        self.cjob.invalidate_recordset(['succeeded_before_cancel'])
+        self.assertTrue(self.cjob.succeeded_before_cancel)
+
+    def test_a_run_whose_outcome_was_not_dealt_with_is_not_marked(self):
+        """Stopped before its outcome hook returned: no success to keep."""
+        cjob = self.cjob
+
+        async def entry(executor):
+            cjob.cancel_job()
+            cjob.env.flush_all()
+
+        self._run_with_entry(entry)
+        self.cjob.invalidate_recordset(['succeeded_before_cancel'])
+        self.assertFalse(self.cjob.succeeded_before_cancel)
+
+    def _chained_head_and_tail(self):
+        """A started head and a step waiting on it, in one graph.
+
+        :return: ``(head queue.job, tail queue.job)``
+        """
+        cjob, qjob = self._started('uuid-head-deps', graph_uuid='graph-deps')
+        _tail, tail_q = self._started(
+            'uuid-tail-deps', graph_uuid='graph-deps', state='wait_dependencies',
+        )
+        # A job queue_job can load: what it runs is the cloud job's own.
+        qjob.with_context(_job_edit_sentinel=qjob.EDIT_SENTINEL).write({
+            'method_name': 'execute', 'records': cjob,
+            'dependencies': {
+                'depends_on': [], 'reverse_depends_on': [tail_q.uuid],
+            },
+        })
+        tail_q.dependencies = {
+            'depends_on': [qjob.uuid], 'reverse_depends_on': [],
+        }
+        self.cjob, self.qjob = cjob, qjob
+        self._succeeded_then_cancelled()
+        return qjob, tail_q
+
+    def test_the_steps_after_a_success_are_set_going_after_a_conflict(self):
+        """Setting them going meets a serialization failure once: it is
+        tried again, as queue_job tries it after any done."""
+        qjob, tail_q = self._chained_head_and_tail()
+        real = Job.enqueue_waiting
+        calls = []
+
+        def enqueue_waiting(job):
+            calls.append(job.uuid)
+            if len(calls) == 1:
+                raise _Conflict()
+            return real(job)
+
+        with patch.object(
+            Job, 'enqueue_waiting', autospec=True, side_effect=enqueue_waiting,
+        ), patch('odoo.addons.queue_job.controllers.main.time.sleep'):
+            qjob.write({'state': 'pending', 'eta': '2026-11-06 08:12:30'})
+        self.assertEqual(calls, [qjob.uuid, qjob.uuid])
+        self.assertEqual(qjob.state, 'done')
+        self.assertEqual(tail_q.state, 'pending')
+
+    def test_steps_that_cannot_be_set_going_leave_the_success_done(self):
+        """The tries run out: logged, and the job is still stored done."""
+        qjob, tail_q = self._chained_head_and_tail()
+        with patch.object(
+            Job, 'enqueue_waiting', autospec=True, side_effect=_Conflict(),
+        ), patch(
+            'odoo.addons.queue_job.controllers.main.time.sleep',
+        ), mute_logger('odoo.addons.queue_job.controllers.main'), self.assertLogs(
+            'odoo.addons.incubacloud.models.queue_job_ext', level='ERROR',
+        ):
+            qjob.write({'state': 'pending', 'eta': '2026-11-06 08:12:30'})
+        self.assertEqual(qjob.state, 'done')
+        self.assertEqual(tail_q.state, 'wait_dependencies')

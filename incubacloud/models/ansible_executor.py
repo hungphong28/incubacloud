@@ -1,0 +1,409 @@
+"""Base executor for host-state operations driven by Ansible.
+
+Phase 3 draws a single line through remote execution:
+
+    machine state = Ansible;  application operation = versioned script.
+
+``AbstractExecutor.run_script()`` covers the second half. This module
+covers the first: an executor that hands a playbook to ``ansible-runner``
+instead of streaming shell commands over the job's SSH transport.
+
+Ansible opens its own SSH connections, so ``AnsibleExecutor`` overrides
+``_async_entry()`` and never calls ``cloud.host.get_transport()``. It
+still reports through the same plumbing as every other executor — log
+chunks, bus updates, ``parse_results`` / ``on_success`` / ``on_failure``
+— so a playbook-backed job is indistinguishable in the panel.
+
+The playbook run is blocking, so it goes to a worker thread. That thread
+only appends to the log buffer; the ORM is touched exclusively from the
+main thread, in the terminal hooks, exactly as in the base class.
+"""
+import asyncio
+import logging
+import os
+import shutil
+import tempfile
+import time
+from pathlib import Path
+
+import yaml
+
+from odoo.tools import config
+
+from .. import ansible_noshm
+from ..local_path import expanded_path
+from .abstract_executor import AbstractExecutor, _looks_like_error
+
+_logger = logging.getLogger(__name__)
+
+try:
+    import ansible_runner
+except ImportError:
+    # Kept importable without the dependency so the addon still loads on
+    # an image that has not been rebuilt yet; jobs fail loudly instead.
+    ansible_runner = None
+    _logger.debug(
+        "ansible-runner is not installed — Ansible-backed jobs are unavailable.",
+    )
+
+#: What a playbook leaves of the request's ``limit_time_real`` for the
+#: job's closing hooks and the removal of its private directory, in
+#: seconds (18-nov-2026). ansible-runner checks its time limit every 5 s
+#: and gives the process 5 s more to end; the hooks write to the database
+#: and send the panel's notices. Past the limit Odoo kills the request
+#: (with ``workers = 0``, the whole server), which leaves the job to be
+#: retried from the start and the run's key and variables on the disk.
+#: A quarter of the limit at most (18-nov-2026): a fixed minute would take
+#: half of Odoo's default ``limit_time_real`` of 120 s, and the closing
+#: needs seconds, not a minute, so a short limit gives up less of its time.
+PLAYBOOK_LIMIT_MARGIN_S = 60
+PLAYBOOK_LIMIT_MARGIN_FRACTION = 4
+
+
+def playbook_limit_margin(limit):
+    """Return the seconds a playbook leaves of a *limit* for closing the job.
+
+    ``PLAYBOOK_LIMIT_MARGIN_S``, or a quarter of the limit when that is
+    less, so that a short ``limit_time_real`` (Odoo's default is 120 s)
+    does not lose half its time to the margin.
+
+    :param limit: the server's ``limit_time_real``, in seconds.
+    :rtype: float
+    """
+    return min(PLAYBOOK_LIMIT_MARGIN_S, limit / PLAYBOOK_LIMIT_MARGIN_FRACTION)
+
+
+class AnsibleExecutor(AbstractExecutor):
+    """Run an Ansible playbook against this job's host.
+
+    Subclasses set ``_playbook`` (path relative to the addon's
+    ``ansible/`` directory) and may override ``get_extra_vars()``. Set
+    ``_check_mode`` to run with ``--check``, which is how a playbook
+    doubles as a drift audit: same code, no changes applied.
+    """
+
+    # Path of the playbook inside ``<addon>/ansible/``, e.g.
+    # "playbooks/host_probe.yml". Required in subclasses.
+    _playbook = None
+
+    # Run with --check (report drift, change nothing).
+    _check_mode = False
+
+    def __init__(self, job_record, host_record, sleep_interval=0.5):
+        super().__init__(job_record, host_record, sleep_interval)
+        # Flipped by _check_cancel so the worker thread's
+        # cancel_callback can stop the playbook mid-run.
+        self._cancel_requested = False
+        # Structured data a playbook hands back through
+        # ``ansible.builtin.set_stats`` (see ``playbook_facts``).
+        self._facts = {}
+
+    def get_commands(self):
+        """Unused: this executor drives ansible-runner, not the command loop.
+
+        Declared because ``AbstractExecutor`` requires it; returning an
+        empty list keeps the contract honest for anything that
+        introspects an executor without running it.
+        """
+        return []
+
+    # ===============================
+    # INVENTORY / VARS (OVERRIDABLE)
+    # ===============================
+
+    def inventory_hostname(self):
+        """Return the stable inventory name for this job's host."""
+        return f"cloud-host-{self._host_record.id}"
+
+    def get_extra_vars(self):
+        """Return the ``--extra-vars`` mapping for the playbook.
+
+        Override to feed a playbook from the job's records. Keep it to
+        plain data: everything here is serialised to YAML on disk.
+        """
+        return {}
+
+    def build_inventory(self, key_path, known_hosts_path):
+        """Return the inventory structure for this job's host.
+
+        Host-key checking stays on and is pinned to the key captured by
+        the panel's TOFU flow (``cloud.host.known_hosts_key``), so an
+        Ansible run trusts exactly what the SSH transport trusts.
+
+        :param key_path: private key file, or None for password auth
+        :param known_hosts_path: known_hosts file written for this run
+        """
+        # Trusted reader, same rationale as ``AbstractExecutor.__init__``:
+        # the connection fields are developer-gated and the job may run
+        # under a lower role that was still allowed to enqueue it.
+        host = self._host_record.sudo()
+        hostvars = {
+            "ansible_host": host.ip_address,
+            "ansible_port": host.port,
+            "ansible_user": host.user,
+            "ansible_python_interpreter": "auto_silent",
+            "ansible_ssh_common_args": (
+                f"-o UserKnownHostsFile={known_hosts_path} "
+                f"-o StrictHostKeyChecking=yes"
+            ),
+        }
+        if key_path:
+            hostvars["ansible_ssh_private_key_file"] = key_path
+        else:
+            # Requires sshpass on the panel image (see dependencies/apt.txt).
+            hostvars["ansible_password"] = host.password
+            # The mechanism the panel checks for (``_password_login_available``).
+            # Since 2.19 ansible-core's default is ssh_askpass, which hands
+            # the password over in a shared memory block in /dev/shm: on a
+            # server where /dev/shm is read-only, as Odoo.sh's, none can be
+            # made. Before 2.19 sshpass was the only one, and the variable
+            # is ignored.
+            hostvars["ansible_ssh_password_mechanism"] = "sshpass"
+        return {"all": {"hosts": {self.inventory_hostname(): hostvars}}}
+
+    # ===============================
+    # RUNNER PLUMBING
+    # ===============================
+
+    def _build_private_data_dir(self, root):
+        """Materialise the ansible-runner private data dir under *root*.
+
+        Lays out ``project/`` (the merged ``ansible/`` overlay of the
+        addon chain), ``inventory/hosts.yml`` and the credential files.
+        Everything lives inside a 0700 temp dir that the caller removes.
+        """
+        host = self._host_record
+        if not host.known_hosts_key:
+            raise RuntimeError(
+                f"Host '{host.name}' has no trusted SSH key. "
+                f"Open the host page and click 'Trust SSH Key' first."
+            )
+
+        project = os.path.join(root, "project")
+        for rel, local in self._addon_overlay("ansible").items():
+            target = os.path.join(project, rel)
+            Path(target).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(local, target)
+        if not os.path.isfile(os.path.join(project, self._playbook)):
+            raise RuntimeError(
+                f"Playbook {self._playbook!r} not found under ansible/ of: "
+                f"{', '.join(self._addon_chain())}."
+            )
+
+        known_hosts_path = os.path.join(root, "known_hosts")
+        self._write_private(known_hosts_path, host.known_hosts_key + "\n")
+
+        key_path = None
+        # Read elevated by the helper: the job may run as a Developer, and
+        # ``key_file`` is for system administrators only.
+        key = (
+            host._get_ssh_private_key_bytes()
+            if host.login_type == "ssh_key" else b""
+        )
+        if key:
+            key_path = os.path.join(root, "ssh_key")
+            self._write_private(key_path, key.decode() + "\n")
+
+        inventory_dir = os.path.join(root, "inventory")
+        Path(inventory_dir).mkdir(parents=True, exist_ok=True)
+        self._write_private(
+            os.path.join(inventory_dir, "hosts.yml"),
+            yaml.safe_dump(
+                self.build_inventory(key_path, known_hosts_path),
+                default_flow_style=False,
+            ),
+        )
+
+    @staticmethod
+    def _write_private(path, content):
+        """Write *content* to *path* with 0600 permissions."""
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(content)
+
+    def _emit(self, text):
+        """Buffer playbook output as log chunks (called from the worker thread).
+
+        Mirrors ``on_stdout``'s classification. Only touches the log
+        buffer — ``list.append`` is all the cross-thread contact there
+        is, and the main loop drains it on its usual tick.
+        """
+        for line in (text or "").splitlines():
+            line = line.rstrip()
+            if not line:
+                continue
+            truncated = self._truncate_line(line)
+            source = "stderr" if _looks_like_error(truncated) else "stdout"
+            self._log_buffer.append((truncated, source))
+
+    def _playbook_timeout(self):
+        """Return how long the playbook may run, in seconds, or None.
+
+        What this attempt has left of the server's ``limit_time_real``,
+        less ``playbook_limit_margin()``, and at least one second: past
+        it ansible-runner stops the playbook and the run ends as a
+        ``timeout``, through ``on_failure``, with its private directory
+        removed. The server's own limit, not the one a configured
+        ``attempt_budget_seconds`` stands for: that budget only decides
+        when a job parks, and a playbook never parks. None when nothing
+        cuts the request, or when this attempt's clock was not started.
+
+        :rtype: int | None
+        """
+        limit = config.get("limit_time_real") or 0
+        if limit <= 0 or self._attempt_started is None:
+            return None
+        elapsed = time.monotonic() - self._attempt_started
+        return max(1, int(limit - elapsed - playbook_limit_margin(limit)))
+
+    def _run_playbook(self, root, semaphore_error=None):
+        """Run the playbook synchronously. Returns ``(rc, status)``.
+
+        :param str root: the run's private data directory
+        :param semaphore_error: why this server cannot make a semaphore
+            (``ansible_noshm.semaphore_error``), or None: ansible-playbook
+            then runs as it is installed; otherwise through the launcher
+            of ``ansible_noshm``, on locks over pipes
+        """
+        options = ["--check"] if self._check_mode else []
+        if semaphore_error is None:
+            launch = {
+                "playbook": self._playbook,
+                "cmdline": " ".join(options) or None,
+            }
+        else:
+            launch = ansible_noshm.launch_arguments(root, self._playbook, options)
+        runner = ansible_runner.run(
+            private_data_dir=root,
+            project_dir=os.path.join(root, "project"),
+            inventory=os.path.join(root, "inventory", "hosts.yml"),
+            extravars=self.get_extra_vars(),
+            timeout=self._playbook_timeout(),
+            **launch,
+            envvars={
+                "ANSIBLE_HOST_KEY_CHECKING": "True",
+                "ANSIBLE_RETRY_FILES_ENABLED": "False",
+                # Ansible's own colour codes would reach the log viewer
+                # as escape noise; the panel does its own styling.
+                "ANSIBLE_NOCOLOR": "True",
+                # ansible-playbook is looked up in this PATH, and Odoo.sh's
+                # names ~/.local/bin, where pip puts it, with the tilde.
+                "PATH": expanded_path(),
+            },
+            event_handler=self._on_runner_event,
+            cancel_callback=lambda: self._cancel_requested,
+            quiet=True,
+        )
+        return runner.rc, runner.status
+
+    def playbook_facts(self):
+        """Return the structured data the playbook exported, if any.
+
+        A playbook hands data back to Python with::
+
+            - ansible.builtin.set_stats:
+                data: {ic_...: ...}
+                aggregate: false
+
+        which lands in the ``playbook_on_stats`` event's ``artifact_data``.
+        ``parse_results`` / ``on_success`` read it to make the same
+        decisions the old bash-parsing executors made from stdout —
+        keeping the *gathering* on the host and the *judgement* in Python.
+        """
+        return self._facts
+
+    def _on_runner_event(self, event):
+        """ansible-runner event hook: stream output, capture exported stats."""
+        self._emit(event.get("stdout"))
+        if event.get("event") == "playbook_on_stats":
+            artifact = (event.get("event_data") or {}).get("artifact_data")
+            if isinstance(artifact, dict):
+                self._facts = artifact
+        return True
+
+    def _check_cancel(self):
+        """Also tell the running playbook to stop before raising."""
+        try:
+            super()._check_cancel()
+        except Exception:
+            self._cancel_requested = True
+            raise
+
+    # ===============================
+    # ASYNC ENTRYPOINT
+    # ===============================
+
+    async def _async_entry(self):
+        """Run the playbook, then dispatch the usual terminal hooks."""
+        # Both guards write the reason into the job log before raising:
+        # they fire before any other output, so a bare raise would be the
+        # one failure path in the pipeline that leaves a failed job with
+        # an empty log (the exception only reaches queue_job.exc_message).
+        if ansible_runner is None:
+            msg = (
+                "ansible-runner is not installed in this image — rebuild it "
+                "before running Ansible-backed jobs."
+            )
+            self._sys(f"✗ {msg}")
+            raise RuntimeError(msg)
+        if not self._playbook:
+            msg = f"{type(self).__name__} does not define a playbook."
+            self._sys(f"✗ {msg}")
+            raise RuntimeError(msg)
+        # Without sshpass Ansible cannot log in with a password, and the
+        # run would end in an opaque authentication error.
+        host = self._host_record.sudo()
+        if host.login_type == "password" and not host._password_login_available():
+            msg = (
+                f"Host '{host.name}' logs in with a password, and this "
+                "panel's server has no sshpass, which Ansible needs for "
+                "that. Install sshpass on the panel's server and restart "
+                "it, or switch the host to an SSH key."
+            )
+            self._sys(f"✗ {msg}")
+            raise RuntimeError(msg)
+
+        mode = " (check mode)" if self._check_mode else ""
+        self._sys(f"Running playbook {self._playbook}{mode} on {self.host}...")
+        # Odoo.sh mounts /dev/shm read-only, where ansible-core's queues
+        # need their semaphores; elsewhere nothing changes.
+        semaphore_error = ansible_noshm.semaphore_error()
+        if semaphore_error is not None:
+            self._sys(
+                f"/dev/shm is not writable on this server "
+                f"({ansible_noshm.describe(semaphore_error)}: "
+                f"{semaphore_error.strerror or semaphore_error}): "
+                f"Ansible runs with its locks over pipes."
+            )
+        root = tempfile.mkdtemp(prefix="incubacloud-ansible-")
+        os.chmod(root, 0o700)
+        try:
+            self._build_private_data_dir(root)
+            # The playbook is the run's one step: cancelled from here on,
+            # the job closes through ``on_failure``.
+            self._step_results = {}
+            rc, status = await asyncio.get_running_loop().run_in_executor(
+                None, self._run_playbook, root, semaphore_error,
+            )
+        except Exception as e:
+            _logger.exception("[ansible] playbook failed: %s", e)
+            self._sys(f"✗ {type(e).__name__}: {e}")
+            raise
+        finally:
+            # The private data dir holds the host's private key and the
+            # runner artifacts; it never outlives the job.
+            shutil.rmtree(root, ignore_errors=True)
+
+        if status == "timeout":
+            self._sys(
+                "✗ The playbook was stopped: it ran past the time this "
+                "request has left before the server's limit_time_real "
+                f"({config.get('limit_time_real')} s), less "
+                f"{playbook_limit_margin(config.get('limit_time_real') or 0):g} s "
+                "for closing the job."
+            )
+        self._sys(f"Playbook finished: {status} (rc={rc}).")
+        results = {
+            self._playbook: {"stdout": "", "exit_status": rc},
+        }
+        await self._dispatch_outcome(results)

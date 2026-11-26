@@ -1,0 +1,40 @@
+// Settings → Assistant: what the panel's own sections do not have.
+// Painted with the --rl-* tokens, like the rest of Settings.
+
+.ic-asst-settings {
+    // A link in a note looks like one, not only by its colour (WCAG 1.4.1):
+    // the panel's base styles paint links as text.
+    .rl-set-hint a {
+        text-decoration: underline;
+    }
+
+    .ic-asst-box {
+        inline-size: 18px;
+        block-size: 18px;
+        accent-color: var(--rl-green-dim, #0c7a55);
+    }
+
+    // The usage table scrolls on its own at 390, never the page.
+    .ic-asst-usage-wrap {
+        overflow-x: auto;
+    }
+
+    .ic-asst-usage {
+        margin-block-end: 8px;
+
+        th,
+        td {
+            padding-inline: 0 12px;
+            vertical-align: middle;
+        }
+
+        // A user's name breaks rather than widening the page at 390.
+        td {
+            overflow-wrap: anywhere;
+        }
+    }
+}
+
+.ic-asst-muted {
+    color: var(--rl-muted);
+}

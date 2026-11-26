@@ -1,0 +1,470 @@
+"""Shared repository-line behavior for project/instance repo models.
+
+``cloud.project.repo`` and ``cloud.instance.repo`` were two 152-line
+files identical to the byte except for the FK — the decision log (P13)
+flags exactly that shape as the dangerous one: a validation fix lands
+on one copy and the other keeps accepting what the first now refuses.
+Everything except the owner FK lives here; each concrete model says
+who owns the line via :meth:`_repo_owner`.
+"""
+import logging
+from urllib.parse import urlsplit
+
+from odoo import _, api, fields, models
+from odoo.exceptions import AccessError, UserError, ValidationError
+
+from ._repo_requirements import (
+    RESERVED_REPO_ALIASES,
+    _normalize_url,
+    _repo_alias,
+    apply_requirements_content,
+    canonical_repo_url,
+    consume_git_read,
+    fetch_requirements_txt,
+    is_safe_git_ref,
+    is_safe_git_sha,
+    is_safe_repo_url,
+    provider_of,
+    resolve_repo_ref,
+)
+
+_logger = logging.getLogger(__name__)
+
+
+def _with_canonical_url(env, vals):
+    """Return *vals* with its ``url``, if any, canonical, and its provider.
+
+    Every way a repository line is written (panel routes, MCP, the
+    assistant, imports, a module on top) ends in ``create`` or
+    ``write``, so a github.com repository spelled otherwise is stored
+    as ``https://github.com/<owner>/<repo>`` before the constraint
+    checks it (5-nov-2026). A repository of a configured Git provider
+    is stored as its base URL and path spell it, with ``.git``, and
+    the line gets ``provider_id`` and ``repo_path``, which nobody else
+    writes.
+
+    :param env: an Odoo environment
+    :param dict vals: the values being written
+    :return: *vals* itself, or a copy with ``url`` rewritten
+    :rtype: dict
+    """
+    url = vals.get('url')
+    if not isinstance(url, str):
+        return vals
+    ref = resolve_repo_ref(env, url)
+    if not ref:
+        return {
+            **vals, 'url': canonical_repo_url(url),
+            'provider_id': False, 'repo_path': False,
+        }
+    return {
+        **vals, 'url': ref.canonical,
+        'provider_id': provider_of(env, ref).id or False,
+        'repo_path': ref.path,
+    }
+
+
+#: Written from the URL by :func:`_with_canonical_url`, never sent.
+_DERIVED_FROM_URL = ('provider_id', 'repo_path')
+
+
+def _without_derived_fields(env, vals):
+    """Return *vals* without the fields the URL alone writes.
+
+    ``provider_id`` and ``repo_path`` say which credential reads a
+    line's repository: below the superuser, a value sent for them is
+    dropped, and :func:`_with_canonical_url` writes them from the URL.
+
+    :param env: an Odoo environment
+    :param dict vals: the values being written
+    :return: *vals* itself, or a copy without those fields
+    :rtype: dict
+    """
+    if env.su or not any(name in vals for name in _DERIVED_FROM_URL):
+        return vals
+    return {k: v for k, v in vals.items() if k not in _DERIVED_FROM_URL}
+
+
+def repo_url_key(env, url):
+    """Return the form every spelling of *url*'s repository shares.
+
+    The URL as a line stores it (:func:`_with_canonical_url`), in lower
+    case, without ``.git`` or a final slash: two URLs of the same
+    repository give the same key.
+
+    :param env: an Odoo environment
+    :param str url: a repository URL as typed or stored
+    :rtype: str
+    """
+    return _normalize_url(_with_canonical_url(env, {'url': url}).get('url'))
+
+
+def user_sees_repo_line(env, url):
+    """Return whether *url* names the repository of a line the user sees.
+
+    A project's line or an instance's, under the user's record rules.
+
+    :param env: an Odoo environment, of the user
+    :param str url: a repository URL as typed or stored
+    :rtype: bool
+    """
+    key = repo_url_key(env, url)
+    if not key:
+        return False
+    name = key.rsplit('/', 1)[-1]
+    for model in ('cloud.project.repo', 'cloud.instance.repo'):
+        lines = env[model].search([('url', 'ilike', name)])
+        if any(repo_url_key(env, line.url) == key for line in lines):
+            return True
+    return False
+
+
+def may_read_with_panel_credentials(env, url):
+    """Return whether the panel reads *url* with its own credentials.
+
+    From Project Manager up, any repository: they point lines at any.
+    Below, only the repository of a line the user sees; any other is
+    read as a public one, so a private repository is not found.
+
+    :param env: an Odoo environment, of the user who reads
+    :param str url: the repository URL the user sent
+    :rtype: bool
+    """
+    if env['cloud.security.mixin']._can_change_repo_url():
+        return True
+    return user_sees_repo_line(env, url)
+
+
+def _url_host(url):
+    """Return the host *url* names, or '' when it names none.
+
+    ``git@host:path`` included, for the message of a missing provider.
+
+    :param str url: a repository URL as stored
+    :rtype: str
+    """
+    text = (url or '').strip()
+    if text.startswith('git@') and ':' in text:
+        return text[4:].split(':', 1)[0].lower()
+    if '://' not in text:
+        text = f'https://{text}'
+    try:
+        return (urlsplit(text).hostname or '').lower()
+    except ValueError:
+        return ''
+
+
+
+#: What a GitLab line's push-to-rebuild says for each state of its webhook.
+_HOOK_CAPABILITY = {
+    'pending': 'hook_pending',
+    'active': 'ok',
+    'failing': 'hook_failing',
+    'orphan': 'hook_pending',
+}
+
+class CloudRepoMixin(models.AbstractModel):
+    _name = 'cloud.repo.mixin'
+    _description = 'Repository line (shared base)'
+
+    #: The line's parent field, named by each concrete model: a write
+    #: that moves the line is checked against the rules as it is now.
+    _owner_field = None
+
+    sequence = fields.Integer(default=10)
+    url = fields.Char(
+        string='Repository URL',
+        required=True,
+        help='Full URL of the GitHub/GitLab repository.',
+    )
+    branch = fields.Char(
+        string='Branch',
+        default='main',
+        help='Branch to use for deployments.',
+    )
+    addons = fields.Char(
+        string='Addons',
+        help=(
+            'Comma-separated list of addon module names to install from'
+            ' this repository. Leave empty to include all addons (*).'
+        ),
+    )
+    excludes = fields.Char(
+        string='Exclude Addons',
+        help=(
+            'Comma-separated list of addon module names to exclude from'
+            ' this repository. Only meaningful when Addons is empty (*).'
+        ),
+    )
+    commit_sha = fields.Char(
+        string='Pinned Commit',
+        help=(
+            'When set, the repository is frozen to this exact commit SHA.'
+            ' Rebuilds will use this commit instead of the branch tip.'
+        ),
+    )
+    provider_id = fields.Many2one(
+        'cloud.git.provider', string='Git provider', ondelete='restrict',
+        index=True, readonly=True,
+        help='Empty for GitHub. Written with the URL, never by hand.',
+    )
+    repo_path = fields.Char(
+        string='Repository path', index=True, readonly=True,
+        help='group/subgroup/project on GitLab, owner/repo on GitHub, in '
+        'lower case. Written with the URL, never by hand.',
+    )
+    repo_capabilities = fields.Json(
+        compute='_compute_repo_capabilities',
+        help='What the panel does with this repository, for the SPA and '
+        'the MCP.',
+    )
+
+    @api.depends('url', 'provider_id')
+    def _compute_repo_capabilities(self):
+        """Say what the panel does with each line's repository.
+
+        ``{provider, host, read, push_rebuild, previews, code_tools,
+        hook_id}``. For GitHub, from the App and
+        the PAT the panel holds; for GitLab, push-to-rebuild from the
+        state of the webhook that delivers the path (its project's, or
+        an active group's); previews of merge requests from the same
+        webhook, ``no_notes`` when no credential of the path has ``api``
+        to write their note; and no code writes.
+        """
+        app = self.env['cloud.github.app'].sudo().search_count([], limit=1)
+        pat = bool(self.env['cloud.settings'].sudo()._get_system().github_pat)
+        Hook = self.env['cloud.gitlab.hook'].sudo()
+        for repo in self:
+            if repo.provider_id:
+                hook = Hook._find_for(repo.provider_id, repo.repo_path or '')
+                push = _HOOK_CAPABILITY.get(hook.state, 'no_hook')
+                previews = push
+                if push == 'ok':
+                    try:
+                        repo.provider_id.sudo()._credential_for(
+                            repo.repo_path or '', 'api_write',
+                        )
+                    except UserError:
+                        previews = 'no_notes'
+                repo.repo_capabilities = {
+                    'provider': 'gitlab',
+                    'host': repo.provider_id.sudo().authority,
+                    'read': True,
+                    'push_rebuild': push,
+                    'previews': previews,
+                    'code_tools': {'read': True, 'write': False},
+                    'hook_id': hook.id or False,
+                }
+                continue
+            repo.repo_capabilities = {
+                'provider': 'github',
+                'host': 'github.com',
+                'read': True,
+                'push_rebuild': 'ok' if app else 'no_hook',
+                'previews': 'ok' if app else 'no_hook',
+                'code_tools': {'read': True, 'write': bool(app or pat)},
+                'hook_id': False,
+            }
+
+    def _repo_owner(self):
+        """Return the record whose pip/apt dependencies this line feeds.
+
+        Each concrete model returns its FK target (the project or the
+        instance); the mixin never needs to know which.
+        """
+        raise NotImplementedError
+
+    @api.constrains('url', 'branch', 'commit_sha')
+    def _check_git_inputs_safe(self):
+        """Refuse URLs/refs/SHAs that could smuggle shell or git tricks."""
+        for repo in self:
+            url = (repo.url or '').strip()
+            if url and repo.provider_id and resolve_repo_ref(
+                repo.env, url,
+            ):
+                pass
+            elif url and not is_safe_repo_url(url):
+                host = _url_host(url)
+                if host and host not in ('github.com', 'www.github.com'):
+                    raise ValidationError(_(
+                        "There is no Git provider for %s: add it under "
+                        "Settings → Git providers.",
+                    ) % host)
+                raise ValidationError(_(
+                    "Repository URL '%s' is not a recognised GitHub "
+                    "URL. Use the canonical form "
+                    "'https://github.com/<owner>/<repo>'.",
+                ) % url)
+            alias = _repo_alias(url)
+            if alias in RESERVED_REPO_ALIASES:
+                raise ValidationError(_(
+                    "%s is a name doodba keeps for itself in custom/src, "
+                    "where each repository is fetched under its own name: "
+                    "use a repository with another name.",
+                ) % alias)
+            branch = (repo.branch or '').strip()
+            if branch and not is_safe_git_ref(branch):
+                raise ValidationError(_(
+                    "Branch '%s' contains characters that are not "
+                    "allowed (use letters, digits, dots, slashes, "
+                    "underscores or hyphens; cannot start with '-' "
+                    "or contain '..').",
+                ) % branch)
+            sha = (repo.commit_sha or '').strip()
+            if sha and not is_safe_git_sha(sha):
+                raise ValidationError(_(
+                    "Pinned commit '%s' is not a valid git SHA "
+                    "(7-64 lowercase hex characters).",
+                ) % sha)
+
+    @api.constrains('addons', 'excludes')
+    def _check_addons_excludes_overlap(self):
+        """A module cannot be included and excluded at the same time."""
+        for repo in self:
+            inc = {
+                m.strip()
+                for m in (repo.addons or '').split(',')
+                if m.strip()
+            }
+            exc = {
+                m.strip()
+                for m in (repo.excludes or '').split(',')
+                if m.strip()
+            }
+            overlap = inc & exc
+            if overlap:
+                raise ValidationError(_(
+                    "Repo %(url)s: module(s) in both Addons and Exclude Addons: %(modules)s",
+                ) % {'url': repo.url, 'modules': ', '.join(sorted(overlap))})
+
+    def _write_with_legacy_urls_canonical(self, vals):
+        """Write *vals*, storing a line's old spelling of its URL canonical.
+
+        A line stored before 5-nov-2026 may keep a github.com URL in
+        another spelling (``github.com/o/r``, ``http://``, ``www.``, a
+        final slash, ``git@github.com:o/r.git``). The constraint checks
+        the URL whenever the branch or the pin is written, so pinning,
+        unpinning, a pull request's branch or a module on top pinning core
+        would fail on such a line although nobody touched its URL. Each
+        line whose URL :func:`canonical_repo_url` rewrites into a safe
+        one is written with that URL too, on its own; the rest go in
+        one write. A URL that cannot be made canonical is left for the
+        constraint to refuse.
+
+        :param dict vals: the values being written, with no ``url``
+        :return: what ``write`` returns
+        :rtype: bool
+        """
+        plain = self.browse()
+        for repo in self:
+            canonical = canonical_repo_url(repo.url)
+            if canonical != repo.url and is_safe_repo_url(canonical):
+                super(CloudRepoMixin, repo).write({**vals, 'url': canonical})
+            else:
+                plain |= repo
+        return super(CloudRepoMixin, plain).write(vals)
+
+    # ── Requirements sync ──────────────────────────────────────────────────
+
+    def _apply_requirements(self):
+        """Fetch requirements.txt and merge into the owner's
+        pip_dependencies, inserting git-style conflict markers where
+        the incoming version differs from an existing spec.
+        Runs silently — failures are ignored.
+        Skipped when context flag ``skip_apply_requirements`` is set
+        (e.g. when the frontend already merged).
+        """
+        if self.env.context.get('skip_apply_requirements'):
+            return
+        for repo in self:
+            if not repo.url or not repo.branch:
+                continue
+            # A Git provider's line runs git on the panel: one read of the
+            # user's hourly cap, or none at all past it.
+            if repo.provider_id and not consume_git_read(self.env):
+                _logger.info(
+                    "requirements of %s not read: git read limit reached",
+                    repo.url,
+                )
+                continue
+            content = fetch_requirements_txt(
+                self.env, repo.url, repo.branch,
+            )
+            if not content:
+                continue
+            owner = repo._repo_owner()
+            apply_requirements_content(
+                owner, content, repo.url, repo.branch,
+            )
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        records = super().create([
+            _with_canonical_url(self.env, _without_derived_fields(self.env, v))
+            for v in vals_list
+        ])
+        records._apply_requirements()
+        return records
+
+    def _check_url_unchanged(self, url):
+        """Refuse *url* on these lines unless the user may change it.
+
+        A user below Project Manager may send the URL a line already has,
+        in any spelling of the same repository, as the forms do on every
+        save; another repository is refused. Superuser writes (the system,
+        migrations, the crons, modules on top) are not checked.
+
+        :param url: the URL being written, already canonical
+        :raises AccessError: when a line would name another repository
+        """
+        if self.env['cloud.security.mixin']._can_change_repo_url():
+            return
+        wanted = _normalize_url(url)
+        for repo in self:
+            if repo_url_key(self.env, repo.url) != wanted:
+                raise AccessError(_(
+                    "Only a Project Manager or higher can change the URL "
+                    "of the repository %s; you can still change its "
+                    "branch.",
+                ) % repo.url)
+
+    def _check_owner_unchanged(self, owner):
+        """Refuse moving these lines to another parent unless the user may.
+
+        Below Project Manager a line stays on its project or instance: on
+        another one it would hand that parent a repository the user may
+        not name there. Writing the parent a line already has, as a
+        parent's ``Command.SET`` does for its own lines, is allowed.
+        Superuser writes are not checked.
+
+        :param owner: the parent's id (or record, or False) being written
+        :raises AccessError: when a line would change its parent
+        """
+        if self.env['cloud.security.mixin']._can_change_repo_url():
+            return
+        if isinstance(owner, models.BaseModel):
+            owner = owner.id
+        for repo in self:
+            if repo[self._owner_field].id != (owner or False):
+                raise AccessError(_(
+                    "Only a Project Manager or higher can move the "
+                    "repository %s to another project or instance.",
+                ) % repo.url)
+
+    def write(self, vals):
+        vals = _with_canonical_url(
+            self.env, _without_derived_fields(self.env, vals),
+        )
+        if self._owner_field in vals:
+            self._check_owner_unchanged(vals[self._owner_field])
+        if 'url' in vals:
+            self._check_url_unchanged(vals['url'])
+            result = super().write(vals)
+        else:
+            result = self._write_with_legacy_urls_canonical(vals)
+        # A line moved to another parent is checked again where it landed.
+        if self._owner_field in vals:
+            self.check_access('write')
+        if 'url' in vals or 'branch' in vals:
+            self._apply_requirements()
+        return result

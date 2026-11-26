@@ -1,0 +1,374 @@
+# API Endpoints
+
+All endpoints are defined in `incubacloud/controllers/`. Unless noted, endpoints are JSON-RPC (`type="jsonrpc"`, the Odoo 19 dispatcher), require `auth="user"` (logged-in internal Odoo session) and are called via POST. The SPA additionally calls a few `cloud.job` model methods through the standard Odoo ORM RPC (`/web/dataset/call_kw`) — see [Jobs](#jobs-and-audit-log).
+
+Access control is layered:
+
+1. **Record rules** scope what each user can see (project membership).
+2. **Role gates** inside each endpoint enforce the 5-tier RBAC before acting.
+3. A few sensitive reads have an extra **field whitelist** (see [Secrets](#secrets)).
+
+## Role gates
+
+Groups form a hierarchy (each implies the previous): `user` < `consultant` < `project_manager` < `developer` < `manager`. Gates used in the tables below:
+
+| Gate | Required group |
+|---|---|
+| manage hosts / manage settings | `group_cloud_manager` |
+| deploy / create instance | `group_cloud_consultant` |
+| terminal / view logs / manage backups / clone to staging / export | `group_cloud_developer` |
+| create project | `group_cloud_project_manager` |
+| change a repository line's URL (project or instance) | `group_cloud_project_manager`; below it, a save may send the line's own URL again, and a new instance's lines name only its project's repositories |
+| delete project | `group_cloud_manager` |
+| delete instance | manager if production, consultant otherwise |
+| connect as user | `group_cloud_user` |
+
+`sudo()`/superuser bypasses all gates. "record rules" in the tables means no explicit gate — visibility is delegated to record rules.
+
+---
+
+## Health and configuration
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/ping` | none | Liveness check, returns `{response: "pong"}`. |
+| `/cloud/get_config` | none | Feature flags, permissions and global settings for the SPA. |
+| `/cloud/get_dashboard` | record rules | Counts (hosts, projects, instances), active alerts, recent jobs. |
+| `/cloud/get_langs` | none | Available Odoo language codes and names. |
+| `/cloud/get_odoo_versions` | none | Offered Odoo versions the panel's template pin can render, with each one's PostgreSQL range; the last is a new project's default. |
+| `/cloud/global_search` | record rules | Cross-entity search (projects, instances, hosts). |
+| `/cloud/get_users` | project manager | Internal users (for member pickers). |
+| `/cloud/get_tags` | none | All tags with id, name, color. |
+| `/cloud/create_tag` | consultant | Create tag; color auto-assigned. |
+
+`GET /cloud/health` is a separate **public** HTTP endpoint (DB liveness probe returning 200/503, rate-limited per IP) intended for external uptime monitors.
+
+## Hosts
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/get_hosts` | none¹ | List hosts with metrics and instance count. |
+| `/cloud/get_host` | manage hosts | Full host detail including Traefik config and alerts. The default certificate comes back as `tls_default_cert` plus `tls_default_info` (names, expiry, issuer, fingerprint); its key only as `has_tls_default_key`, never the value. |
+| `/cloud/host_defaults` | manage hosts | Defaults for the new-host form. |
+| `/cloud/create_host` | manage hosts | Create host (field whitelist enforced). |
+| `/cloud/save_host` | manage hosts | Update host; also syncs whitelist entries. Accepts `tls_default_cert` / `tls_default_key`: an empty key keeps the stored one, an empty certificate removes both, and a pair that cannot serve is refused with a validation error. |
+| `/cloud/delete_host` | manage hosts | Archive or delete host. |
+| `/cloud/trust_host_key` | manage hosts | Pin the host's SSH key (TOFU confirmation). With `expected_fingerprint`, the key is read and compared before any credential is sent, and a server presenting another key is refused with nothing stored (agents' approval, see [`mcp.md`](mcp.md)). |
+| `/cloud/setup_whitelist` | manage hosts | Enqueue whitelist setup SSH job. |
+| `/cloud/get_host_instances` | record rules | Instances deployed on a host. |
+| `/cloud/browse_host_dir` | manage hosts | Browse a remote directory (path-safety validated). |
+| `/cloud/import_host_instance` | manage hosts | Import an instance already running on the host (reads `.copier-answers.yml`, `repos.yaml`, compose files). |
+
+¹ SSH-related fields are redacted from the response unless the caller is a manager.
+
+## Projects
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/get_projects` | record rules | Paginated project list (`{items, total, truncated, limit}`). |
+| `/cloud/get_project` | record rules | Project detail (repos, dependencies, backup backend). |
+| `/cloud/get_project_full` | record rules | Project + instances + jobs in one payload (SPA store). |
+| `/cloud/create_project` | create project | Create project (field whitelist enforced). Reads each line's `requirements.txt`; a GitLab one within the request's Git reads (below), else `warning` says how many were not read. |
+| `/cloud/save_project` | consultant | Update project; repos replaced by the `repos` array. |
+| `/cloud/delete_project` | delete project | Delete project (fails if instances exist). |
+| `/cloud/get_project_instances` | record rules | Instances in a project. |
+| `/cloud/import_project` | create project | Import a project from a Git URL (doodba or Odoo.sh layout; SSRF host allowlist). |
+
+## Instances
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/get_instance` | record rules | Full instance detail (Odoo config, DB, SMTP, repos, domains). |
+| `/cloud/create_instance` | create instance | Create instance with repos. May return `{blocked: true, reason}` (`pip_conflict`, `host_required`, `no_host`), and `warning` when GitLab repositories were left out of the module check (below). Each domain's `cert_resolver` is clamped to the field's options; anything else becomes the field's default (`auto`). |
+| `/cloud/save_instance` | consultant | Update instance (field whitelist enforced); `warning` as in `create_instance`. Rewrites the domain list from the request, with `cert_resolver` clamped as in `create_instance`. |
+| `/cloud/keep_instance` | consultant | Reset a staging's autopurge window and clear its expiry warnings. |
+| `/cloud/delete_instance` | delete instance | Tear down and delete/archive the instance. |
+| `/cloud/deploy_instance` | deploy | Enqueue `deploy_instance` job. |
+| `/cloud/rebuild_instance` | deploy | Enqueue `rebuild_instance` job (safe rebuild with boot test). |
+| `/cloud/clone_to_staging` | clone to staging | Clone production instance to a staging (DB + config). |
+| `/cloud/move_instance` | manage hosts | Move an instance to another host (chained jobs: deploy → quiesce → fresh backup → restore → cutover → cleanup). |
+| `/cloud/rollback_move` | manage hosts | Recover a move that failed before cutover (restarts the source). |
+| `/cloud/resolve_pip_conflict` | consultant | Apply the chosen resolution for a Python dependency conflict. Answers `{ok, job_id}`: the job that waited on the alert and is back in its queue, or `false`. |
+| `/cloud/resolve_addon_conflict` | consultant | Apply the chosen resolution for an addon conflict. Answers `{ok, job_id}` like the pip one. |
+| `/cloud/compare_sync` | consultant | Diff instance config vs. what is deployed on the host. |
+| `/cloud/apply_sync` | consultant | Apply the config diff to the host. |
+| `/cloud/fetch_container_logs` | view logs | Tail container logs for the log viewer page. |
+| `/cloud/instance_log_archives` | view logs | List the daily Odoo log files kept on the host (name, size, mtime). |
+| `/cloud/fetch_log_archive` | view logs | Read one archived day, with an optional fixed-string filter applied on the host. |
+| `/cloud/search_log_archives` | view logs | Which archived days mention a term, with hit counts (bounded sweep on the host). Rate-limited; audited with the term. |
+| `/cloud/instance/<id>/log_archive/<name>` | view logs | Download one archived day, gzipped (HTTP, not JSON-RPC). Rate-limited; audited. |
+| `/cloud/instance_relay_test_mail` | consultant | Enqueue `relay_test_mail`: one mail through a production's relay to the caller's own address. Refused, with the reason `get_instance` answers as `relay_test_refusal`, for a staging, an instance without a relay, one not deployed, stopped or asleep, or with changes to apply; then five an hour per instance (`cloud.instance.send_relay_test_mail` holds the checks and the count). |
+| `/cloud/instance_mailbox` | view logs | List the mail a staging captured instead of sending. Staging only, deployed and running; rate-limited; nothing stored. |
+| `/cloud/instance_mail` | view logs | One captured message, decoded, with its attachments listed but not carried. Rate-limited. |
+| `/cloud/instance_mailbox_clear` | view logs | Empty a staging's captured mailbox. Rate-limited; audited. |
+
+An instance runs one job at a time; a job asked for while another runs waits in the instance's queue instead of being refused. The deploy and rebuild endpoints answer `{job_id, state, job_type, queued_behind}`: `state` is `queued` when the job waits and the state its queue job reached when it started (`pending` at first); `job_type` is the visible name of its type; `queued_behind` is the visible name of the type of the job running on the instance, or `false` when the job started or nothing visible runs (a queue held by a failure). A job that waits on a conflict alert answers `{job_id, state: "blocked", blocked: true, alert_id, alert_code, message, conflicts}` instead. A busy instance never makes them answer an error; what the job's type allows still can (a second restore or delete waiting, a sixth job in the queue): `{ok: false, error}`.
+
+## Backups
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/list_backups` | manage backups | Paginated backup list for an instance (`offset`/`limit`). |
+| `/cloud/get_backup_result` | manage backups | Poll the outcome of a backup-related job. |
+| `/cloud/create_backup` | manage backups | Enqueue backup creation job. |
+| `/cloud/download_backup` | manage backups | Enqueue backup download job; returns attachment URL when ready. |
+| `/cloud/download_backup_neutralized` | manage backups | Same, but neutralized (crons off, mail servers archived, credentials scrubbed). |
+| `/cloud/restore_backup` | manage backups | Enqueue in-place restore job. |
+
+Uploading an external ZIP goes through three plain-HTTP endpoints, all multipart, CSRF-protected and gated on *manage backups*:
+
+| Path | Description |
+|---|---|
+| `POST /cloud/instance/<id>/restore/begin` | Open a staged upload; returns `{upload_id, max_bytes, chunk_bytes}`. Rate-limited per user (2/min). |
+| `POST /cloud/instance/<id>/restore/part` | Append one piece (`upload_id`, `offset`, `chunk`). `offset` must equal the current size: a piece behind it is acknowledged without rewriting (safe retry), one past it is refused 409 (a hole no reader could detect). Capped at 40 MiB per request. |
+| `POST /cloud/instance/<id>/restore/finish` | Close the upload and enqueue the restore. |
+
+Pieces rather than one request because a CDN or reverse proxy in front of the panel caps a single body long before Odoo sees it — Cloudflare at 100 MB — so the one-shot route (`POST /cloud/instance/<id>/restore`, still accepted) answered 413 to anything larger. The total is capped by `incubacloud.restore_upload_max_bytes` (default 2 GiB), which is a disk budget: the rebuilt file waits under the data directory until the executor sends it.
+
+Two JSON-RPC routes cover the archives that never pass through the panel: `cloud.instance.grant_restore_upload` (installs a one-use, directory-confined, expiring SSH key and returns the private half once) and `cloud.instance.restore_from_url` (has the host fetch it over `https`/`sftp`/`ftp`, with the address validated and pinned here). See [RB-19](runbooks/RB-19-restore-large-backup.md).
+
+## Backup backends
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/get_backup_backends` | manager; below, names only | List S3 backends (no secrets, truncation-capped). Below a manager, the backends' ids and names alone, for the forms that choose one; their bucket, path and endpoint stay a manager's. |
+| `/cloud/get_backup_backend` | manage settings | Backend detail (never returns `s3_secret_access_key` / `passphrase`). |
+| `/cloud/create_backup_backend` | manage settings | Create backend; passphrase and secret auto-generated if omitted. |
+| `/cloud/save_backup_backend` | manage settings | Update backend; empty secret fields preserve the stored value. |
+| `/cloud/delete_backup_backend` | manage settings | Delete backend. |
+| `/cloud/test_backup_backend` | manage settings | Test S3 connectivity via boto3. |
+| `/cloud/measure_backup_usage` | manage settings | Measure bucket usage (feeds quota alerts). |
+
+## Secrets
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/get_secret` | developer + whitelist + write access | Return the plaintext of one encrypted field. |
+
+Allowed `(model, field)` pairs (`_SECRET_FIELDS`):
+
+| Model | Fields |
+|---|---|
+| `cloud.host` | `password`, `traefik_panel_password` |
+| `cloud.instance` | `odoo_admin_password`, `postgres_password`, `smtp_relay_password` |
+| `cloud.backup.backend` | `s3_secret_access_key`, `passphrase` |
+| `res.users` | `cloud_telegram_bot_token`, `cloud_webhook_secret` |
+
+The OAuth2 relay's `smtp_relay_oauth_client_secret` is deliberately absent: once saved it is never read back, `get_instance` answers only `has_smtp_relay_oauth_client_secret`.
+
+The caller must be in `group_cloud_developer`, the pair must be whitelisted, **and** the caller needs write access to the record. Anything else returns an error. Secrets are stored with `EncryptedChar` (Fernet) — see `docs/architecture.md`.
+
+## Alerts
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/get_alert_count` | record rules | Active alert count for the header badge. |
+| `/cloud/get_alert_history` | record rules | Paginated alert history (`state_filter`, `level_filter`, `offset`, `limit`). |
+| `/cloud/dismiss_alert` | consultant + write access | Dismiss one alert. |
+| `/cloud/dismiss_all_alerts` | consultant | Dismiss all non-blocking visible alerts (`pip_conflict`/`addon_conflict` excluded). |
+
+## Jobs and audit log
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/get_job_brief` | read access | Minimal job state + last system message (used after bus events). |
+| `/cloud/get_job_state` | read access | What became of a job just asked for: `{ok, job_id, state, job_type, queued_behind}`, the same answer as the deploy and rebuild endpoints (or their `blocked` envelope), the type names in the caller's language; `{ok: false}` for a job the caller cannot read. Read by the buttons that enqueue through the ORM or through an endpoint that answers with the id alone. |
+| `/cloud/get_audit_log` | record rules | Paginated, filterable audit log (`instance_id` or `host_id`, `q`, `action_filter`, `date_from/to`, `offset`, `limit`). |
+| `/cloud/purge_audit_logs` | manager | Purge audit rows older than the retention window. |
+
+There are **no** dedicated `/cloud/*` routes for job history, log chunks or cancel/retry. The SPA calls `cloud.job` model methods through the standard ORM RPC instead: `load_history` (paginated history), `get_host_jobs`, `enqueue(host_id, instance_id, job_type_code)` (host-level actions such as `host_probe` and `full_setup`; role-gated server-side), `retry_job` and `cancel_job` (role-gated server-side like `enqueue`: in any state, by whoever may ask for a job of its type and for every step of its chain the cancellation ends; a job waiting in its queue is cancelled at once). The job log terminal page consumes chunks over WebSocket with an HTTP polling fallback (see [Static pages](#static-pages-and-public-http-endpoints)).
+
+## Notification preferences
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/get_user_preferences` | own user | Notification prefs; secrets returned only as booleans (`cloud_telegram_configured`, `cloud_webhook_configured`). |
+| `/cloud/save_user_preferences` | own user | Save prefs (level, mode, email toggle, muted projects, Telegram, webhook; webhook URL must be `https://`). An empty bot token or signing secret keeps the stored one, unless the save leaves the channel's address empty (Telegram's chat ID, the webhook URL): the channel is then off, and its secret is deleted with it, one sent in the same save included. |
+| `/cloud/telegram_detect_chat_id` | own user | Poll the bot's `getUpdates` to auto-detect the chat id, with the token typed (`bot_token`) or else the stored one. Saves nothing. |
+| `/cloud/telegram_send_test` | own user | Send a test message, with the token and chat typed (`bot_token`, `chat_id`) or else the stored ones. Saves nothing. |
+
+The outbound job-state webhook (payload, `X-IncubaCloud-Signature` HMAC header) is documented in `docs/architecture.md`.
+
+## Platform settings
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/get_general_settings` | manage hosts | Global defaults (singleton `cloud.settings`). |
+| `/cloud/save_general_settings` | manage hosts | Update global defaults. |
+| `/cloud/get_core_rate_limits` | manage hosts | Current admin-tunable rate limits. |
+| `/cloud/save_core_rate_limits` | manage hosts | Update rate limits. |
+
+## GitHub integration
+
+App management (all gated on **manage settings**):
+
+| Path | Description |
+|---|---|
+| `/cloud/get_github_app` | App status `{configured, has_installation, app_id}`. Private key never returned. |
+| `/cloud/save_github_app` | Update App credentials (force-confirm on destructive overwrite). |
+| `/cloud/save_github_pat` | Store a personal access token (fallback auth). |
+| `/cloud/test_github_connection` | Validate current credentials against the GitHub API. |
+| `/cloud/reset_github_app` | Clear the stored App. |
+| `/cloud/detect_github_installation` | Detect/refresh the installation id. |
+
+Repository operations (all gated on **consultant**, but the import preview,
+gated on **create project** as the import is). Below project manager,
+the panel reads with its GitHub App or token, or a provider's credential, only
+a repository of a line the user sees; any other is read as a public one. A
+repository of a Git provider (GitLab) is read with the panel's git and the
+provider's credential, with the same answers, and counts against
+`rate_limit_git_reads_per_hour`;
+an error that a provider's setting fixes says `settings_hint: "git_providers"`,
+one of GitHub's `settings_hint: "github"`. A request that reads several
+GitLab repositories (creating a project, the module check of an instance's
+save, creation or import) makes at most 10 reads, all within 20 s, each one
+of the hourly cap too; a read past them is not made and the answer says so,
+and the deploy reads without them:
+
+| Path | Description |
+|---|---|
+| `/cloud/get_repo_branches` | Branch list (App token or PAT; `ls-remote` on GitLab, which adds `provider` and `host`). |
+| `/cloud/get_branch_head` | Head commit of a branch. |
+| `/cloud/get_repo_modules` | Odoo addon names in a repository. |
+| `/cloud/get_repo_requirements` | `requirements.txt` content. |
+| `/cloud/fetch_odoojs_submodules` | `.gitmodules` for the Odoo.sh import wizard (create project; SSRF host allowlist). |
+| `/cloud/freeze_repo` / `/cloud/unfreeze_repo` | Toggle auto-rebuild freeze on one repo. |
+| `/cloud/freeze_all_repos` / `/cloud/unfreeze_all_repos` | Bulk freeze/unfreeze (record-rule scoped). |
+
+## Git providers (GitLab)
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/get_git_providers` | consultant | `{network, can_manage, providers}`: each provider's name, base URL, authority, CA fingerprints and last test; for a manager also its CA bundle and credentials (namespace, kind, user, scopes, token user, expiry, `has_token`). The token is never returned. |
+| `/cloud/save_git_provider` | manage settings | Add or edit a provider and its credentials, all or nothing; a credential left out is removed, an empty token keeps the stored one. A new token (not a deploy token) is introspected; a failure there is answered in `warnings`. Audited without values. |
+| `/cloud/delete_git_provider` | manage settings | Refused, with how many, while repository lines use it. |
+| `/cloud/test_git_provider` | manage settings | With a repository URL of the provider: `git` (`ls-remote HEAD`) and `api` (token introspection), each a code (`ok`, `auth`, `tls`, `not_found`, `unreachable`, `private_address`, `timeout`, `redirect`, `no_api`, `no_credential`, …) and its message; kept on the provider. |
+| `/cloud/get_git_hooks` | consultant | The panel's GitLab webhooks: provider, scope, path, state (`pending`, `active`, `failing`, `orphan`), whether the panel created it, the last delivery and the last «Verify»; the URL for a manager. A consultant gets only the webhooks of repository lines they can read. |
+| `/cloud/register_git_hook` | write on the line | `{line_model, line_id, scope}`: creates or reuses the webhook of a GitLab line's path (`ON CONFLICT`) and registers it in GitLab, adopting the panel's own, on a READ COMMITTED cursor with the row held `FOR NO KEY UPDATE` meanwhile, so two at once leave one webhook; `{manual: true, reason}` when it must be set up by hand. `scope='group'` is for managers. |
+| `/cloud/reveal_git_hook_secret` | manager | URL and secret to paste in GitLab; `rotate=true` makes a new secret and rewrites GitLab's webhook with URL and token together, with the row held as when registering; the panel keeps the new secret only once GitLab took it, and after an unclear answer gives GitLab the kept one back (best effort). Audited. |
+| `/cloud/verify_git_hook` | write on a line it serves | Asks GitLab for a tag-push test and returns `verify_requested_at` at once; one per webhook every 15 s; GitLab's 429 is translated. The SPA polls `get_git_hooks`. |
+| `/cloud/delete_git_hook` | manager | Deletes the webhook in GitLab (when it is the panel's; a 404 is done) and in the panel. With no credential that may delete it in GitLab, or one GitLab refuses (401, 403), it is deleted in the panel only and `warning` says so. Its `gitlab_hook_failing` alert is resolved. |
+| `/cloud/reprocess_git_event` | manager | Dispatches again a GitLab delivery whose dispatch failed. |
+
+`/cloud/get_config` answers `features.git_providers = {network}`: `any` by
+default, or `public` when a module that extends the panel limits it to Git
+servers on a public address.
+
+## Terminal
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/terminal/open` | terminal + rate limits | Spawn a PTY subprocess for an instance shell; returns session id. |
+| `/cloud/terminal/<sid>/output` | session owner | Poll output chunks. |
+| `/cloud/terminal/<sid>/input` | session owner | Send base64 keystrokes. |
+| `/cloud/terminal/<sid>/resize` | session owner | Resize the PTY. |
+| `/cloud/terminal/<sid>/close` | session owner | Close the session. |
+
+`GET /cloud/terminal/<sid>` (HTTP) renders the xterm.js page; only the session's owner may load it.
+
+## Instance connect
+
+| Path | Gate | Description |
+|---|---|---|
+| `/cloud/get_instance_users` | connect as user + read access | List the instance's internal Odoo users (via docker exec). |
+| `/cloud/prepare_instance_connect` | connect as user + read access | Inject a one-time session token, return the `/ic/login` redirect URL. |
+
+## MCP (`incubacloud_mcp`)
+
+Agents' endpoint and the MCP's own pages; see [`mcp.md`](mcp.md).
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/mcp` | `Authorization: Bearer` (OAuth access token or API key); the cookie is ignored | The MCP endpoint. One JSON-RPC message per POST, JSON answers, 256 KiB at most. `GET`/`DELETE`: 405. |
+| GET | `/.well-known/oauth-protected-resource/mcp`, `/.well-known/oauth-protected-resource` | **public** | RFC 9728 document of `/mcp`; 404 without an issuer. |
+| GET, POST | `/cloud/mcp/approve/<token>` | user (the one whose agent asked; others 403) | Approval page of an agent's action. GET shows; POST (CSRF) approves or cancels. Never framed or cached. |
+| GET | `/cloud/mcp/download/<token>` | **public** (single-use token) | The backup an approved `download_backup` link names: once, 15 minutes; the user's role and access checked again; another user's session 404, `HEAD` 405, a file gone 410. |
+| JSON | `/cloud/mcp/config` | cloud user | What *Connect an agent* shows: the MCP address, the issuer, whether API keys are accepted, the links, and the user's own auto-approval rules that still count. |
+| JSON | `/cloud/mcp/get_settings`, `/cloud/mcp/save_settings` | manage settings | The agents' issuer, the MCP address and the agents' limit; read-only where the platform sets them. |
+| JSON | `/cloud/mcp/auto_approval/list` | cloud user | Auto-approval rules: every rule for an Administrator, the user's own otherwise; whether the panel allows them, the notice's version and the periods. |
+| JSON | `/cloud/mcp/auto_approval/candidates` | manage settings | The users a rule may be granted to, with their credentials that connected (and the assistant). |
+| JSON | `/cloud/mcp/auto_approval/grant` | manage settings | Grant a rule (`user_id`, `credential`, `days`, `expires_on` or `no_expiry`, `acknowledged`, `notice_version`, `include_charges`); no longest period, and no end date with `no_expiry`. `{ok, rule}` or `{ok: false, error}`. |
+| JSON | `/cloud/mcp/auto_approval/revoke` | manage settings, or the rule's user | End a rule now (`rule_id`). |
+| JSON | `/cloud/mcp/auto_approval/activity` | manage settings, or the rule's user | A page of the audit rows of a rule (`rule_id`, `offset`, `limit` ≤ 100), newest first. |
+
+Every `/cloud/mcp/auto_approval/*` route refuses a request that carries an
+agent's mark (the MCP endpoint's or the assistant's), and no tool calls them.
+
+## Assistant (`incubacloud_assistant`)
+
+The assistant's chat and its settings, for the panel's own pages; the MCP excludes all of them (see [`assistant.md`](assistant.md)). All JSON-RPC, `auth="user"`. *Allowed to use the assistant*: it is on, with a key and a default model, section 12A accepted, and the user among those a manager chose. *Own*: the record belongs to the user (a record rule, also for managers); it works while the assistant is off, so a user can read and delete what they have until it expires.
+
+| Method | Path | Gate | Description |
+|---|---|---|---|
+| JSON | `/cloud/assistant/status` | cloud user | Whether the assistant is on for the user; if so the provider, the month's usage and limit, unread conversations and the allowed models (with whether each is usable); if not, how many conversations they still have. |
+| JSON | `/cloud/assistant/accept_notice` | allowed to use the assistant | The user read the first-use notice. |
+| JSON | `/cloud/assistant/conversations` | own | The conversations of the last 30 days, latest first. |
+| JSON | `/cloud/assistant/conversation` | own | One conversation and its messages; marks it read and heals a step that was lost. |
+| JSON | `/cloud/assistant/send` | allowed to use the assistant | Write in a new or an existing conversation (20 a minute per user; the notice must have been accepted). |
+| JSON | `/cloud/assistant/set_model` | allowed to use the assistant | Change the conversation's model among the allowed, usable ones. |
+| JSON | `/cloud/assistant/stop` | own | Stop the task at once if nothing runs, else at the next step's check. |
+| JSON | `/cloud/assistant/retry` | allowed to use the assistant | Go on after an error or a stop. |
+| JSON | `/cloud/assistant/confirm` | allowed to use the assistant, own | Confirm a card. Refused for any request that carries an agent's mark. |
+| JSON | `/cloud/assistant/cancel` | allowed to use the assistant, own | Cancel a card; the model is told. |
+| JSON | `/cloud/assistant/delete` | own | Stop and delete a conversation. |
+| JSON | `/cloud/assistant/get_settings` | manage settings | Provider, whether a key is set (never the key), the provider's models with their tags, the allowed and default models, the users and the chosen ones, the limits, why the assistant is blocked on this database, and the last acceptance of section 12A. |
+| JSON | `/cloud/assistant/save_settings` | manage settings | Save what changed, every value checked. A new key is tried against the provider's listing first; switching on needs a key, models, and `accept_ai_terms: true`. |
+| JSON | `/cloud/assistant/refresh_models` | manage settings | Read the provider's models again with the key kept. |
+| JSON | `/cloud/assistant/usage` | manage settings | Each user's tokens and approximate cost per month (up to 24 months). |
+
+## Static pages and public HTTP endpoints
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/cloud`, `/cloud/<path>` | user | SPA shell (OWL app); deep links land on the same handler. |
+| GET | `/cloud/log/<job_id>` | user | Job log terminal page. Live chunks over **WebSocket**, with a 10 s HTTP polling fallback. |
+| GET | `/cloud/log/<job_id>/download` | user | Download the job log as a `.log` file. |
+| GET | `/cloud/instance/<id>/logs` | user (view logs) | Container log viewer (polls `/cloud/fetch_container_logs` every 4 s). |
+| POST | `/cloud/instance/<id>/restore` | user (manage backups) | Upload a backup ZIP (≤ 2 GiB) and enqueue restore. Rate-limited. |
+| GET | `/cloud/terminal/<sid>` | user (owner) | xterm.js terminal page. |
+| GET | `/cloud/health` | **public** | DB liveness probe → 200/503 (429 when rate-limited). |
+| POST | `/cloud/gitlab/webhook/<hook_key>` | **public** | GitLab webhook receiver. Per-IP limit (the GitHub bucket, counted at READ COMMITTED), 8 MB, `X-Gitlab-Token` compared in constant time before the body is read (401), duplicates by `Idempotency-Key` and by push answered 200. Every answer after the token is 200, a failed dispatch included. Push and merge request events (previews); tag pushes only count as deliveries. |
+| POST | `/cloud/github/webhook` | **public** | GitHub App webhook receiver. HMAC-SHA256 signature required, per-IP rate limit, replay protection by delivery id. |
+| GET | `/_odoo.sh/ip-change` | **public**, Odoo.sh only | Odoo.sh's notice that the panel's outgoing address changed (`old`, `new`). Answers only where `ODOO_STAGE` is `production`, 404 elsewhere; Odoo.sh's platform answers 403 to any other caller. Raises `panel_address_changed` with the hosts whose SSH list does not admit the new address (a `new` that is not a public address counts as unknown) and changes no host; the same notice again is ignored ([RB-41](runbooks/RB-41-panel-address-change.md)). `ok`, or 400 when `old` is not an address. |
+| GET | `/cloud/github/setup` | user (manage settings) | Start GitHub App creation via manifest flow. |
+| GET | `/cloud/github/callback` | user (manage settings) | Exchange the manifest code for credentials (state token, 10 min TTL). |
+
+All SPA/log/terminal pages additionally require an **internal** user (portal/public users get 404).
+
+## Rate limiting
+
+DB-backed tumbling counters (`cloud.rate.limit`), 60-second windows, atomic upserts. The admin-tunable caps live in Settings → Rates:
+
+| Endpoint | Scope | Default | Tunable |
+|---|---|---|---|
+| `POST /cloud/instance/<id>/restore` | per user | 2/min | no |
+| `GET /cloud/health` | per IP | 60/min | no |
+| `POST /cloud/github/webhook` | per IP | 300/min | yes |
+| `POST /cloud/gitlab/webhook/<hook_key>` | per IP (same bucket) | 300/min | yes; a 429 is a lost delivery, GitLab does not retry |
+| `/cloud/terminal/open` | per user | 10/min | yes |
+| `/cloud/terminal/open` | per instance | 30/min | yes |
+| `POST /mcp` (failed authentications) | per IP (IPv6 /64) | 60/min; refused only where trusted proxies are declared, else logged | no |
+| `POST /mcp` (tool calls of all of a user's agents) | per user | 120/min | yes |
+| Reads of a Git provider's repository (`get_repo_branches`, `get_branch_head`, `get_repo_modules`, `get_repo_requirements`, freeze) | per user | 120/hour | yes |
+
+Exceeding a limit returns HTTP 429 (HTTP endpoints, webhook adds `Retry-After: 60`) or `{ok: false, error}` (JSON-RPC). Over the agents' limit, a tool call answers an MCP error result (`isError`); over the failed authentications, `/mcp` answers 429 with `Retry-After: 60`. `run_command` also counts in the terminal's buckets, and `run_host_command` in the host console's.
+
+## Error handling
+
+Application errors use a consistent envelope:
+
+```json
+{"ok": false, "error": "Human-readable error message"}
+```
+
+Unexpected exceptions are logged with a correlation id and returned as `"<message> (ref: <id>)"`; `UserError`/`ValidationError`/`AccessError` messages pass through verbatim.
+
+Gated create/deploy flows can return a **blocked** envelope instead:
+
+```json
+{"blocked": true, "reason": "pip_conflict", "message": "..."}
+```
+
+Success responses are **not** uniformly wrapped: mutating endpoints generally return `{"ok": true, ...}`, while read endpoints return bare data objects or lists (e.g. `get_projects` → `{items, total, truncated, limit}`, `get_secret` → `{value}`).
+
+Plain-HTTP endpoints use real status codes instead of the JSON-RPC envelope: the restore upload returns `{"error": ...}` with 400/403/404/429/500 or `{"job_id": ...}` on success; `/cloud/health` returns `{"status": "ok"|"down"|"rate_limited"}`; the GitHub webhook responds with plain text.

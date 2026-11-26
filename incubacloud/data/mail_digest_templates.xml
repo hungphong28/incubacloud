@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!--
+        Daily digest email body. Rendered by
+        ``res.users._send_cloud_digest_for`` with pre-formatted plain
+        dicts (no ORM access from the template), then put in the company
+        layout (``mail_layout``), which brings logo, frame and footer.
+        Inline styles only — email clients ignore stylesheets. The
+        accent is the company's (``accent``); red and amber are the
+        semantic colours used across the console.
+    -->
+    <template id="mail_cloud_digest" name="IncubaCloud: daily digest email">
+                <div>
+                    <h1 style="margin:0;font-size:18px;color:#0e1512;">Daily cloud digest</h1>
+                    <p style="margin:4px 0 18px;font-size:12px;color:#5a6661;">
+                        <t t-out="period_start"/> → <t t-out="period_end"/>
+                    </p>
+                    <t t-if="failed_jobs">
+                        <h2 style="font-size:14px;margin:0 0 8px;color:#c0393c;">
+                            Failed jobs (<t t-out="failed_count"/>)
+                        </h2>
+                        <table style="width:100%;border-collapse:collapse;margin-bottom:18px;">
+                            <t t-foreach="failed_jobs" t-as="row">
+                                <tr style="border-bottom:1px solid #dde6df;">
+                                    <td style="padding:6px 8px 6px 0;font-size:13px;">
+                                        <strong t-out="row['name']"/><br/>
+                                        <span style="color:#5a6661;font-size:12px;" t-out="row['target']"/>
+                                    </td>
+                                    <td style="padding:6px 8px;font-size:12px;color:#5a6661;white-space:nowrap;" t-out="row['when']"/>
+                                    <td style="padding:6px 0;text-align:right;">
+                                        <a t-att-href="row['url']" t-att-style="'color:%s;font-size:12px;' % accent">Log →</a>
+                                    </td>
+                                </tr>
+                            </t>
+                        </table>
+                    </t>
+                    <t t-if="done_jobs">
+                        <h2 t-att-style="'font-size:14px;margin:0 0 8px;color:%s;' % accent">
+                            Completed jobs (<t t-out="done_count"/>)
+                        </h2>
+                        <table style="width:100%;border-collapse:collapse;margin-bottom:18px;">
+                            <t t-foreach="done_jobs" t-as="row">
+                                <tr style="border-bottom:1px solid #dde6df;">
+                                    <td style="padding:6px 8px 6px 0;font-size:13px;">
+                                        <strong t-out="row['name']"/><br/>
+                                        <span style="color:#5a6661;font-size:12px;" t-out="row['target']"/>
+                                    </td>
+                                    <td style="padding:6px 8px;font-size:12px;color:#5a6661;white-space:nowrap;" t-out="row['when']"/>
+                                    <td style="padding:6px 0;text-align:right;">
+                                        <a t-att-href="row['url']" t-att-style="'color:%s;font-size:12px;' % accent">Log →</a>
+                                    </td>
+                                </tr>
+                            </t>
+                        </table>
+                    </t>
+                    <t t-if="alerts">
+                        <h2 style="font-size:14px;margin:0 0 8px;color:#865602;">
+                            New alerts (<t t-out="alert_count"/>)
+                        </h2>
+                        <table style="width:100%;border-collapse:collapse;margin-bottom:18px;">
+                            <t t-foreach="alerts" t-as="row">
+                                <tr style="border-bottom:1px solid #dde6df;">
+                                    <td style="padding:6px 8px 6px 0;white-space:nowrap;vertical-align:top;">
+                                        <t t-if="row['level'] == 'critical'">
+                                            <span style="background:#fdecec;color:#c0393c;font-size:11px;padding:2px 8px;border-radius:10px;">critical</span>
+                                        </t>
+                                        <t t-else="">
+                                            <span style="background:#fbf2df;color:#865602;font-size:11px;padding:2px 8px;border-radius:10px;">warning</span>
+                                        </t>
+                                    </td>
+                                    <td style="padding:6px 8px;font-size:13px;">
+                                        <t t-out="row['message']"/><br/>
+                                        <span style="color:#5a6661;font-size:12px;" t-out="row['target']"/>
+                                    </td>
+                                    <td style="padding:6px 0;font-size:12px;color:#5a6661;white-space:nowrap;text-align:right;" t-out="row['when']"/>
+                                </tr>
+                            </t>
+                        </table>
+                    </t>
+                    <p style="margin:16px 0 0;font-size:12px;color:#5a6661;">
+                        You receive this summary because your delivery preference
+                        is set to <strong>Daily digest</strong>. Severe failures
+                        are still emailed immediately. Manage preferences from
+                        your <a t-att-href="console_url" t-att-style="'color:%s;' % accent">cloud console</a>.
+                    </p>
+                </div>
+    </template>
+</odoo>

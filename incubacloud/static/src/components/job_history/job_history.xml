@@ -1,0 +1,315 @@
+<templates>
+<t t-name="incubacloud.JobHistory">
+<div class="ic-job-history">
+
+    <!-- ── Page header ── -->
+    <t t-if="!props.embedded">
+        <div class="rl-phead">
+            <div class="rl-htext">
+                <h1 class="rl-ptitle">Job History</h1>
+            </div>
+            <div class="rl-pactions">
+                <button class="rl-btn rl-btn-ghost" t-on-click="loadHistory">
+                    <t t-out="env.icon('refresh', 15)"/> Refresh
+                </button>
+            </div>
+        </div>
+    </t>
+
+    <!-- ── Alert context banner ── -->
+    <t t-if="state.alertMode">
+        <div class="rl-sevban info">
+            <span class="rl-si2"><t t-out="env.icon('clock', 18)"/></span>
+            <div>
+                <div class="rl-at">Showing job linked to alert</div>
+                <button class="jh-link" t-on-click="clearAlertMode">Show all jobs</button>
+            </div>
+        </div>
+    </t>
+
+
+    <!-- ── Filters ──
+         One row: the category, always on view, and the toggles that open
+         the rest of the filters and the timeline. -->
+    <div t-att-class="'jh-filters' + (state.alertMode ? ' jh-filters-hidden' : '')">
+        <div class="jh-bar">
+            <div class="jh-filter-group">
+                <span class="jh-filter-label">Category</span>
+                <div class="jh-chips">
+                    <button t-att-class="'jh-chip' + (state.filter.job_category === 'operational' ? ' active' : '')"
+                            t-on-click="() => this.setCategory('operational')">Operational</button>
+                    <button t-att-class="'jh-chip' + (state.filter.job_category === 'admin' ? ' active' : '')"
+                            t-on-click="() => this.setCategory('admin')">Admin</button>
+                    <button t-att-class="'jh-chip' + (state.filter.job_category === 'all' ? ' active' : '')"
+                            t-on-click="() => this.setCategory('all')">All</button>
+                </div>
+            </div>
+            <div class="jh-bar-toggles">
+                <button type="button" class="jh-fold jh-fold-filters"
+                        t-att-aria-expanded="state.filtersOpen ? 'true' : 'false'"
+                        t-on-click="toggleFilters">
+                    <t t-esc="filtersLabel"/>
+                    <span class="jh-fold-caret" aria-hidden="true"><t t-if="state.filtersOpen">▴</t><t t-else="">▾</t></span>
+                </button>
+                <button type="button" class="jh-fold jh-fold-gantt"
+                        t-att-aria-expanded="state.ganttOpen ? 'true' : 'false'"
+                        t-on-click="toggleGantt">
+                    Timeline <t t-esc="ganttWindowLabel"/>
+                    <span class="jh-fold-caret" aria-hidden="true"><t t-if="state.ganttOpen">▴</t><t t-else="">▾</t></span>
+                </button>
+            </div>
+        </div>
+
+        <t t-if="state.filtersOpen">
+            <div class="jh-filters-body">
+
+                <!-- State chips -->
+                <div class="jh-filter-group">
+                    <span class="jh-filter-label">State</span>
+                    <div class="jh-chips">
+                        <t t-foreach="allStateKeys" t-as="s" t-key="s">
+                            <button
+                                t-att-class="'jh-chip jh-chip-' + s + (state.filter.states.includes(s) ? ' active' : '')"
+                                t-on-click="() => this.toggleState(s)">
+                                <t t-esc="stateLabel(s)"/>
+                            </button>
+                        </t>
+                    </div>
+                </div>
+
+                <!-- Host + Instance + User -->
+                <div class="jh-filter-row">
+                    <div class="jh-filter-group jh-filter-group-search">
+                        <span class="jh-filter-label">Host</span>
+                        <SearchSelect options="hostOptions"
+                                      value="state.filter.host_id"
+                                      onChange.bind="setHost"
+                                      placeholder.translate="All hosts"
+                                      emptyLabel.translate="All hosts"/>
+                    </div>
+
+                    <div class="jh-filter-group jh-filter-group-search">
+                        <span class="jh-filter-label">Instance</span>
+                        <SearchSelect options="instanceOptions"
+                                      value="state.filter.instance_id"
+                                      onChange.bind="setInstance"
+                                      placeholder.translate="All instances"
+                                      emptyLabel.translate="All instances"/>
+                    </div>
+
+                    <div class="jh-filter-group jh-filter-group-search" t-if="state.users.length > 1">
+                        <span class="jh-filter-label">User</span>
+                        <SearchSelect options="userOptions"
+                                      value="state.filter.user_id"
+                                      onChange.bind="setUser"
+                                      placeholder.translate="All users"
+                                      emptyLabel.translate="All users"/>
+                    </div>
+                </div>
+
+                <!-- Dates -->
+                <div class="jh-filter-row">
+                    <div class="jh-filter-group">
+                        <span class="jh-filter-label">From</span>
+                        <input type="datetime-local" class="jh-filter-input"
+                               t-att-value="state.filter.date_from"
+                               t-on-change="onDateFromChange"/>
+                    </div>
+
+                    <div class="jh-filter-group">
+                        <span class="jh-filter-label">To</span>
+                        <input type="datetime-local" class="jh-filter-input"
+                               t-att-value="state.filter.date_to"
+                               t-on-change="onDateToChange"/>
+                    </div>
+
+                    <div class="jh-filter-actions">
+                        <button class="rl-btn rl-btn-primary rl-btn-sm" t-on-click="applyFilter">Apply</button>
+                        <button class="rl-btn rl-btn-ghost rl-btn-sm" t-on-click="resetFilter">Reset</button>
+                    </div>
+                </div>
+            </div>
+        </t>
+    </div>
+
+    <!-- ── Loading ── -->
+    <t t-if="state.loading">
+        <div class="ic-skeleton-list" style="padding: 16px 0;">
+            <t t-foreach="[1,2,3,4,5]" t-as="i" t-key="i">
+                <div class="ic-skeleton-row" style="padding: 8px 0;">
+                    <div class="ic-skeleton-label" style="width: 160px;"/>
+                    <div class="ic-skeleton-value" style="width: 80px;"/>
+                    <div class="ic-skeleton-value" style="width: 60px;"/>
+                </div>
+            </t>
+        </div>
+    </t>
+
+    <t t-else="">
+
+        <!-- ── Gantt ── -->
+        <div t-if="state.ganttOpen" class="rl-card jh-gantt">
+            <div class="jh-gantt-head">
+                <span class="rl-tlh">Timeline</span>
+                <div class="jh-gantt-wins">
+                    <button t-att-class="'jh-win' + (state.ganttHours === 1 ? ' active' : '')"
+                            t-on-click="() => this.setGanttWindow(1)">1h</button>
+                    <button t-att-class="'jh-win' + (state.ganttHours === 6 ? ' active' : '')"
+                            t-on-click="() => this.setGanttWindow(6)">6h</button>
+                    <button t-att-class="'jh-win' + (state.ganttHours === 24 ? ' active' : '')"
+                            t-on-click="() => this.setGanttWindow(24)">24h</button>
+                    <button t-att-class="'jh-win' + (state.ganttHours === 168 ? ' active' : '')"
+                            t-on-click="() => this.setGanttWindow(168)">7d</button>
+                </div>
+            </div>
+
+            <t t-if="!ganttJobs.length">
+                <div class="rl-stub">
+                    <span class="rl-si"><i class="fa fa-calendar-o"/></span>
+                    <h3>No jobs in this time window</h3>
+                    <p>Try expanding the time range or adjusting filters.</p>
+                    <button class="rl-btn rl-btn-ghost rl-btn-sm" style="margin-top:12px;"
+                            t-on-click="() => this.setGanttWindow(168)">
+                        <i class="fa fa-expand"/> Show last 7 days
+                    </button>
+                </div>
+            </t>
+            <t t-else="">
+                <!-- X-axis ticks -->
+                <div class="jh-gantt-axis">
+                    <div class="jh-gantt-label-col"/>
+                    <div class="jh-gantt-track-col" t-ref="ganttAxis">
+                        <t t-foreach="ganttTicks" t-as="tick" t-key="tick.pct">
+                            <span class="jh-gantt-tick"
+                                  t-att-style="'left:' + tick.pct + '%'">
+                                <t t-esc="tick.label"/>
+                            </span>
+                        </t>
+                    </div>
+                </div>
+
+                <!-- Rows -->
+                <div class="jh-gantt-body">
+                    <t t-foreach="ganttJobs" t-as="job" t-key="job.id">
+                        <div class="jh-gantt-row">
+                            <div class="jh-gantt-label" t-att-title="job.name + ' · ' + job.host">
+                                <span t-att-class="'rl-tl-dot ' + ganttDotClass(job.state, job.stopping)"/>
+                                <div class="jh-gantt-label-lines">
+                                    <span class="jh-gantt-label-name" t-esc="job.name"/>
+                                    <t t-if="job.trigger === 'webhook'">
+                                        <span class="jh-gantt-label-trigger">
+                                            <i class="fa fa-github"/>
+                                            <t t-esc="job.push_sha"/>
+                                            <t t-esc="job.push_message"/>
+                                        </span>
+                                    </t>
+                                    <span class="jh-gantt-label-host">
+                                        <t t-if="job.instance_name" t-esc="job.instance_name + ' · '"/>
+                                        <t t-esc="job.host"/>
+                                    </span>
+                                </div>
+                            </div>
+                            <div class="jh-gantt-track">
+                                <div t-att-class="'jh-gantt-bar jh-gantt-state-' + job.state"
+                                     t-att-style="'left:' + job.ganttLeft.toFixed(2) + '%;width:' + job.ganttWidth.toFixed(2) + '%'"
+                                     t-att-title="stateLabel(job.state) + ' · ' + formatDuration(job.duration_s)"
+                                     t-on-click="() => this.openLog(job)"/>
+                            </div>
+                        </div>
+                    </t>
+                </div>
+            </t>
+        </div>
+
+        <!-- ── Pre-handover notice ── -->
+        <t t-if="state.preClaim">
+            <div class="jh-preclaim">
+                <span class="jh-preclaim-icon"><i class="fa fa-history"/></span>
+                <t t-if="state.preClaim.showing_all">
+                    <span>
+                        Showing <t t-esc="state.preClaim.hidden"/> job<t t-if="state.preClaim.hidden !== 1">s</t>
+                        logged before this instance was handed over on
+                        <t t-esc="formatDate(state.preClaim.since)"/>.
+                    </span>
+                    <button class="rl-btn rl-btn-ghost rl-btn-sm" t-on-click="() => this.togglePreClaim()">
+                        Hide earlier history
+                    </button>
+                </t>
+                <t t-else="">
+                    <span>
+                        <t t-esc="state.preClaim.hidden"/> earlier job<t t-if="state.preClaim.hidden !== 1">s</t>
+                        hidden — logged before this instance was handed over on
+                        <t t-esc="formatDate(state.preClaim.since)"/>.
+                    </span>
+                    <button class="rl-btn rl-btn-ghost rl-btn-sm" t-on-click="() => this.togglePreClaim()">
+                        Show earlier history
+                    </button>
+                </t>
+            </div>
+        </t>
+
+        <!-- ── Table ── -->
+        <div class="rl-card jh-table-wrap">
+            <t t-if="!state.jobs.length">
+                <div class="rl-stub">
+                    <span class="rl-si"><i class="fa fa-search"/></span>
+                    <h3>No jobs found</h3>
+                    <p>No jobs match the current filters. Try resetting or broadening your criteria.</p>
+                    <button class="rl-btn rl-btn-ghost rl-btn-sm" style="margin-top:12px;"
+                            t-on-click="() => this.resetFilters()">
+                        <t t-out="env.icon('x', 15)"/> Reset filters
+                    </button>
+                </div>
+            </t>
+            <t t-else="">
+                <table class="rl-table jh-table rl-table--jobs">
+                    <thead>
+                        <tr>
+                            <th>State</th>
+                            <th>Job</th>
+                            <th>Instance</th>
+                            <th>Host</th>
+                            <th>User</th>
+                            <th>Date</th>
+                            <th>Duration</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <t t-foreach="state.jobs" t-as="job" t-key="job.id">
+                            <tr class="click"
+                                title="Click to view log"
+                                t-att-data-job-id="job.id"
+                                t-on-click="() => this.openLog(job)">
+                                <td>
+                                    <span t-att-class="'rl-pill rl-pill--bare rl-pill--job ' + ganttDotClass(job.state, job.stopping)">
+                                        <span class="rl-d"/>
+                                        <t t-esc="rowStateText(job)"/>
+                                    </span>
+                                </td>
+                                <td class="jh-col-name">
+                                    <t t-esc="job.name"/>
+                                    <t t-if="job.trigger === 'webhook'">
+                                        <span class="jh-col-trigger"><i class="fa fa-github"/> <t t-esc="job.push_sha"/> <t t-esc="job.push_message"/></span>
+                                    </t>
+                                </td>
+                                <td t-att-class="'jh-col-inst' + (job.instance_name ? '' : ' jh-col-none')"
+                                    t-esc="instanceText(job)"/>
+                                <td class="rl-mono" t-esc="job.host"/>
+                                <td t-esc="job.user_name || '—'"/>
+                                <td class="rl-mono jh-col-date" t-esc="formatDate(job.create_date)"/>
+                                <td class="rl-mono jh-col-dur">
+                                    <span t-esc="formatDuration(job.duration_s)"/>
+                                    <span class="jh-log-hint"><t t-out="env.icon('terminal', 14)"/> Log</span>
+                                </td>
+                            </tr>
+                        </t>
+                    </tbody>
+                </table>
+            </t>
+        </div>
+
+    </t>
+
+</div>
+</t>
+</templates>

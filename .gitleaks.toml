@@ -1,0 +1,85 @@
+# gitleaks config — tuned to match this repo's layout.
+#
+# Extends the upstream default ruleset and adds narrow allowlists for
+# intentional matches:
+#   - Test fixtures that embed sample RSA keys.
+#   - Translation files and UI placeholders that carry the
+#     "BEGIN PRIVATE KEY" marker as part of instructional copy.
+#   - One historical commit where a short-lived dev fallback key lived
+#     in password_utils.py before the mandatory-env-var rollout.
+#
+# When adding a new allowlist entry, prefer ``paths`` (narrow, stable)
+# over ``commits`` (rewrites break the allowlist).
+#
+# NOTE: gitleaks 8.x expects a single ``[allowlist]`` table here —
+# ``[[allowlists]]`` (plural) is silently ignored by the global
+# allowlist loader, which is why the first version of this file let
+# all five false positives through.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known-safe false positives: test fixtures, translations, UI placeholders, and one historical dev-only fallback key."
+paths = [
+    # Tier-2 test: uses the string ``fakekey...`` as a PEM body to
+    # exercise the GitHub App credential parser. No real key.
+    '''incubacloud/tests/test_cloud_github_app\.py''',
+    # Tier-2 test for the encrypted private_key field: needs a
+    # multi-line PEM-shaped literal to prove newlines survive the
+    # round trip through Fernet. No real key.
+    '''incubacloud/tests/test_encrypted_private_key\.py''',
+    # Translations quote help text and error messages that include the
+    # literal ``-----BEGIN PRIVATE KEY-----`` marker.
+    '''incubacloud/i18n/.*\.po''',
+    '''incubacloud/i18n/.*\.pot''',
+    # Tier-2 test for the host's default TLS certificate: the fixture
+    # needs a PEM-shaped literal to prove the key is encrypted at rest
+    # and never reaches the drift snapshot. No real key.
+    '''incubacloud/tests/test_behind_cdn\.py''',
+    # Tier-2 test for the CDN client-certificate authority: a PEM-shaped
+    # ``PRIVATE KEY`` literal proves a key pasted along with the
+    # authority is refused. No real key.
+    '''incubacloud/tests/test_cdn_client_auth\.py''',
+    # Tests of what agents never see (incubacloud_mcp): made-up secrets
+    # of every shape the masking must catch — PEM-shaped key literals, a
+    # GitHub App key line, a netrc password in a ``curl -u`` line, an
+    # OIDC client secret — prove each is found and masked. No real key.
+    '''incubacloud_mcp/tests/common\.py''',
+    '''incubacloud_mcp/tests/test_secrets\.py''',
+    '''incubacloud_mcp/tests/test_protocol_redact_limits\.py''',
+    # Test of the agents' issuer key cache: a made-up, unsigned JWT
+    # whose header names a key id. No real token.
+    '''incubacloud_mcp/tests/test_jwks_cache\.py''',
+    # Tests of the Git providers (GitLab): made-up access tokens of the
+    # shapes GitLab issues, so the credential forms, their introspection
+    # and the masking of saved tokens are exercised. No real token.
+    '''incubacloud/tests/test_git_provider\.py''',
+    '''incubacloud/tests/test_git_provider_routes\.py''',
+    # Settings form textarea ``placeholder=""`` attribute showing the
+    # expected PEM shape.
+    '''incubacloud/static/src/components/settings/settings\.xml''',
+    # CI workflow pins a CI-only Fernet key so the password_utils
+    # module can boot in the test container. Not a production secret.
+    '''\.github/workflows/ci\.yml''',
+    # Test of the security board's known keys: a made-up ``PRIVATE KEY``
+    # literal proves a private key pasted as a known key is refused and
+    # never echoed back. No real key.
+    '''incubacloud/tests/test_security_board\.py''',
+]
+# Tests of the GitLab providers: made-up deploy and access tokens prove a
+# credential is chosen, sent only to its server and kept out of the
+# audit, the build and the logs. Allowed by their own text, not by file,
+# so a real token pasted in those tests is still caught. Each is ``gldt-`` or ``glpat-`` and a word
+# no generated token has; a new made-up token in a test is added here.
+regexes = [
+    '''^gldt-(?:AbC_123\.x|abcdefgh12|deploy1234|deploysave1|mcpread01|supersecret12|tokenOfTheDeploy)$''',
+    '''^glpat-(?:0123456789abcdef|abcdefgh|abcdefgh12|capped1234|groupsave1|hostimport1|othersecret99|readonly12|routes12|secret-token-123|supersecret12|supersecret99|warnsave1)$''',
+]
+commits = [
+    # password_utils.py historically contained a base64 dev fallback
+    # key (``development-key-do-not-use``). It was removed before
+    # production; the commit stays in history, flagged by gitleaks as
+    # ``generic-api-key`` on the string literal.
+    "5b13bd664b8dc55a0bae36bf8b2f8dcb801ebd65",
+]

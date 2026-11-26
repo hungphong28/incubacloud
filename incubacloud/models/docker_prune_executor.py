@@ -1,0 +1,1007 @@
+import contextlib
+import re
+import shlex
+
+from ..restore_space import GIB, RESERVE_BYTES, STAGING_ROOT, in_gib
+from .abstract_executor import (
+    DETACHED_GIVE_UP_AFTER_CAP_S,
+    DETACHED_PREFIX,
+    HANDOFF_SWEEP,
+    JOB_DIR_PREFIX,
+    detached_dir,
+    handoff_sweep,
+)
+from .ansible_executor import AnsibleExecutor
+from .cloud_restore_upload_grant import (
+    LEGACY_UPLOAD_ROOT,
+    UPLOAD_ROOT,
+    USED_GRANT_DAYS,
+)
+from .host_probe_executor import MIN_DISK_GB
+
+# Docker label that opts a resource out of the prune. Stamped by
+# ``DeployInstanceExecutor._resource_override_content`` on every
+# panel-deployed service, because any of them may legitimately sit
+# stopped (one deployed ahead of being handed over, a
+# Sablier-slept instance, a manually stopped one) and an unlabelled stopped container *matches*
+# the ``label!=`` filter below. Defined here because the playbook this
+# executor drives is what acts on it.
+#
+# The project's network is NOT labelled and NOT pruned — see the play's
+# own comment, and ``_resource_override_content`` for why labelling it
+# is worse than the disease.
+PROTECT_LABEL = "incubacloud.protect=1"
+
+#: Free space, in GB, on the disk Docker keeps its images and build cache
+#: on, under which a deploy or a rebuild first empties the build cache
+#: and the unused images (``build_cache_prune_if_low``): a build that runs
+#: out of disk fails half-way, and the daily prune may be most of a day
+#: away. The single place to change it. The Check's own figure
+#: (``MIN_DISK_GB``, 10 GB), not lower: under it the Check marks the host
+#: degraded with ``host_low_disk``, and a build that left the cache full
+#: between 8 and 10 GB kept the host there until the daily prune
+#: (8 GB until 9-nov-2026).
+BUILD_CACHE_MIN_FREE_GB = MIN_DISK_GB
+
+#: How recent what a job's cleanup keeps is: the build cache used and the
+#: images made within it. A delete or a rebuild holds the host's build lock
+#: (``HostBuildLockMixin``), but a deploy holds none (its «Build Odoo
+#: image» builds without it), so the cleanup of one may run while the
+#: other builds: the cache that build is filling, and the image it has
+#: just built and not started yet, are that recent.
+BUILD_CACHE_KEEP = "1h"
+
+#: The cleanup the daily prune does for disk, without the containers:
+#: the build cache, and the images no container uses, the labelled ones
+#: spared (see ``PROTECT_LABEL``), what is more recent than
+#: ``BUILD_CACHE_KEEP`` spared too. An image is dated by when it was built,
+#: so one a deploy has just pulled may go before its stack starts: its
+#: ``docker compose up`` pulls it again. Never ``docker system prune``,
+#: which takes networks too (see the playbook).
+_CACHE_PRUNE = (
+    f'docker builder prune -af --filter "until={BUILD_CACHE_KEEP}"; '
+    f'docker image prune -af --filter "label!={PROTECT_LABEL}"'
+    f' --filter "until={BUILD_CACHE_KEEP}"'
+)
+
+
+#: What a build that took its repositories from the host leaves in Docker's
+#: build cache besides its layers: its context, the trees included, which
+#: BuildKit copies and keeps per directory until the daily prune (about
+#: 1.2 GB per 19.0 instance; a host with 25 instances rebuilt in one
+#: night would take some 30 GB, measured 10-nov-2026). Only the contexts
+#: no build is using; the layers stay, their cache keyed by content, and
+#: the next build of each instance sends its context whole again, a local
+#: copy.
+#: ``--all`` only because the filter already keeps everything but the
+#: contexts out of it.
+_CONTEXT_PRUNE = "docker builder prune -af --filter type=source.local"
+
+
+def build_context_prune():
+    """The command that removes the build contexts Docker keeps unused.
+
+    For the end of a build whose context holds the repositories' trees
+    (``deploy.sh fetch-repos``). It never fails, for the reason
+    ``build_cache_prune`` gives.
+
+    :return: the shell command, which always exits 0
+    :rtype: str
+    """
+    return f"{{ {_CONTEXT_PRUNE}; }} 2>&1 || true"
+
+
+def build_cache_prune():
+    """The command that empties Docker's build cache and unused images.
+
+    For a step that frees what an instance leaves behind (its image, the
+    cache its builds filled) when it is deleted. It never fails: a
+    cleanup that could not run must not fail the job that asked for it,
+    and the daily prune tries again.
+
+    :return: the shell command, which always exits 0
+    :rtype: str
+    """
+    return f"{{ {_CACHE_PRUNE}; }} 2>&1 || true"
+
+
+def build_cache_prune_if_low(min_free_gb=BUILD_CACHE_MIN_FREE_GB):
+    """The command that runs ``build_cache_prune`` when the disk is low.
+
+    Reads, on the host, the free space of the disk Docker's data lives on
+    (``DockerRootDir``, ``/var/lib/docker`` when it cannot be read), and
+    empties the cache and unused images only under *min_free_gb*. A free
+    space it cannot read leaves everything as it is. It never fails, for
+    the reason ``build_cache_prune`` gives.
+
+    :param int min_free_gb: the threshold, in GB
+    :return: the shell command, which always exits 0
+    :rtype: str
+    """
+    need_kb = int(min_free_gb) * 1024 * 1024
+    return (
+        "{ root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null);"
+        ' free=$(df -Pk "${root:-/var/lib/docker}" 2>/dev/null'
+        " | awk 'NR==2 {print $4}');"
+        ' if [ -z "$free" ]; then echo "Free disk unknown: the build cache is left as it is.";'
+        f' elif [ "$free" -lt {need_kb} ]; then'
+        f' echo "Free disk $((free / 1048576)) GB, under {int(min_free_gb)} GB:'
+        ' emptying the build cache and the unused images.";'
+        f" {_CACHE_PRUNE};"
+        f' else echo "Free disk $((free / 1048576)) GB: the build cache stays."; fi; }}'
+        " 2>&1 || true"
+    )
+
+
+#: What the build cache keeps when ``after_build_prune`` caps it, a
+#: BuildKit size. 5 GB (16-nov-2026): more than one build writes, so what
+#: a deploy building beside it has just written (the most recent records,
+#: kept first) stays; the space a rebuild leaves behind is mostly the
+#: previous image, which the same step removes.
+BUILD_CACHE_RESERVED = "5GB"
+
+#: What an instance's image is taken to weigh when there is none to read
+#: (a first deploy), in GiB, for ``build_room_needed``. Measured on
+#: 16-nov-2026, Docker 29.10: a Doodba image of 18.0 or 19.0 weighs
+#: 3.1-3.2 GiB in the overlay2 image store and 4.5-4.7 GiB in containerd's,
+#: the default of a new Docker 29. 4 keeps a first deploy's need (9 GiB with
+#: the reserve) under the 10 GB of the Check (``host_probe_executor.MIN_DISK_GB``),
+#: so a compatible server is not refused. A first build on a server that
+#: lacks the Doodba base image too writes more (8.1-8.5 GiB in containerd,
+#: 3.6-3.7 GiB in overlay2): the reserve takes the difference on a server
+#: chosen by hand, and the 14 GB the automatic placement asks
+#: (``cloud.host._MIN_DISK_FREE_GB``, since 17-nov-2026) leave it whole.
+BUILD_IMAGE_ESTIMATE_GB = 4
+
+#: What a build writes, as a multiple of the image it rebuilds: the peak of
+#: the disk's use while it runs against the size ``docker image inspect``
+#: gives of the previous image. Applied to the image, never to the reserve.
+#: Measured on 16-nov-2026, Docker 29.10, a rebuild of 18.0 and 19.0 with
+#: the previous image kept and the base image unchanged (with or without
+#: cache): 0.66-0.72 of it in containerd's image store, 0.42-0.46 in
+#: overlay2, and no peak above what stays once the build ends. 1 covers
+#: both. Not covered, and not measured: a full rebuild (``--pull
+#: --no-cache``) when Tecnativa has republished the base image, which pulls
+#: it again and writes as a first build does (1.79 in containerd, 1.16 in
+#: overlay2, measured on a server without the base image). With the factor
+#: 1 the extra 0.79 of the image comes out of the 5 GiB reserve, so it fits
+#: while the image stays under about 6.3 GiB; past that the disk can fill,
+#: and the boot test stops the rebuild with its own message.
+BUILD_PEAK_FACTOR = 1
+
+
+def build_room_command(directory):
+    """The command that reads the room a build of the instance in *directory* has.
+
+    Prints ``free_kb <n>``, what is free on the disk Docker keeps its data
+    on (``DockerRootDir``, ``/var/lib/docker`` when it cannot be read), and
+    ``image <bytes>``, the size of the image of the instance's ``odoo``
+    container (``docker compose images``), each only when it can be read.
+    Not ``docker compose config --images``: it lists every service's
+    image, in no fixed order, whatever service it is given (Compose 5.7,
+    16-nov-2026). An instance without its container has no image read.
+    POSIX shell: a self-hosted user's login shell may be dash. It never
+    fails.
+
+    :param str directory: the instance's directory, as the steps name it
+        (it may start with ``~``, unquoted)
+    :rtype: str
+    """
+    return (
+        "{ root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null);"
+        ' df -Pk "${root:-/var/lib/docker}" 2>/dev/null'
+        " | awk 'NR == 2 { print \"free_kb\", $4 }';"
+        f" img=$(cd {directory} 2>/dev/null"
+        " && docker compose images -q odoo 2>/dev/null | head -n 1);"
+        ' if [ -n "$img" ]; then'
+        " docker image inspect --format 'image {{.Size}}' \"$img\" 2>/dev/null; fi;"
+        " } 2>/dev/null; true"
+    )
+
+
+def build_room_free_command(directory):
+    """The command that frees room for a build, then reads it again.
+
+    The dangling images first, whatever their age (``docker image prune
+    -f``: what several pushes in the last hour left), then
+    ``build_cache_prune``; then ``build_room_command``. It never fails.
+
+    :param str directory: as ``build_room_command`` takes it
+    :rtype: str
+    """
+    return (
+        "{ docker image prune -f; } >/dev/null 2>&1;"
+        f" {{ {build_cache_prune()}; }} >/dev/null 2>&1;"
+        f" {build_room_command(directory)}"
+    )
+
+
+def parse_build_room(stdout):
+    """Return ``(free_bytes, image_bytes)`` from ``build_room_command``'s answer.
+
+    :param str stdout: what it printed
+    :return: each in bytes, or None when it was not read
+    :rtype: tuple
+    """
+    free = image = None
+    for line in (stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            continue
+        if parts[0] == "free_kb":
+            free = int(parts[1]) * 1024
+        elif parts[0] == "image":
+            image = int(parts[1])
+    return free, image
+
+
+def build_room_needed(image_bytes):
+    """Return what must be free for a build, and the image's share of it.
+
+    The image times ``BUILD_PEAK_FACTOR`` (the current one's size, or
+    ``BUILD_IMAGE_ESTIMATE_GB`` without one), plus
+    ``restore_space.RESERVE_BYTES``, what the server's other instances
+    keep, as a restore and the boot test leave them.
+
+    :param int image_bytes: the current image's size, or None
+    :return: ``(needed, image_share)``, in bytes
+    :rtype: tuple
+    """
+    image = image_bytes or BUILD_IMAGE_ESTIMATE_GB * GIB
+    share = int(image * BUILD_PEAK_FACTOR)
+    return share + RESERVE_BYTES, share
+
+
+def build_room_refusal(free, image_bytes, needed, share, what):
+    """Return why a build is refused with *free* bytes free.
+
+    :param int free: bytes free on Docker's disk
+    :param int image_bytes: the current image's size, or None
+    :param int needed: ``build_room_needed``'s total
+    :param int share: ``build_room_needed``'s image share
+    :param str what: what was not done, as the message ends it
+    :rtype: str
+    """
+    image = (
+        "as large as its current one" if image_bytes
+        else "estimated, as the instance has none yet"
+    )
+    return (
+        f"No room on the server to build the image: Docker's disk has"
+        f" {in_gib(free)} free, and the build needs {in_gib(needed)}"
+        f" ({in_gib(share)} for the image, {image}, and"
+        f" {in_gib(RESERVE_BYTES)} the server's other instances keep)."
+        f" {what} Free space on the server (remove the instances or"
+        " previews it no longer needs) or enlarge its disk, then try again."
+    )
+
+
+def after_build_prune(min_free_gb=BUILD_CACHE_MIN_FREE_GB):
+    """The command a rebuild runs once its new image is in service.
+
+    Removes the dangling images (``docker image prune -f``: the previous
+    image, untagged by the build and freed by the restart; an image a
+    container uses, stopped or not, and every tagged one stay). Under
+    *min_free_gb* free after that, it caps the build cache at
+    ``BUILD_CACHE_RESERVED`` (``--reserved-space``, ``--keep-storage``
+    where Docker does not know it): on a disk with room, the cache serves
+    the next cached rebuilds and the daily prune empties it anyway. POSIX
+    shell; it never fails, as any status but 0 fails a job's step.
+
+    :param int min_free_gb: under this many GB free, the cache is capped
+    :return: the shell command, which always exits 0
+    :rtype: str
+    """
+    need_kb = int(min_free_gb) * 1024 * 1024
+    cap = BUILD_CACHE_RESERVED
+    return (
+        "{ docker image prune -f;"
+        " root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null);"
+        ' free=$(df -Pk "${root:-/var/lib/docker}" 2>/dev/null'
+        " | awk 'NR==2 {print $4}');"
+        f' if [ -n "$free" ] && [ "$free" -lt {need_kb} ]; then'
+        f' echo "Free disk $((free / 1048576)) GB, under {int(min_free_gb)} GB:'
+        f' the build cache is capped at {cap}.";'
+        f" docker builder prune -f --reserved-space {cap} 2>/dev/null"
+        f" || docker builder prune -f --keep-storage {cap};"
+        ' else echo "The build cache stays."; fi; } 2>&1 || true'
+    )
+
+# Alert raised when the post-prune inventory shows that a container the
+# panel manages is gone. With every managed resource labelled this
+# should never fire; it exists precisely because it once did (2026-08:
+# rebuilds rewrote override.yml without the label and the nightly prune
+# swept stopped instances and failed a host's backups for two days).
+SWEPT_ALERT_CODE = "prune_swept_managed"
+
+# Services whose container must exist (any state) for every deployed
+# instance. Deliberately the unconditional pair from
+# ``cloud.instance.expected_services`` — checking by project prefix
+# would miss a Sablier-slept free instance whose ``odoo`` was swept
+# while its still-running ``db``/``smtp`` kept the prefix alive.
+_REQUIRED_SERVICES = ("odoo", "db")
+
+# Alert raised when a project network the panel manages is gone after
+# the prune. Distinct from the container alert because the remedy is
+# different: the containers are still there, they simply cannot attach
+# to anything, so the stack has to be recreated rather than restored.
+NETWORK_ALERT_CODE = "prune_swept_network"
+
+# Alert raised when a host has used most of the networks Docker can give
+# it. Each instance takes at least one; past the host's address pools a
+# deploy fails with «all predefined address pools have been fully
+# subnetted». Docker's own pools allow about 31, which is what capped a
+# server at ~24 instances until the pools were widened (2-nov-2026).
+NETWORKS_HIGH_ALERT_CODE = "docker_networks_high"
+#: Share of the host's networks in use at which the alert is raised.
+NETWORKS_HIGH_RATIO = 0.8
+
+#: Run on the host as the panel's account. Removes the networks a deleted
+#: instance left behind, and reports how many networks are in use against
+#: how many the address pools allow. A network goes only when all of
+#: this holds: it is an instance's kind (``<project>_default`` or
+#: ``<project>_whitelist``), it carries a compose project, that project is
+#: neither an instance the panel knows on this host (active or archived)
+#: nor one of the host's own stacks (``cloud.host._infra_compose_projects``),
+#: and no container uses it, running or stopped. Never ``docker network
+#: prune``: on 2026-08-20 that took the
+#: networks of instances kept stopped on purpose, whose containers then
+#: could not start.
+#: Written without double braces, so Ansible leaves it as it is.
+_NETWORK_SWEEP = r"""python3 - <<'PY'
+import ipaddress, json, subprocess
+OWNED = set(%(owned)r.split())
+INFRA = set(%(infra)r.split())
+def run(*args):
+    return subprocess.run(args, capture_output=True, text=True, check=True).stdout
+names = [
+    json.loads(line)["Name"]
+    for line in run("docker", "network", "ls", "--filter", "type=custom", "--format", "json").splitlines()
+    if line.strip()
+]
+for name in names:
+    if not name.endswith(("_default", "_whitelist")):
+        continue
+    try:
+        info = json.loads(run("docker", "network", "inspect", name))[0]
+    except Exception:
+        continue
+    project = (info.get("Labels") or dict()).get("com.docker.compose.project", "")
+    if not project or project in OWNED or project in INFRA:
+        continue
+    if run("docker", "ps", "-aq", "--filter", "network=" + name).split():
+        continue
+    if subprocess.run(["docker", "network", "rm", name], capture_output=True).returncode == 0:
+        print("removed " + name)
+used = len([line for line in run("docker", "network", "ls", "--filter", "type=custom", "-q").splitlines() if line.strip()])
+try:
+    with open("/etc/docker/daemon.json", encoding="utf-8") as fh:
+        pools = json.load(fh).get("default-address-pools") or []
+    total = sum(2 ** (p["size"] - ipaddress.ip_network(p["base"]).prefixlen) for p in pools)
+except Exception:
+    total = 0
+print("networks %%d %%d" %% (used, total or 31))
+PY"""
+
+
+def network_sweep(env, host):
+    """The orphaned-network sweep for *host*, its instances and stacks named.
+
+    :param env: an Odoo environment
+    :param host: the ``cloud.host`` the sweep runs on
+    :return: the command the playbook runs
+    :rtype: str
+    """
+    projects = env["cloud.instance"].sudo().with_context(active_test=False).search(
+        [("host_id", "=", host.id)],
+    ).mapped("doodba_project_name")
+    return _NETWORK_SWEEP % {
+        "owned": " ".join(sorted(p for p in projects if p)),
+        "infra": " ".join(host._infra_compose_projects()),
+    }
+
+
+#: What releases before 1.0.200 named, at /tmp, the files a job staged or
+#: built and the directories it worked in: archives of customers'
+#: databases, a deploy's copier answers, configuration and secrets, a
+#: purge's bucket keys, the proxy's private keys and certificate store,
+#: the scripts a job ran, and the dumps and files of a layer's jobs.
+#: Created 0644 and left there by a job that ended early.
+_LEGACY_TMP_NAMES = (
+    ".incubacloud-handoff-*.zip",
+    ".incubacloud-backup-*.zip",
+    ".incubacloud-bkdl-*",
+    ".incubacloud-bkneu-*",
+    ".incubacloud-export-*",
+    ".incubacloud-archived-purge-*",
+    ".incubacloud-*-answers.yml",
+    ".incubacloud-*-addons.yaml",
+    ".incubacloud-*-repos.yaml",
+    ".incubacloud-*-odoo.conf",
+    ".incubacloud-*-pip.txt",
+    ".incubacloud-*-apt.txt",
+    ".incubacloud-*-override.yml",
+    ".incubacloud-*-extra-*",
+    ".incubacloud-*-backup.env",
+    ".incubacloud-*-incubacloud.env",
+    ".incubacloud-acme.json",
+    ".incubacloud-traefik-*",
+    ".incubacloud-whitelist.yaml",
+    ".incubacloud-github-webhook.yml",
+    ".incubacloud-scripts-*",
+    ".icfree-*",
+    ".ic-modules-*",
+    ".ic-sablier*",
+)
+
+#: How old a job's directory must be before the day's sweep takes it:
+#: a job removes its own, and one whose worker died does not. No job
+#: runs this long — a step's command stops after an hour, a download
+#: from a link after a day.
+_JOB_DIR_AGE_MINUTES = 3 * 24 * 60
+
+
+def legacy_tmp_sweep(root="/tmp"):
+    """Return the command that removes older releases' leftovers in *root*.
+
+    Files and directories under those names right in *root*, a day old,
+    first this account's (``-user``): ``find`` follows no link, a link
+    is neither a file nor a directory to it, and ``rm -rf`` does not
+    follow one inside a directory either. Nothing this release creates
+    is named like them.
+
+    Then the privileged pass, for what the account cannot remove: root's
+    (before a hardening moves the panel to an operator account it
+    connected as root) and uid 1000's, the odoo container's, which wrote
+    the live dumps and exports at those names through its ``/tmp``
+    mount (``instance_logs.sh``) and is not the operator on a platform
+    host (root) or on a VPS whose operator has another uid. Without
+    root the pass asks ``sudo -n``, and only after a search the account
+    can do itself found something: a host without sudoers would
+    otherwise report an incident, and mail root, every day. Where the
+    account is root it runs directly, with no search. It never fails
+    the play. After its first run on a host it finds nothing.
+
+    :param str root: the directory to sweep, ``/tmp`` but in tests
+    :rtype: str
+    """
+    names = " -o ".join(
+        f"-name {shlex.quote(name)}" for name in _LEGACY_TMP_NAMES
+    )
+    match = (
+        "-mmin +1440 \\( -type f -o -type d \\)"
+        f" \\( {names} \\)"
+    )
+    where = f"find {shlex.quote(root)} -mindepth 1 -maxdepth 1"
+    others = "\\( -user 0 -o -user 1000 \\)"
+    remove = f"{where} {others} {match} -exec rm -rf {{}} +"
+    return (
+        f'{where} -user "$(id -u)" {match} -exec rm -rf {{}} +;'
+        f' if [ "$(id -u)" = 0 ]; then {remove};'
+        f" elif {where} {others} {match} -print -quit 2>/dev/null"
+        f" | grep -q .; then sudo -n {remove};"
+        " fi 2>/dev/null || true"
+    )
+
+
+def job_dir_sweep(root="/tmp"):
+    """Return the command that removes the job directories a dead worker
+    left in *root*: this account's, three days old (``JOB_DIR_PREFIX``).
+
+    :param str root: the directory to sweep: ``/tmp``, or
+        ``restore_space.STAGING_ROOT`` where a restore's is
+    :rtype: str
+    """
+    return (
+        f"find {shlex.quote(root)} -mindepth 1 -maxdepth 1 -type d"
+        f" -name '{JOB_DIR_PREFIX[5:]}*' -user \"$(id -u)\""
+        f" -mmin +{_JOB_DIR_AGE_MINUTES} -exec rm -rf {{}} +"
+    )
+
+
+def upload_dir_sweep(root=UPLOAD_ROOT):
+    """Return the command that removes old upload keys' directories.
+
+    The panel revokes a consumed grant ``USED_GRANT_DAYS`` after its
+    restore, directory and all (``cloud.restore.upload.grant``); this is
+    the safety net for a host where that job never ran. Only directories
+    named as a grant's token, this account's and that old, right under
+    a root that is this account's own directory and not a link — in a
+    root another account owns, a name could be swapped for a link
+    between the search and the removal. ``find`` follows no link, and
+    ``rm -rf`` none inside a directory either.
+
+    :param str root: the grants' root: ``UPLOAD_ROOT``, or
+        ``LEGACY_UPLOAD_ROOT`` for what releases before 1.0.239 left
+    :rtype: str
+    """
+    quoted = shlex.quote(root)
+    token = "[0-9a-f]" * 16
+    return (
+        f"{{ [ -d {quoted} ] && [ ! -h {quoted} ] && [ -O {quoted} ]"
+        f" && find {quoted} -mindepth 1 -maxdepth 1 -type d"
+        f" -name '{token}' -user \"$(id -u)\""
+        f" -mmin +{USED_GRANT_DAYS * 24 * 60} -exec rm -rf {{}} +; }}"
+        " || true"
+    )
+
+
+def detached_dir_sweep(env, root="/tmp"):
+    """Return the command that removes the step directories nobody follows.
+
+    A step run apart (``detached_step.sh``) leaves its directory until
+    its job records the result, and the reconciliation removes what a job
+    closed without its server left; a checkpoint given up, or deleted
+    with its job, leaves it for good. This takes, in *root*, this
+    account's directories named as a step's whose cap ended
+    ``DETACHED_GIVE_UP_AFTER_CAP_S`` ago (the reconciliation gives up on
+    them then; a directory without a deadline counts from its date),
+    except those of a checkpoint still open — not ``closed`` — on any
+    host: its job may come back for them. Each goes through its own
+    ``ctl.sh clean``, which keeps a step that still runs; a directory
+    without it never started a step. POSIX ``sh``, never through a link.
+
+    :param env: an environment to read the checkpoints with
+    :param str root: the directory to sweep, ``/tmp`` but in tests
+    :rtype: str
+    """
+    spared = set()
+    rows = env["cloud.job.checkpoint"].sudo().search([("closed", "=", False)])
+    for row in rows:
+        for index in range(row.next_index + 1):
+            spared.add(detached_dir(
+                env, row.job_id.id, row.queue_job_uuid, index,
+            ).rsplit("/", 1)[1])
+    keep = "".join(f"{name}) continue ;; " for name in sorted(spared))
+    prefix = DETACHED_PREFIX.rsplit("/", 1)[1]
+    pattern = shlex.quote(f"{root}/{prefix}") + "*"
+    return (
+        f'now=$(date +%s); for d in {pattern}; do'
+        ' [ -d "$d" ] && [ ! -h "$d" ] && [ -O "$d" ] || continue;'
+        f' n="${{d##*/{prefix}}}";'
+        ' case "$n" in ""|*[!0-9a-f]*) continue ;; esac;'
+        f' case "${{d##*/}}" in {keep}esac;'
+        ' t=$(cat "$d/deadline" 2>/dev/null);'
+        ' case "$t" in ""|*[!0-9]*) t=$(stat -c %Y "$d") ;; esac;'
+        f' [ "$now" -ge $((t + {DETACHED_GIVE_UP_AFTER_CAP_S})) ] || continue;'
+        ' if [ -f "$d/ctl.sh" ]; then bash "$d/ctl.sh" clean "$d" >/dev/null 2>&1;'
+        ' else rm -rf -- "$d"; fi;'
+        " done; true"
+    )
+
+
+#: What every sweep of /tmp and /var/tmp runs after the handoffs.
+_STAGING_SWEEPS = (
+    f"{legacy_tmp_sweep()}; {job_dir_sweep()}; {job_dir_sweep(STAGING_ROOT)};"
+    f" {upload_dir_sweep()}; {upload_dir_sweep(LEGACY_UPLOAD_ROOT)}"
+)
+
+
+def tmp_sweep(env, host):
+    """Return the day's sweep of /tmp and /var/tmp for *host*.
+
+    Its handoffs a day old but those a restore still waits for
+    (``handoff_sweep``), older releases' leftovers, the directories of
+    jobs whose worker died, in /tmp and in /var/tmp, where a restore's
+    is (``restore_space.STAGING_ROOT``), what upload keys left three days
+    ago, there and where releases before 1.0.239 put them
+    (``upload_dir_sweep``), and the step directories no open checkpoint
+    holds (``detached_dir_sweep``). On disk, /var/tmp keeps what a
+    server's reboot used to take from a /tmp in memory: this is what
+    takes it.
+
+    :param env: an environment to read the jobs with
+    :param host: the ``cloud.host`` it runs on
+    :rtype: str
+    """
+    return f"{handoff_sweep(env, host)}; {_STAGING_SWEEPS}; {detached_dir_sweep(env)}"
+
+
+#: The day's sweep of /tmp as a playbook run alone has it: with no panel
+#: to ask, it spares no handoff and leaves every step directory, which only
+#: the panel can tell from one a job will come back for (``tmp_sweep``).
+TMP_SWEEP = f"{HANDOFF_SWEEP}; {_STAGING_SWEEPS}"
+
+def boot_test_sweep(root="/tmp"):
+    """Return the command that removes the copies boot tests left behind.
+
+    ``rebuild.sh boot-test`` copies the database into a volume
+    ``ic_boot_<id>`` and its trap removes it; a test killed before its
+    trap (a worker that died, a server that rebooted) leaves it, the size
+    of the database (#91, 13-nov-2026). The next boot test of the same
+    instance removes it first; this takes those of instances that do not
+    rebuild again.
+
+    First the test's containers, ``ic_boot_copy_<id>``, ``ic_boot_pg_<id>``
+    and ``ic_boot_odoo_<id>``, running or not, created a day ago: one
+    killed after the throwaway PG started still mounts the volume, which
+    is then no volume ``dangling`` and would stay for good (Fable's review
+    of #91, 13-nov-2026). A test has six hours at most
+    (``BOOT_TEST_CAP_S``), so none of a day is one still running. Then
+    the volumes so named that no container uses and that were created a
+    day ago, and the test's networks ``ic_boot_<id>`` of a day, which
+    Docker refuses to remove while a container is on them. Each date is
+    read from ``docker inspect``. Then the copies releases before 1.0.228
+    made in *root* as ``ic_boot_<id>``, a day old: owned by the postgres
+    uid 70, which this account cannot remove, they go from a container,
+    as the boot test removed them, and only after a search this account
+    can do found one, so a host with none pulls no image. ``find``
+    follows no link, and ``rm -rf`` none inside a directory either.
+
+    Says ``removed container|volume|network <name>`` for each; it never
+    fails, and contains no braces Ansible would read.
+
+    :param str root: the directory of the old copies, ``/tmp`` but in tests
+    :rtype: str
+    """
+    quoted = shlex.quote(root)
+    match = "-mindepth 1 -maxdepth 1 -type d -name 'ic_boot_[0-9]*' -mmin +1440"
+    # The first "Name" and "Created" of what ``docker inspect`` prints are
+    # the object's own; a container's name starts with a slash.
+    name_of = r"""sed -n 's/^[[:space:]]*"Name": *"\/\{0,1\}\([^"]*\)".*/\1/p' | head -n 1"""
+    created = r"""sed -n 's/^[[:space:]]*"Created": *"\([^"]*\)".*/\1/p' | head -n 1"""
+    day_old = (
+        ' t=$(date -d "$c" +%s 2>/dev/null) || continue;'
+        " [ $((now - t)) -ge 86400 ] || continue;"
+    )
+    return (
+        "now=$(date +%s);"
+        " for id in $(docker ps -aq --filter name=ic_boot_ 2>/dev/null); do"
+        ' j=$(docker inspect "$id" 2>/dev/null) || continue;'
+        f""" n=$(printf '%s\\n' "$j" | {name_of});"""
+        ' case "$n" in'
+        " ic_boot_copy_*[!0-9]*|ic_boot_pg_*[!0-9]*|ic_boot_odoo_*[!0-9]*)"
+        " continue ;;"
+        " ic_boot_copy_?*|ic_boot_pg_?*|ic_boot_odoo_?*) ;;"
+        " *) continue ;; esac;"
+        f""" c=$(printf '%s\\n' "$j" | {created});"""
+        f"{day_old}"
+        ' docker rm -f "$id" >/dev/null 2>&1 && echo "removed container $n";'
+        " done;"
+        " for v in $(docker volume ls -q --filter dangling=true"
+        " --filter name=ic_boot_ 2>/dev/null); do"
+        ' case "$v" in ic_boot_*[!0-9]*|ic_boot_) continue ;; ic_boot_*) ;;'
+        " *) continue ;; esac;"
+        ' c=$(docker volume inspect "$v" 2>/dev/null'
+        r""" | sed -n 's/.*"CreatedAt": *"\([^"]*\)".*/\1/p' | head -n 1);"""
+        f"{day_old}"
+        ' docker volume rm "$v" >/dev/null 2>&1 && echo "removed volume $v";'
+        " done;"
+        " for id in $(docker network ls -q --filter name=ic_boot_ 2>/dev/null); do"
+        ' j=$(docker network inspect "$id" 2>/dev/null) || continue;'
+        f""" n=$(printf '%s\\n' "$j" | {name_of});"""
+        ' case "$n" in ic_boot_*[!0-9]*|ic_boot_) continue ;; ic_boot_*) ;;'
+        " *) continue ;; esac;"
+        f""" c=$(printf '%s\\n' "$j" | {created});"""
+        f"{day_old}"
+        ' docker network rm "$id" >/dev/null 2>&1 && echo "removed network $n";'
+        " done;"
+        f" if find {quoted} {match} -print -quit 2>/dev/null | grep -q .; then"
+        f" docker run --rm -v {quoted}:/host_tmp alpine find /host_tmp {match}"
+        " -exec rm -rf {} + ;"
+        " fi; true"
+    )
+
+
+#: The sweep of the boot tests' copies as the play runs it, alone or for
+#: the panel: it asks the panel nothing.
+BOOT_TEST_SWEEP = boot_test_sweep()
+
+# Docker prints sizes with SI units (``12.86GB``, ``938.4kB``, ``0B``).
+_SIZE_UNITS = {"b": 1, "kb": 10 ** 3, "mb": 10 ** 6, "gb": 10 ** 9,
+               "tb": 10 ** 12}
+_RECLAIMED_RE = re.compile(
+    r"total reclaimed space:\s*([\d.]+)\s*([a-z]*b)", re.IGNORECASE,
+)
+
+
+def _reclaimed_bytes(stdout):
+    """Sum every ``Total reclaimed space`` line in *stdout*.
+
+    The play runs three prunes, so its output carries three totals.
+    Reporting the last one — which is what reading the output backwards
+    used to do — would under-report by whatever the other two freed.
+
+    :param stdout: combined stdout of the prune commands.
+    :return: total reclaimed space in bytes.
+    """
+    return int(sum(
+        float(value) * _SIZE_UNITS.get(unit.lower(), 1)
+        for value, unit in _RECLAIMED_RE.findall(stdout)
+    ))
+
+
+def _format_size(size):
+    """Render a byte count the way Docker does, for a familiar log line.
+
+    :param size: size in bytes.
+    :return: a string such as ``12.86GB`` or ``0B``.
+    """
+    for unit, factor in (
+        ("TB", 10 ** 12), ("GB", 10 ** 9), ("MB", 10 ** 6), ("kB", 10 ** 3),
+    ):
+        if size >= factor:
+            # ``.4g`` is what Docker's own humaniser uses, so 1.5GB
+            # stays "1.5GB" instead of gaining a padded decimal.
+            return f"{size / factor:.4g}{unit}"
+    return f"{size}B"
+
+
+class DockerPruneExecutor(AnsibleExecutor):
+    """Reclaim disk on a host by pruning unused Docker resources.
+
+    Runs ``ansible/playbooks/host_maintenance.yml`` (``docker system
+    prune -af``, excluding resources labelled ``PROTECT_LABEL``). The
+    playbook exports the reclaimed-space line so the job log keeps
+    showing how much was freed; a failure of the prune command fails
+    the play, which the default ``parse_results`` turns into a job
+    failure.
+    """
+
+    _job_type = "docker_prune"
+    _playbook = "playbooks/host_maintenance.yml"
+
+    def get_extra_vars(self):
+        """Hand the playbook the label to spare and the sweep of /tmp.
+
+        Passing them (rather than letting the playbook's own defaults
+        stand) keeps this module the single source of truth for the
+        label, shared with whatever stamps it onto its containers, and
+        for the sweep, whose handoff part the jobs run too and which
+        spares the handoffs a restore still waits for on this host.
+        """
+        return {
+            "ic_protect_label": PROTECT_LABEL,
+            "ic_tmp_sweep": tmp_sweep(self.env, self.job.host_id),
+            "ic_network_sweep": network_sweep(self.env, self.job.host_id),
+            "ic_boot_test_sweep": BOOT_TEST_SWEEP,
+            "ic_git_helper_image": self._git_helper_image(),
+        }
+
+    def _git_helper_image(self):
+        """Return the git helper image the play prepares, or "".
+
+        The image ``deploy.sh fetch-repos`` runs (``GIT_HELPER_IMAGE``),
+        on a host with an instance of a series that fetches its
+        repositories on the host: there the night pays its pull, about
+        730 MB, not the first job, and the tags of other digests go
+        (10-nov-2026). A host whose instances all
+        clone in the image does not hold it for nothing.
+
+        :rtype: str
+        """
+        # Imported here: deploy_instance_executor imports this module.
+        from ._odoo_versions import VERSIONS, prefetch_repos
+        from .deploy_instance_executor import GIT_HELPER_IMAGE
+
+        versions = set(
+            self.env["cloud.instance"].sudo().search(
+                [("host_id", "=", self.job.host_id.id)],
+            ).mapped("odoo_version")
+        )
+        if any(v in VERSIONS and prefetch_repos(v) for v in versions):
+            return GIT_HELPER_IMAGE
+        return ""
+
+    async def before_execute(self, transport):
+        self._sys("Starting Docker cleanup...")
+
+    def _summarize_prune_output(self, stdout):
+        """Log what the prune deleted, by section.
+
+        ``docker system prune`` prints ``Deleted <kind>:`` sections.
+        Containers and images are listed by ID/digest — useless for
+        post-mortems, so they are logged as counts; networks are listed
+        by *name*, which is exactly what an operator needs to see, so
+        those are spelled out. The presence check below is what turns
+        "a network named like an instance got deleted" into an alert.
+        """
+        section = None
+        counts = {}
+        networks = []
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("Deleted ") and line.endswith(":"):
+                section = line[len("Deleted "):-1].lower()
+                counts.setdefault(section, 0)
+                continue
+            if line.lower().startswith("total reclaimed"):
+                section = None
+                continue
+            if section:
+                counts[section] += 1
+                if section == "networks":
+                    networks.append(line)
+        if counts:
+            parts = ", ".join(
+                f"{n} {kind}" for kind, n in counts.items() if n
+            )
+            self._sys(f"Deleted: {parts or 'nothing'}.")
+        if networks:
+            shown = ", ".join(networks[:10])
+            more = f" (+{len(networks) - 10} more)" if len(networks) > 10 else ""
+            self._sys(f"Deleted networks: {shown}{more}")
+
+    def _instances_to_check(self):
+        """Yield the deployed instances whose resources must have survived.
+
+        Instances with an active non-background job are skipped: a
+        rebuild's ``compose down`` phase legitimately leaves the stack
+        without containers — and without its network — for a while, and
+        alerting on that would cry wolf on every rebuild.
+
+        :return: iterator over ``cloud.instance`` records.
+        """
+        Job = self.job.env["cloud.job"]
+        for inst in self.job.host_id.instance_ids.filtered("deployed"):
+            busy = Job.search_count([
+                ("instance_id", "=", inst.id),
+                ("state", "in", Job._active_states),
+                ("job_type_id.code", "not in", Job._hidden_job_types),
+            ])
+            if not busy:
+                yield inst
+
+    def _check_managed_containers(self, survivors_raw):
+        """Alert if a panel-managed container did not survive the prune.
+
+        Compares the post-prune ``docker ps -a`` inventory against the
+        ``odoo``/``db`` containers every deployed instance on this host
+        must have (named ``<project>-<service>-1`` by compose, the same
+        convention the rest of the panel relies on). Instances with an
+        active non-background job are skipped: a rebuild's ``compose
+        down`` phase legitimately leaves the stack containerless for a
+        while. Raises/refreshes a critical host alert when something is
+        missing; resolves it when everything is present again.
+        """
+        survivors = {
+            line.strip() for line in survivors_raw.splitlines() if line.strip()
+        }
+        missing = []
+        checked = 0
+        for inst in self._instances_to_check():
+            checked += 1
+            project = inst.doodba_project_name
+            missing.extend(
+                name
+                for svc in _REQUIRED_SERVICES
+                if (name := f"{project}-{svc}-1") not in survivors
+            )
+        with self._durable_env() as alert_env:
+            host = alert_env["cloud.host"].browse(self.job.host_id.id)
+            if missing:
+                shown = ", ".join(sorted(missing))
+                alert_env["cloud.alert"].raise_alert(
+                    SWEPT_ALERT_CODE,
+                    f"Docker prune on '{host.name}' left managed "
+                    f"container(s) missing: {shown}. The protect label "
+                    f"should have spared them — a rebuild may be "
+                    f"rewriting overrides without it.",
+                    level="critical",
+                    host=host,
+                    job=alert_env["cloud.job"].browse(self.job.id),
+                    # The protect label is the platform's to get
+                    # right; the operator only sees the damage.
+                    audience="provider",
+                )
+                self._sys(f"✗ Managed container(s) missing after prune: {shown}")
+            else:
+                alert_env["cloud.alert"].resolve_alert(SWEPT_ALERT_CODE, host=host)
+                self._sys(
+                    f"✓ All managed stacks intact "
+                    f"({checked} instance(s) checked)."
+                )
+
+    def _check_managed_networks(self, networks_raw):
+        """Alert if a panel-managed project network did not survive.
+
+        The container check cannot see this failure: the containers are
+        label-protected and survive, the network is not and does not,
+        and the stack is left unable to start at all. A container that
+        compose merely *starts* keeps the network id it was created
+        with, so a missing network answers ``network <id> not found``
+        and the whole ``up`` fails — which is how it stayed invisible
+        until a backup tried to wake a stopped stack days later.
+
+        Since the play no longer prunes networks this should never
+        fire. It exists because the equivalent container check was
+        added for the same reason and still caught a real regression.
+
+        :param networks_raw: ``docker network ls`` output, one name per
+            line, gathered after the prune.
+        """
+        survivors = {
+            line.strip() for line in networks_raw.splitlines() if line.strip()
+        }
+        missing = [
+            name
+            for inst in self._instances_to_check()
+            if (name := f"{inst.doodba_project_name}_default") not in survivors
+        ]
+        with self._durable_env() as alert_env:
+            host = alert_env["cloud.host"].browse(self.job.host_id.id)
+            if missing:
+                shown = ", ".join(sorted(missing))
+                alert_env["cloud.alert"].raise_alert(
+                    NETWORK_ALERT_CODE,
+                    f"Docker prune on '{host.name}' left managed "
+                    f"network(s) missing: {shown}. Their containers "
+                    f"cannot attach to anything — the stacks must be "
+                    f"recreated, not merely started.",
+                    level="critical",
+                    host=host,
+                    job=alert_env["cloud.job"].browse(self.job.id),
+                    # The protect label is the platform's to get
+                    # right; the operator only sees the damage.
+                    audience="provider",
+                )
+                self._sys(f"✗ Managed network(s) missing after prune: {shown}")
+            else:
+                alert_env["cloud.alert"].resolve_alert(
+                    NETWORK_ALERT_CODE, host=host,
+                )
+
+    def _report_network_sweep(self, stdout):
+        """Log the networks the sweep removed and check the host's room.
+
+        :param stdout: the sweep's output: ``removed <name>`` lines and a
+            last ``networks <used> <total>`` line
+        """
+        removed = []
+        used = total = None
+        for line in (stdout or "").splitlines():
+            words = line.split()
+            if len(words) == 2 and words[0] == "removed":
+                removed.append(words[1])
+            elif len(words) == 3 and words[0] == "networks":
+                with contextlib.suppress(ValueError):
+                    used, total = int(words[1]), int(words[2])
+        if removed:
+            self._sys(f"Removed orphaned network(s): {', '.join(removed)}")
+        if used is None or not total:
+            return
+        with self._durable_env() as alert_env:
+            host = alert_env["cloud.host"].browse(self.job.host_id.id)
+            if used >= total * NETWORKS_HIGH_RATIO:
+                alert_env["cloud.alert"].raise_alert(
+                    NETWORKS_HIGH_ALERT_CODE,
+                    f"Host '{host.name}' uses {used} of the {total} Docker "
+                    f"networks its address pools allow: past them, a new "
+                    f"instance cannot be deployed on it.",
+                    level="warning",
+                    host=host,
+                )
+            else:
+                alert_env["cloud.alert"].resolve_alert(
+                    NETWORKS_HIGH_ALERT_CODE, host=host,
+                )
+
+    async def on_success(self, results):
+        facts = self.playbook_facts()
+        self._report_network_sweep(facts.get("ic_network_sweep_stdout"))
+        stdout = facts.get("ic_prune_stdout", "")
+        self._summarize_prune_output(stdout)
+        # Every prune in the play prints its own total; report the sum,
+        # not whichever one happened to run last.
+        if "reclaimed" in stdout.lower():
+            self._sys(
+                f"✓ Total reclaimed space: "
+                f"{_format_size(_reclaimed_bytes(stdout))}"
+            )
+        else:
+            self._sys("✓ Docker cleanup complete.")
+        survivors_raw = facts.get("ic_containers_after")
+        if survivors_raw is None:
+            self._sys("Container inventory unavailable — presence check skipped.")
+        else:
+            self._check_managed_containers(survivors_raw)
+        networks_raw = facts.get("ic_networks_after")
+        if networks_raw is None:
+            self._sys("Network inventory unavailable — presence check skipped.")
+        else:
+            self._check_managed_networks(networks_raw)
+
+    async def on_failure(self, results, errors):
+        self._sys(f"✗ Docker cleanup failed: {'; '.join(errors)}")

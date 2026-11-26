@@ -1,0 +1,1115 @@
+<templates>
+
+    <t t-name="incubacloud.HostDetail">
+        <!-- Root keeps `ic-host-detail` so a layer's Traefik-panel patch
+             (xpath on `hasclass('ic-host-detail')`) keeps resolving. -->
+        <div class="ic-host-detail">
+
+            <!-- Loading -->
+            <t t-if="state.loading">
+                <div class="ic-rl-detail-scroll">
+                    <div class="rl-ovcards">
+                        <div class="ic-skeleton-card"/>
+                        <div class="ic-skeleton-card"/>
+                    </div>
+                    <div style="margin-top: 16px;">
+                        <div class="ic-skeleton-text ic-skeleton-lg"/>
+                        <div class="ic-skeleton-text ic-skeleton-md"/>
+                        <div class="ic-skeleton-text ic-skeleton-sm"/>
+                    </div>
+                </div>
+            </t>
+
+            <t t-elif="isNew or state.host">
+
+                <!-- ═══════════════════════════════════════════════════════════
+                     Hero: crumb + title + host status badge + subtitle
+                     ═══════════════════════════════════════════════════════════ -->
+                <div class="rl-crumb">
+                    <a t-on-click="goBack">Hosts</a>
+                    <span class="rl-sep">/</span>
+                    <span class="rl-cur">
+                        <t t-if="isNew">New host</t>
+                        <t t-else="" t-esc="state.host.name"/>
+                    </span>
+                </div>
+
+                <div class="rl-phead ic-rl-hero">
+                    <div class="rl-htext">
+                        <h1 class="rl-ptitle">
+                            <t t-if="isNew">New Host</t>
+                            <t t-else="">
+                                <t t-esc="state.host.name"/>
+                                <span t-att-class="'rl-sb ' + hostSbClass(state.host.status)">
+                                    <span class="rl-d"/><t t-esc="statusLabel(state.host.status)"/>
+                                </span>
+                                <t t-if="state.host.config_dirty">
+                                    <span
+                      class="rl-pill pending"
+                      title="Saved host configuration differs from what the last full setup shipped. Re-run full setup to apply it."
+                    >
+                                        Changes not applied
+                                    </span>
+                                </t>
+                                <t t-if="state.host.template_drift">
+                                    <span class="rl-pill pending"
+                                          t-att-title="templateDriftTitle">
+                                        Behind the shipped templates
+                                    </span>
+                                </t>
+                                <t t-if="state.host.hardened === false">
+                                    <span class="rl-pill pending"
+                                          title="The security recipe has not been applied to this host from the panel. Apply Hardening installs it; it is optional.">
+                                        Not hardened
+                                    </span>
+                                </t>
+                            </t>
+                        </h1>
+                        <t t-if="!isNew">
+                            <p class="rl-psub">
+                                <code class="ic-host-ip">
+                                    <t t-esc="state.host.ip_address"/>:<t t-esc="state.host.port || 22"/>
+                                </code>
+                                ·
+                                <t t-esc="state.host.instance_count"/> instance<t t-if="state.host.instance_count !== 1">s</t>
+                            </p>
+                        </t>
+                    </div>
+                </div>
+
+                <!-- ═══════════════════════════════════════════════════════════
+                     Action bar (existing hosts only, Manager only)
+                     Keeps `ic-action-bar` so extension patches
+                     (xpath on `hasclass('ic-action-bar')`) resolve.
+                     ═══════════════════════════════════════════════════════════ -->
+                <t t-if="!isNew and state.host and env.permissions?.can_manage_hosts">
+                    <div class="rl-abar ic-action-bar">
+                        <!-- One row: what is done with the host, with the
+                             rarer actions under «More», then the trash on
+                             the right. An extension that appends buttons
+                             inside the bar sees them before the trash. -->
+                        <div class="ic-ab-group">
+                            <button class="rl-btn rl-btn-primary" title="Check host"
+                                    t-on-click="runCheck">
+                                <t t-out="env.icon('refresh', 15)"/> Check
+                            </button>
+                            <button class="rl-btn rl-btn-ghost" title="Full setup"
+                                    t-on-click="runFullSetup">
+                                <t t-out="env.icon('settings', 15)"/> Full Setup
+                            </button>
+                            <t t-if="state.host.hardened">
+                                <button class="rl-btn rl-btn-ghost"
+                                        title="Re-apply hardening (idempotent: re-runs are non-disruptive)"
+                                        t-on-click="() => this.openHardeningModal()">
+                                    <t t-out="env.icon('shield', 15)"/> Re-apply Hardening
+                                </button>
+                            </t>
+                            <t t-else="">
+                                <button class="rl-btn rl-btn-ghost"
+                                        title="Apply hardening (Ubuntu 22.04+ or Debian 12+ with root or passwordless sudo)"
+                                        t-on-click="() => this.openHardeningModal()">
+                                    <t t-out="env.icon('shield', 15)"/> Apply Hardening
+                                </button>
+                            </t>
+                            <!-- Same gate as the endpoint behind it
+                                 (_check_can_manage_hosts): root on the whole
+                                 machine is for whoever manages hosts. -->
+                            <button class="rl-btn rl-btn-ghost ic-ab-warn"
+                                    title="Open an interactive shell directly on this host"
+                                    aria-label="Open host shell"
+                                    t-on-click="openHostShell">
+                                <t t-out="env.icon('terminal', 15)"/> Host Shell
+                            </button>
+                            <!-- Until the host key is trusted no SSH
+                                 operation works, so that button stays in
+                                 the row, not under «More». -->
+                            <t t-if="!state.has_known_hosts_key">
+                                <button class="rl-btn rl-btn-ghost ic-ab-warn"
+                                        title="Trust SSH host key (required before any SSH operation)"
+                                        t-att-disabled="state.trusting_host_key || null"
+                                        t-on-click="trustHostKey">
+                                    <i t-if="state.trusting_host_key" class="fa fa-spinner fa-spin"/>
+                                    <i t-else="" class="fa fa-shield"/>
+                                    Trust SSH Key
+                                </button>
+                            </t>
+                            <IcMenu label.translate="More" triggerClass="'ic-ab-more'">
+                                <button class="rl-btn rl-btn-ghost" title="Import existing instance"
+                                        t-on-click="openImportBrowser">
+                                    <t t-out="env.icon('download', 15)"/> Import Instance
+                                </button>
+                                <!-- Community / extension actions -->
+                                <t t-if="state.host.custom_actions?.length">
+                                    <t t-foreach="state.host.custom_actions" t-as="action" t-key="action.code">
+                                        <button class="rl-btn rl-btn-ghost"
+                                                t-att-title="action.name"
+                                                t-att-aria-label="action.name"
+                                                t-att-disabled="state.actionBusy ? true : null"
+                                                t-on-click="() => this.hostAction(action)">
+                                            <i t-if="state.actionBusy === action.code" class="fa fa-spinner fa-spin"/>
+                                            <i t-else="" t-att-class="'fa ' + (action.action_icon || 'fa-cog')"/>
+                                            <t t-esc="action.name"/>
+                                        </button>
+                                    </t>
+                                </t>
+                                <t t-if="state.has_known_hosts_key">
+                                    <button class="rl-btn rl-btn-ghost"
+                                            title="Re-trust SSH host key"
+                                            t-att-disabled="state.trusting_host_key || null"
+                                            t-on-click="trustHostKey">
+                                        <i t-if="state.trusting_host_key" class="fa fa-spinner fa-spin"/>
+                                        <i t-else="" class="fa fa-shield"/>
+                                        Re-trust Key
+                                    </button>
+                                </t>
+                            </IcMenu>
+                        </div>
+                        <!-- Same trash as the instance header: the footer
+                             one sits below every form tab and is absent
+                             from Overview, where a host page opens. The
+                             stylesheet keeps this group, and so the trash,
+                             last and on the right. -->
+                        <div class="ic-ab-group ic-ab-upkeep">
+                            <button class="rl-iconbtn danger ic-ab-delete"
+                                    title="Delete"
+                                    aria-label="Delete host"
+                                    t-on-click="deleteHost">
+                                <t t-out="env.icon('trash', 15)"/>
+                            </button>
+                        </div>
+                    </div>
+                </t>
+
+                <!-- ═══════════════════════════════════════════════════════════
+                     Tabs — keeps `ic-detail-tabs` so a layer's Security patch
+                     (xpath on `hasclass('ic-detail-tabs')`) resolves.
+                     ═══════════════════════════════════════════════════════════ -->
+                <div class="rl-tabs ic-detail-tabs" role="tablist">
+                    <t t-if="!isNew">
+                        <button t-att-class="state.tab === 'overview' ? 'rl-tab active' : 'rl-tab'"
+                                role="tab"
+                                t-att-aria-selected="state.tab === 'overview' ? 'true' : 'false'"
+                                t-on-click="() => this.setTab('overview')">Overview</button>
+                    </t>
+                    <button t-att-class="state.tab === 'general' ? 'rl-tab active' : 'rl-tab'"
+                            role="tab"
+                            t-att-aria-selected="state.tab === 'general' ? 'true' : 'false'"
+                            t-on-click="() => this.setTab('general')">General</button>
+                    <button t-att-class="state.tab === 'connection' ? 'rl-tab active' : 'rl-tab'"
+                            role="tab"
+                            t-att-aria-selected="state.tab === 'connection' ? 'true' : 'false'"
+                            t-on-click="() => this.setTab('connection')">Connection</button>
+                    <button t-att-class="state.tab === 'traefik' ? 'rl-tab active' : 'rl-tab'"
+                            role="tab"
+                            t-att-aria-selected="state.tab === 'traefik' ? 'true' : 'false'"
+                            t-on-click="() => this.setTab('traefik')">Traefik</button>
+                    <button t-att-class="state.tab === 'whitelist' ? 'rl-tab active' : 'rl-tab'"
+                            role="tab"
+                            t-att-aria-selected="state.tab === 'whitelist' ? 'true' : 'false'"
+                            t-on-click="() => this.setTab('whitelist')">Whitelist</button>
+                    <t t-if="canViewMetrics">
+                        <button t-att-class="state.tab === 'metrics' ? 'rl-tab active' : 'rl-tab'"
+                                role="tab"
+                                t-att-aria-selected="state.tab === 'metrics' ? 'true' : 'false'"
+                                data-tab="metrics"
+                                t-on-click="() => this.setTab('metrics')">Metrics</button>
+                    </t>
+                    <t t-if="!isNew and env.permissions?.can_manage_hosts">
+                        <button t-att-class="state.tab === 'access' ? 'rl-tab active' : 'rl-tab'"
+                                role="tab"
+                                t-att-aria-selected="state.tab === 'access' ? 'true' : 'false'"
+                                data-tab="access"
+                                t-on-click="() => this.setTab('access')">Access</button>
+                    </t>
+                    <t t-if="!isNew and env.permissions?.can_manage_hosts">
+                        <button t-att-class="state.tab === 'activity' ? 'rl-tab active' : 'rl-tab'"
+                                role="tab"
+                                t-att-aria-selected="state.tab === 'activity' ? 'true' : 'false'"
+                                t-on-click="() => this.setTab('activity')">Audit Logs</button>
+                    </t>
+                </div>
+
+                <!-- ═══════════════════════════════════════════════════════════
+                     Scrolling body
+                     ═══════════════════════════════════════════════════════════ -->
+                <div class="ic-rl-detail-scroll">
+
+                    <!-- ── Overview ───────────────────────────────────────── -->
+                    <t t-if="!isNew and state.tab === 'overview' and state.host">
+                        <div class="rl-ovcards">
+
+                            <!-- Status -->
+                            <div class="rl-ovcard">
+                                <div class="rl-ovtitle">Status</div>
+                                <div class="rl-ovrow">
+                                    <span class="rl-l">State</span>
+                                    <span t-att-class="'rl-v ' + hostVClass(state.host.status)">
+                                        <t t-esc="statusLabel(state.host.status)"/>
+                                    </span>
+                                </div>
+                                <div class="rl-ovrow">
+                                    <span class="rl-l">CPU</span>
+                                    <span class="rl-v">
+                                        <t t-if="state.host.cpu_cores" t-esc="coresLabel(state.host.cpu_cores)"/>
+                                        <t t-else="">—</t>
+                                    </span>
+                                </div>
+                                <div class="rl-ovrow">
+                                    <span class="rl-l">RAM</span>
+                                    <span class="rl-v" t-esc="formatRam(state.host.ram_total_gb)"/>
+                                </div>
+                                <div class="rl-ovrow">
+                                    <span class="rl-l">Disk</span>
+                                    <t t-if="state.host.disk">
+                                        <span t-att-class="'rl-v' + (state.host.disk >= 85 ? ' crit' : '')">
+                                            <t t-esc="state.host.disk + '%'"/>
+                                            <t t-if="diskExtra()">
+                                                <span class="rl-ov-sub" t-esc="diskExtra()"/>
+                                            </t>
+                                        </span>
+                                    </t>
+                                    <t t-else=""><span class="rl-v muted">—</span></t>
+                                </div>
+                            </div>
+
+                            <!-- Info -->
+                            <div class="rl-ovcard">
+                                <div class="rl-ovtitle">Info</div>
+                                <div class="rl-ovrow">
+                                    <span class="rl-l">Domain</span>
+                                    <span class="rl-v" t-esc="state.host.wildcard_domain || '—'"/>
+                                </div>
+                                <div class="rl-ovrow">
+                                    <span class="rl-l">Instances</span>
+                                    <span class="rl-v" t-esc="state.host.instance_count"/>
+                                </div>
+                                <div class="rl-ovrow">
+                                    <span class="rl-l">Traefik</span>
+                                    <t t-if="state.host.traefik_deployed">
+                                        <span class="rl-v ok">Deployed</span>
+                                    </t>
+                                    <t t-else=""><span class="rl-v muted">Not deployed</span></t>
+                                </div>
+                                <div class="rl-ovrow">
+                                    <span class="rl-l">SSH Key</span>
+                                    <t t-if="state.has_known_hosts_key">
+                                        <span class="rl-v ok"><t t-out="env.icon('shield', 13)"/> Trusted</span>
+                                    </t>
+                                    <t t-else="">
+                                        <span class="rl-v warn"><t t-out="env.icon('alert', 13)"/> Not trusted</span>
+                                    </t>
+                                </div>
+                                <!-- The fingerprint is the only thing an
+                                     operator can compare this host's identity
+                                     against, so it is readable here instead of
+                                     living solely in the server log. -->
+                                <div class="rl-ovrow" t-if="state.host.known_hosts_fingerprint">
+                                    <span class="rl-l">Key fingerprint</span>
+                                    <span class="rl-v rl-mono" t-esc="state.host.known_hosts_fingerprint"/>
+                                </div>
+                                <div class="rl-ovrow" t-if="state.host.revoked_key_fingerprint">
+                                    <span class="rl-l">Revoked key</span>
+                                    <span class="rl-v warn rl-mono"
+                                          title="Fingerprint the host was trusted with before its endpoint changed. Re-trust the key: an identical fingerprint means the machine did not change."
+                                          t-esc="state.host.revoked_key_fingerprint"/>
+                                </div>
+                                <t t-if="state.host.last_probed">
+                                    <div class="rl-ovrow">
+                                        <span class="rl-l">Last check</span>
+                                        <span class="rl-v" t-esc="timeAgo(state.host.last_probed)"/>
+                                    </div>
+                                </t>
+                                <!-- Whether this host is actually being
+                                     monitored. Enrolment is automatic, so
+                                     this is a health readout, not a
+                                     prompt to do something. -->
+                                <div class="rl-ovrow">
+                                    <span class="rl-l">Monitoring</span>
+                                    <span class="rl-v" t-esc="observabilityLabel"/>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Recent Activity timeline -->
+                        <p class="rl-tlh">Recent activity</p>
+                        <t t-if="state.jobsLoading and !state.jobs.length">
+                            <div class="ic-ov-activity-loading">
+                                <div class="ic-skeleton-row">
+                                    <div class="ic-skeleton-label"/>
+                                    <div class="ic-skeleton-value"/>
+                                </div>
+                                <div class="ic-skeleton-row">
+                                    <div class="ic-skeleton-label"/>
+                                    <div class="ic-skeleton-value"/>
+                                </div>
+                            </div>
+                        </t>
+                        <t t-elif="!state.jobs.length">
+                            <div class="ic-ov-activity-empty">No activity yet.</div>
+                        </t>
+                        <t t-else="">
+                            <div class="rl-tl">
+                                <t t-foreach="state.jobs.slice(0, 4)" t-as="job" t-key="job.id">
+                                    <div class="rl-tl-item" t-att-data-job-id="job.id" t-on-click="() => this.openLog(job)">
+                                        <div class="rl-tl-rail">
+                                            <span t-att-class="'rl-tl-dot ' + jobTone(job.state, job.stopping)"/>
+                                            <span class="rl-tl-line"/>
+                                        </div>
+                                        <div class="rl-tl-content">
+                                            <div class="rl-tl-head">
+                                                <span class="rl-tl-icon"><i t-att-class="'fa ' + jobIcon(job.job_type_code)"/></span>
+                                                <span class="rl-tl-name" t-esc="job.name"/>
+                                                <span t-att-class="'rl-tl-state ' + jobTone(job.state, job.stopping)"
+                                                      t-esc="jobStateText(job)"/>
+                                                <t t-if="job.requires_action">
+                                                    <span class="ic-hold" t-on-click.stop="() => {}" t-on-keydown="onHoldKeydown">
+                                                        <button type="button" class="ic-tl-alert-badge"
+                                                                t-att-aria-expanded="state.holdOpen === job.id ? 'true' : 'false'"
+                                                                t-att-aria-describedby="'ic-hold-reason-' + job.id"
+                                                                t-on-click.stop="() => this.toggleHold(job)">
+                                                            <t t-out="env.icon('alert', 13)"/> Action required
+                                                        </button>
+                                                        <span t-att-class="'ic-hold-pop' + (state.holdOpen === job.id ? ' open' : '')">
+                                                            <span class="ic-hold-reason" t-att-id="'ic-hold-reason-' + job.id" t-esc="holdReason(job)"/>
+                                                            <button type="button" class="ic-hold-link" t-on-click.stop="() => this.openHoldAlert(job)">
+                                                                <t t-out="env.icon('alert', 12)"/> Open the alert
+                                                            </button>
+                                                        </span>
+                                                    </span>
+                                                </t>
+                                                <span class="rl-tl-loghint"><t t-out="env.icon('terminal', 12)"/> Log</span>
+                                            </div>
+                                            <t t-if="job.last_system_message">
+                                                <div class="rl-tl-msg" t-esc="job.last_system_message"/>
+                                            </t>
+                                            <div class="rl-tl-foot">
+                                                <span class="rl-when">
+                                                    <t t-esc="formatDate(job.create_date)"/>
+                                                    <t t-esc="' (' + timeAgo(job.create_date) + ')'"/>
+                                                </span>
+                                                <div class="rl-acts">
+                                                    <t t-if="isActiveJob(job.state) or job.state === 'blocked'">
+                                                        <button class="rl-tl-abtn"
+                                                                t-on-click="(ev) => this.cancelJob(ev, job)">
+                                                            <t t-out="env.icon('x', 11)"/> Cancel
+                                                        </button>
+                                                    </t>
+                                                    <t t-if="job.state === 'failed'">
+                                                        <button class="rl-tl-abtn"
+                                                                t-on-click="(ev) => this.retryJob(ev, job)">
+                                                            <t t-out="env.icon('refresh', 11)"/> Retry
+                                                        </button>
+                                                    </t>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </t>
+                            </div>
+                            <t t-if="hasMoreJobs or state.jobs.length > 4">
+                                <button class="rl-btn rl-btn-ghost" style="margin-top:6px" t-on-click="viewAllJobs">
+                                    View all activity <t t-out="env.icon('fwd', 15)"/>
+                                </button>
+                            </t>
+                        </t>
+                    </t>
+
+                    <!-- ── Config tabs (everything except overview) ───────── -->
+                    <t t-if="state.tab !== 'overview'">
+
+                        <!-- ── General tab: the host's groups on the record grid
+                             (form standard §2–§4). ───────────────────────── -->
+                        <t t-if="state.tab === 'general'">
+                            <section class="ic-set-block ic-host-group" aria-labelledby="hd-g-details">
+                                <div class="ic-set-block__head">
+                                    <h3 class="ic-set-block__title" id="hd-g-details">Details</h3>
+                                </div>
+                                <div class="ic-set-block__body">
+                                    <div class="ic-rgrid">
+                                        <div class="rl-frow ic-w-m"
+                                             t-att-class="validator.fieldError('name') ? 'has-error' : ''">
+                                            <label for="hd-name">Name <span class="rl-req">*</span></label>
+                                            <input id="hd-name" type="text" aria-required="true"
+                                                   t-att-aria-invalid="validator.fieldError('name') ? 'true' : undefined"
+                                                   t-att-aria-describedby="validator.fieldError('name') ? 'hd-err-name' : undefined"
+                                                   t-att-value="state.form.name"
+                                                   t-on-input="(ev) => this.onInput('name', ev)"
+                                                   t-on-blur="() => validator.touch('name')"/>
+                                            <t t-if="validator.fieldError('name')">
+                                                <span class="ic-field-error"
+                                                      t-att-id="'hd-err-name'" t-esc="validator.fieldError('name')"/>
+                                            </t>
+                                        </div>
+                                        <div class="ic-w-m ic-rgrid__gap" aria-hidden="true"/>
+                                        <div class="rl-frow ic-w-m"
+                                             t-att-class="validator.fieldError('ip_address') ? 'has-error' : ''">
+                                            <label for="hd-ip_address">IP address <span class="rl-req">*</span></label>
+                                            <input id="hd-ip_address" type="text" aria-required="true"
+                                                   t-att-aria-invalid="validator.fieldError('ip_address') ? 'true' : undefined"
+                                                   t-att-aria-describedby="validator.fieldError('ip_address') ? 'hd-err-ip_address' : undefined"
+                                                   t-att-value="state.form.ip_address"
+                                                   t-on-input="(ev) => this.onInput('ip_address', ev)"
+                                                   t-on-blur="() => validator.touch('ip_address')"/>
+                                            <t t-if="validator.fieldError('ip_address')">
+                                                <span class="ic-field-error"
+                                                      t-att-id="'hd-err-ip_address'" t-esc="validator.fieldError('ip_address')"/>
+                                            </t>
+                                        </div>
+                                        <div class="rl-frow ic-w-s"
+                                             t-att-class="validator.fieldError('port') ? 'has-error' : ''">
+                                            <label for="hd-port">Port <span class="rl-req">*</span></label>
+                                            <input id="hd-port" type="number" aria-required="true"
+                                                   t-att-aria-invalid="validator.fieldError('port') ? 'true' : undefined"
+                                                   t-att-aria-describedby="validator.fieldError('port') ? 'hd-err-port' : undefined"
+                                                   t-att-value="state.form.port"
+                                                   t-on-input="(ev) => this.onInput('port', ev)"
+                                                   t-on-blur="() => validator.touch('port')"/>
+                                            <t t-if="validator.fieldError('port')">
+                                                <span class="ic-field-error"
+                                                      t-att-id="'hd-err-port'" t-esc="validator.fieldError('port')"/>
+                                            </t>
+                                        </div>
+                                        <div class="rl-frow ic-w-l">
+                                            <label for="hd-tags">Tags</label>
+                                            <TagSelector
+                                                id="'hd-tags'"
+                                                selected="state.selectedTags"
+                                                available="state.allTags"
+                                                onAdd.bind="addTag"
+                                                onRemove.bind="removeTag"
+                                                onCreate.bind="createTag"
+                                            />
+                                        </div>
+                                        <div class="rl-frow ic-w-l">
+                                            <label for="hd-description">Description</label>
+                                            <textarea id="hd-description" rows="4"
+                                                      t-att-value="state.form.description"
+                                                      t-on-input="(ev) => this.onInput('description', ev)"/>
+                                        </div>
+                                        <div class="rl-frow ic-w-l">
+                                            <label for="hd-exclude_from_autoassign">Auto-assignment</label>
+                                            <div class="ic-host-check">
+                                                <input id="hd-exclude_from_autoassign" type="checkbox"
+                                                       aria-describedby="hd-exclude_from_autoassign-help"
+                                                       t-att-checked="state.form.exclude_from_autoassign"
+                                                       t-on-change="(ev) => { this.state.form.exclude_from_autoassign = ev.target.checked; }"/>
+                                                <span>Exclude from auto-assignment</span>
+                                            </div>
+                                            <span class="ic-form-note" id="hd-exclude_from_autoassign-help">
+                                                When checked, this host will not be selected automatically for new instances.
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </section>
+
+                            <!-- Where new instances go: a layer's rows, a host pool
+                                 or warm spares, added by xpath on this grid, which
+                                 stays a direct child of this tab with `ic-form-grid`.
+                                 Empty, as here alone and on New Host, it is not
+                                 shown (host_detail.scss); Auto-assignment, a single
+                                 field, is in Details (form standard §3). -->
+                            <div class="ic-set-block ic-host-group ic-host-placement ic-form-grid"
+                                 role="group" aria-labelledby="hd-g-placement">
+                                <div class="ic-set-block__head">
+                                    <h3 class="ic-set-block__title" id="hd-g-placement">Placement</h3>
+                                </div>
+                            </div>
+
+                            <!-- How visitors reach the host, and what its proxy
+                                 believes about them. -->
+                            <section class="ic-set-block ic-host-group" aria-labelledby="hd-g-edge">
+                                <div class="ic-set-block__head">
+                                    <h3 class="ic-set-block__title" id="hd-g-edge">Network edge</h3>
+                                    <button type="button" class="ic-set-how"
+                                            t-att-aria-expanded="state.edgeHowOpen ? 'true' : 'false'"
+                                            t-on-click="() => { this.state.edgeHowOpen = !this.state.edgeHowOpen; }">
+                                        <i class="fa fa-info-circle" aria-hidden="true"/> How it works
+                                    </button>
+                                    <div id="hd-g-edge-how" class="ic-set-how__text" t-if="state.edgeHowOpen">
+                                        <p>The rate limit counts a visitor by the address that opened the connection or, with Reached through a CDN on, by the forwarded client, so one CDN edge is not one bucket shared by everyone behind it. Turning Reached through a CDN on for a host the world reaches directly is the worse mistake of the two: a direct request carries no forwarded chain, so every visitor collapses into a single shared bucket.</p>
+                                        <p>The HTTP connection-rate cap is enforced by the host firewall and applies on the next hardening run. Behind a CDN it is not applied: the CDN's allowlist replaces it.</p>
+                                        <p>Every instance on this host shares a network with the proxy. With Proxy network on, the host's firewall keeps one instance from reaching another directly, past the proxy and the CDN. Full Setup applies it, or removes it.</p>
+                                        <p>Traefik believes X-Forwarded-For only on connections from the ranges applied to this host, and strips it from every other, which is what makes the header unspoofable and lets the per-client rate limit key on the real visitor instead of a handful of edge addresses. The ranges are whatever the platform supplies, unless this host's override pins it to a different proxy than the rest.</p>
+                                        <p>Direct access is ignored while no range is applied, where it would lock out every visitor. An empty override does not mean that, since the platform may be supplying the list.</p>
+                                        <p>The CDN's addresses are shared by all its customers; only your zone's client certificate tells your traffic apart. Leave the certificate authority empty to accept any connection the firewall lets in; it is applied by Full Setup or Push Trusted Proxy Settings.</p>
+                                    </div>
+                                </div>
+                                <div class="ic-set-block__body">
+                                    <div class="ic-rgrid">
+                                        <div class="rl-frow ic-w-s">
+                                            <label for="hd-http_conn_rate">HTTP connection-rate cap</label>
+                                            <input id="hd-http_conn_rate" type="number" min="0" step="1"
+                                                   aria-describedby="hd-http_conn_rate-help"
+                                                   t-att-value="state.form.http_conn_rate"
+                                                   t-on-input="(ev) => this.onInput('http_conn_rate', ev)"/>
+                                        </div>
+                                        <span class="ic-form-note ic-w-l ic-rgrid__note" id="hd-http_conn_rate-help">
+                                            New connections per second one source may open on ports 80/443. 0 turns it off.
+                                        </span>
+                                        <div class="rl-frow ic-w-l">
+                                            <label for="host-shared-guard">Proxy network</label>
+                                            <div class="ic-host-check">
+                                                <input id="host-shared-guard" type="checkbox"
+                                                       aria-describedby="host-shared-guard-help"
+                                                       t-att-checked="state.form.shared_guard"
+                                                       t-on-change="(ev) => { this.state.form.shared_guard = ev.target.checked; }"/>
+                                                <span>Only the proxy may open connections to the instances</span>
+                                            </div>
+                                            <span class="ic-form-note" id="host-shared-guard-help">
+                                                Keeps one instance from reaching another directly, past the proxy. Applied by Full Setup.
+                                            </span>
+                                        </div>
+                                        <div class="rl-frow ic-w-l">
+                                            <span class="ic-ro-label">Applied to this host</span>
+                                            <div t-if="state.effectiveProxyRanges.length">
+                                                <code t-esc="state.effectiveProxyRanges.join(', ')"/>
+                                            </div>
+                                            <div t-else="">
+                                                <em>No proxy is trusted. This host is treated as answering its visitors directly.</em>
+                                            </div>
+                                            <span class="ic-form-note">
+                                                <t t-if="state.effectiveProxyRanges.length">
+                                                    Source: <t t-esc="proxySourceLabel()"/>.
+                                                </t>
+                                                <t t-if="proxyChangePending()">
+                                                    <strong>Not applied yet.</strong> Traefik on this host is still running the previous list; use Push Trusted Proxy Settings, or a full setup run, to ship it.
+                                                </t>
+                                            </span>
+                                        </div>
+                                        <div class="rl-frow ic-w-l">
+                                            <label for="hd-block_direct_access">Direct access</label>
+                                            <div class="ic-host-check">
+                                                <input id="hd-block_direct_access" type="checkbox"
+                                                       aria-describedby="hd-block_direct_access-help"
+                                                       t-att-checked="state.form.block_direct_access"
+                                                       t-on-change="(ev) => { this.state.form.block_direct_access = ev.target.checked; }"/>
+                                                <span>Only accept traffic from the proxies applied above</span>
+                                            </div>
+                                            <span class="ic-form-note" id="hd-block_direct_access-help">
+                                                Refuses HTTPS requests that reached this host without going through one of them, so its address cannot be used to bypass the edge.
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <!-- The CDN's side of it: right as they are for
+                                     nearly every host, and wrong without a sign on
+                                     this screen (form standard §4). -->
+                                <SettingAdvanced fields="['behind_cdn', 'trusted_proxy_ranges', 'cdn_client_ca']"
+                                                 form="state.form">
+                                    <div class="ic-set-block__body">
+                                        <div class="ic-rgrid">
+                                            <div class="rl-frow ic-w-l">
+                                                <label for="hd-behind_cdn">Reached through a CDN</label>
+                                                <div class="ic-host-check">
+                                                    <input id="hd-behind_cdn" type="checkbox"
+                                                           aria-describedby="hd-behind_cdn-help"
+                                                           t-att-checked="state.form.behind_cdn"
+                                                           t-on-change="(ev) => { this.state.form.behind_cdn = ev.target.checked; }"/>
+                                                    <span>Visitors reach this host through a CDN or reverse proxy</span>
+                                                </div>
+                                                <span class="ic-form-note" id="hd-behind_cdn-help">
+                                                    Decides how the rate limit identifies a visitor.
+                                                </span>
+                                            </div>
+                                            <div class="rl-frow ic-w-l">
+                                                <label for="hd-trusted_proxy_ranges">Trusted proxy ranges (override)</label>
+                                                <textarea id="hd-trusted_proxy_ranges" rows="3"
+                                                          aria-describedby="hd-trusted_proxy_ranges-help"
+                                                          t-att-value="state.form.trusted_proxy_ranges"
+                                                          t-on-input="(ev) => this.onInput('trusted_proxy_ranges', ev)"/>
+                                                <span class="ic-form-note" id="hd-trusted_proxy_ranges-help">
+                                                    One CIDR range per line, e.g. 198.51.100.0/24 or 2001:db8::/32. Leave empty to use what the platform supplies.
+                                                </span>
+                                            </div>
+                                            <div class="rl-frow ic-w-l">
+                                                <label for="hd-cdn_client_ca">CDN client certificate authority</label>
+                                                <textarea id="hd-cdn_client_ca" rows="4" spellcheck="false"
+                                                          aria-describedby="hd-cdn_client_ca-help"
+                                                          placeholder="-----BEGIN CERTIFICATE-----"
+                                                          t-att-value="state.form.cdn_client_ca"
+                                                          t-on-input="(ev) => this.onInput('cdn_client_ca', ev)"/>
+                                                <span class="ic-form-note" id="hd-cdn_client_ca-help">
+                                                    With direct access refused, also require every TLS connection to present a client certificate signed by this authority.
+                                                </span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </SettingAdvanced>
+                            </section>
+
+                            <!-- The platform's own traffic to the host, past the CDN. -->
+                            <t t-if="env.features?.observability?.configure !== false">
+                                <section class="ic-set-block ic-host-group" aria-labelledby="hd-g-internal">
+                                    <div class="ic-set-block__head">
+                                        <h3 class="ic-set-block__title" id="hd-g-internal">Internal traffic</h3>
+                                    </div>
+                                    <div class="ic-set-block__body">
+                                        <div class="ic-rgrid">
+                                            <div class="rl-frow ic-w-s">
+                                                <label for="host-direct-port">Direct port</label>
+                                                <input id="host-direct-port" type="number" min="0" step="1"
+                                                       placeholder="9443"
+                                                       aria-describedby="host-direct-port-help"
+                                                       t-att-value="state.form.direct_port"
+                                                       t-on-input="(ev) => this.onInput('direct_port', ev)"/>
+                                            </div>
+                                            <span class="ic-form-note ic-w-l ic-rgrid__note" id="host-direct-port-help">
+                                                Port the platform's own servers use to reach this host without the CDN. Applied by Full Setup.
+                                                <t t-if="directPortPending"><strong>Not applied yet.</strong></t>
+                                            </span>
+                                            <div class="rl-frow ic-w-l">
+                                                <label for="host-direct-opt-out">Use the public path</label>
+                                                <div class="ic-host-check">
+                                                    <input id="host-direct-opt-out" type="checkbox"
+                                                           t-att-checked="state.form.direct_path_opt_out"
+                                                           t-on-change="(ev) => { this.state.form.direct_path_opt_out = ev.target.checked; }"/>
+                                                    <span>This host's agents, and the panels that run on it, keep going through the CDN.</span>
+                                                </div>
+                                            </div>
+                                            <div class="rl-frow ic-w-l" t-if="state.directPortShipped">
+                                                <span class="ic-ro-label">Admitted on the direct port</span>
+                                                <div><code t-esc="state.directAllowlist.join(', ')"/></div>
+                                                <span class="ic-form-note" t-if="state.directAllowlistPending">
+                                                    <strong>pending</strong>
+                                                </span>
+                                            </div>
+                                            <div class="rl-frow ic-w-l" t-if="state.agentsWriteUrl">
+                                                <span class="ic-ro-label">Agents write to</span>
+                                                <div><code t-esc="state.agentsWriteUrl"/></div>
+                                                <span class="ic-form-note" t-if="state.directReachReason"
+                                                      t-esc="state.directReachReason"/>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </section>
+                            </t>
+                        </t>
+
+                        <!-- ── Connection tab ───────────────────────────────────── -->
+                        <t t-if="state.tab === 'connection'">
+                            <div class="rl-fgrid">
+                                <div class="rl-frow"
+                                     t-att-class="validator.fieldError('user') ? 'has-error' : ''">
+                                    <label for="hd-user">User <span class="rl-req">*</span></label>
+                                    <input id="hd-user" aria-required="true"
+                    t-att-aria-invalid="validator.fieldError('user') ? 'true' : undefined"
+                    t-att-aria-describedby="validator.fieldError('user') ? 'hd-err-user' : undefined" type="text" placeholder="ubuntu"
+                                           t-att-value="state.form.user"
+                                           t-on-input="(ev) => this.onInput('user', ev)"
+                                           t-on-blur="() => validator.touch('user')"/>
+                                    <t t-if="validator.fieldError('user')">
+                                        <span class="ic-field-error"
+                      t-att-id="'hd-err-user'" t-esc="validator.fieldError('user')"/>
+                                    </t>
+                                </div>
+                                <div class="rl-frow">
+                                    <label for="hd-login_type">Login type <span class="rl-req">*</span></label>
+                                    <RlSelect id="'hd-login_type'"
+                                              value="state.form.login_type"
+                                              options="loginTypeOptions"
+                                              onChange="(value) => this.onSelect('login_type', { target: { value: value } })"
+                                              ariaLabel="'Login type'"/>
+                                    <span class="ic-form-note" t-if="!state.passwordLoginAvailable and !passwordHostWithoutSshpass">
+                                        This panel's server has no sshpass, so hosts are added with an SSH key.
+                                    </span>
+                                    <span class="ic-form-note ic-field-error" t-if="passwordHostWithoutSshpass" role="alert">
+                                        This host logs in with a password, but this panel's server has no sshpass, so Ansible cannot reach it. Install sshpass on the panel's server and restart it, or switch the host to an SSH key.
+                                    </span>
+                                </div>
+                                <t t-if="state.form.login_type === 'password'">
+                                    <div class="rl-frow rl-full">
+                                        <label for="hd-password" id="hd-password-label">Password</label>
+                                        <PasswordInput
+                                            id="'hd-password'"
+                                            value="state.form.password"
+                                            hasValue="state.has_password"
+                                            required="true"
+                                            onChange="(val) => this.onPasswordChange('password', val)"/>
+                                    </div>
+                                </t>
+                                <t t-else="">
+                                    <div class="rl-frow rl-full" t-if="isNew">
+                                        <span class="ic-ro-label" id="host-key-source-label">SSH key</span>
+                                        <div class="ic-key-source" role="radiogroup"
+                                             aria-labelledby="host-key-source-label">
+                                            <label class="ic-key-source__option" for="hd-key-source-generate">
+                                                <input id="hd-key-source-generate" type="radio" name="host-key-source" value="generate"
+                                                       t-att-checked="state.form.key_source === 'generate'"
+                                                       t-on-change="() => { this.state.form.key_source = 'generate'; }"/>
+                                                Generate a key for me
+                                            </label>
+                                            <label class="ic-key-source__option" for="hd-key-source-upload">
+                                                <input id="hd-key-source-upload" type="radio" name="host-key-source" value="upload"
+                                                       t-att-checked="state.form.key_source === 'upload'"
+                                                       t-on-change="() => { this.state.form.key_source = 'upload'; }"/>
+                                                Upload my own private key
+                                            </label>
+                                        </div>
+                                    </div>
+                                    <div class="rl-frow rl-full" t-if="!isNew or state.form.key_source === 'upload'">
+                                        <label for="hd-key_file">SSH private key <span class="rl-req">*</span></label>
+                                        <input id="hd-key_file" type="file" accept=".pem,.key,.txt" t-ref="keyFile"
+                                               t-on-change="onKeyFileChange"/>
+                                        <t t-if="!isNew and state.has_key_file and !state.form.key_file">
+                                            <span class="ic-form-note ic-form-note--set">
+                                                <t t-out="env.icon('check', 15)"/> Key stored — upload a new file only to replace it.
+                                            </span>
+                                        </t>
+                                    </div>
+                                    <div class="rl-frow rl-full ic-host-pubkey" t-if="sshPublicKey">
+                                        <span class="ic-ro-label">Public key</span>
+                                        <div class="ic-copy-field">
+                                            <code class="ic-copy-field__value" t-esc="sshPublicKey"
+                                                  t-on-copy="() => this.markKeyShared()"/>
+                                            <button type="button" class="ic-copy-field__btn"
+                                                    title="Copy the public key" aria-label="Copy the public key"
+                                                    t-on-click="() => this.copyText(sshPublicKey, 'key')">
+                                                <i t-att-class="state.copied === 'key' ? 'fa fa-check' : 'fa fa-clipboard'"/>
+                                            </button>
+                                        </div>
+                                        <span class="ic-form-note" t-if="isNew">
+                                            Paste it in your provider's SSH key field when you create the server.
+                                        </span>
+                                        <span class="ic-form-note" t-if="isNew">
+                                            Keep this page open until you create the host.
+                                        </span>
+                                        <span class="ic-form-note">
+                                            If the server already exists, run this on it as the user above:
+                                        </span>
+                                        <div class="ic-copy-field">
+                                            <code class="ic-copy-field__value" t-esc="authorizedKeysCommand"
+                                                  t-on-copy="() => this.markKeyShared()"/>
+                                            <button type="button" class="ic-copy-field__btn"
+                                                    title="Copy the command" aria-label="Copy the command"
+                                                    t-on-click="() => this.copyText(authorizedKeysCommand, 'command')">
+                                                <i t-att-class="state.copied === 'command' ? 'fa fa-check' : 'fa fa-clipboard'"/>
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div class="rl-frow rl-full" t-elif="isNew and state.form.key_source === 'generate'">
+                                        <t t-if="state.keyGenerateFailed">
+                                            <span class="ic-field-error">The key could not be generated.</span>
+                                            <button type="button" class="rl-btn rl-btn-ghost rl-btn-sm"
+                                                    t-on-click="() => this.generateKey()">Try again</button>
+                                        </t>
+                                        <span class="ic-form-note" t-else="">Generating a key…</span>
+                                    </div>
+                                </t>
+                                <div class="rl-frow rl-full" t-if="!isNew">
+                                    <label for="host-security-logs">Send security logs</label>
+                                    <div style="display: flex; align-items: center; gap: 8px;">
+                                        <input id="host-security-logs" type="checkbox"
+                                               t-att-checked="state.form.security_logs_enabled"
+                                               t-att-disabled="!securityLogsSwitchable"
+                                               t-on-change="(ev) => { this.state.form.security_logs_enabled = ev.target.checked; }"/>
+                                        <span>SSH sign-ins and failed attempts (address, user, key), sudo commands, fail2ban's blocks, changes to passwd, shadow, sudoers and the SSH configuration, and the failed sign-ins to its instances (address, instance and time), sent to the metrics central and kept there 90 days. This server can add to them but cannot delete them. Off stops sending; what was sent expires on its own.</span>
+                                    </div>
+                                    <span class="ic-form-note" t-if="state.securityLogsAvailable === false">
+                                        Coming soon.
+                                    </span>
+                                    <span class="ic-form-note" t-elif="!observabilityCollects">
+                                        Observability is off on this panel: agents already installed keep sending until it is on again, and a change here applies then.
+                                    </span>
+                                </div>
+                            </div>
+                        </t>
+
+                        <!-- ── Traefik tab ──────────────────────────────────────── -->
+                        <t t-if="state.tab === 'traefik'">
+                            <!-- Keeps `ic-traefik-meta` so a layer's DNS patch
+                                 (xpath on this grid) resolves. -->
+                            <div class="rl-fgrid ic-traefik-meta">
+                                <div class="rl-frow"
+                                     t-att-class="validator.fieldError('wildcard_domain') ? 'has-error' : ''">
+                                    <label for="hd-wildcard_domain">Wildcard domain <span class="rl-req">*</span></label>
+                                    <input id="hd-wildcard_domain" aria-required="true"
+                    t-att-aria-invalid="validator.fieldError('wildcard_domain') ? 'true' : undefined"
+                    t-att-aria-describedby="validator.fieldError('wildcard_domain') ? 'hd-err-wildcard_domain' : undefined" type="text" placeholder="example.com"
+                                           t-att-value="state.form.wildcard_domain"
+                                           t-on-input="(ev) => this.onInput('wildcard_domain', ev)"
+                                           t-on-blur="() => validator.touch('wildcard_domain')"/>
+                                    <t t-if="validator.fieldError('wildcard_domain')">
+                                        <span class="ic-field-error"
+                      t-att-id="'hd-err-wildcard_domain'" t-esc="validator.fieldError('wildcard_domain')"/>
+                                    </t>
+                                </div>
+                                <div class="rl-frow">
+                                    <label for="hd-traefik_panel_password" id="hd-traefik_panel_password-label">Panel password</label>
+                                    <PasswordInput
+                                        id="'hd-traefik_panel_password'"
+                                        value="state.form.traefik_panel_password"
+                                        autoGenerate="true"
+                                        hasValue="state.has_traefik_panel_password"
+                                        onChange="(val) => this.onPasswordChange('traefik_panel_password', val)"/>
+                                </div>
+                                <div class="rl-frow rl-full">
+                                    <label for="hd-tls_default_cert">Default certificate <span class="rl-opt">— served when a router has none of its own; what a CDN in front connects to</span></label>
+                                    <textarea id="hd-tls_default_cert" rows="5" spellcheck="false"
+                                              placeholder="-----BEGIN CERTIFICATE-----"
+                                              t-att-value="state.form.tls_default_cert"
+                                              t-on-input="(ev) => this.onInput('tls_default_cert', ev)"/>
+                                    <t t-if="state.tls_default_info">
+                                        <span class="ic-form-note">
+                                            Covers <t t-esc="state.tls_default_info.hostnames.join(', ') || '—'"/>
+                                            · expires <t t-esc="state.tls_default_info.expires_on"/>
+                                            · <t t-esc="state.tls_default_info.issuer"/>
+                                        </span>
+                                    </t>
+                                </div>
+                                <div class="rl-frow rl-full">
+                                    <label for="hd-tls_default_key">Default certificate key <span class="rl-opt" t-if="state.has_tls_default_key">— stored; paste a new one to replace it</span></label>
+                                    <textarea id="hd-tls_default_key" rows="5" spellcheck="false" autocomplete="off"
+                                              placeholder="-----BEGIN PRIVATE KEY-----"
+                                              t-att-value="state.form.tls_default_key"
+                                              t-on-input="(ev) => this.onInput('tls_default_key', ev)"/>
+                                    <span class="ic-form-note">Reaches the host with Push Trusted Proxy Settings or Full Setup. Clear the certificate to remove both.</span>
+                                </div>
+                            </div>
+                            <div class="ic-file-tabs">
+                                <t t-foreach="traefikFiles" t-as="f" t-key="f.key">
+                                    <button t-att-class="state.traefik_file === f.key ? 'ic-file-tab active' : 'ic-file-tab'"
+                                            t-on-click="() => this.setTraefikFile(f.key)">
+                                        <t t-esc="f.label"/>
+                                    </button>
+                                </t>
+                            </div>
+                            <div class="ic-code-editor-wrap">
+                                <div class="ic-code-gutter">
+                                    <t t-foreach="getLineNumbers(state.traefik_file)" t-as="n" t-key="n">
+                                        <div class="ic-line-num" t-esc="n"/>
+                                    </t>
+                                </div>
+                                <textarea class="ic-code-area" spellcheck="false"
+                                          autocomplete="off" autocorrect="off" autocapitalize="off"
+                                          t-att-value="state.form[state.traefik_file]"
+                                          t-on-input="(ev) => this.onInput(state.traefik_file, ev)"
+                                          t-on-scroll="onCodeScroll"/>
+                            </div>
+                        </t>
+
+                        <!-- ── Whitelist tab ────────────────────────────────────── -->
+                        <!-- Keep the exact `state.tab === 'whitelist'` t-if as the
+                             anchor a layer's Security patch appends after. -->
+                        <t t-if="state.tab === 'whitelist'">
+                            <div class="ic-whitelist-panel">
+                                <p class="rl-tabnote">
+                                    Hostnames that test instances on this host can reach
+                                    through the <code>globalwhitelist</code> proxy.
+                                    Click <strong>Apply Whitelist</strong> to push changes.
+                                </p>
+                                <p class="rl-tabnote">
+                                    This list is also what a new staging on this host starts with. Changing it here does not change the stagings that already exist — each one keeps its own list, on its own Whitelist tab.
+                                </p>
+                                <div class="rl-card ic-whitelist-card">
+                                    <t t-foreach="state.form.whitelist" t-as="hostname" t-key="hostname">
+                                        <div class="rl-row ic-whitelist-item">
+                                            <span class="rl-mono ic-whitelist-hostname" t-esc="hostname"/>
+                                            <span class="rl-rspacer"/>
+                                            <button class="rl-iconbtn danger" title="Remove"
+                                                    t-on-click="() => this.removeWhitelistEntry(hostname)">
+                                                <t t-out="env.icon('x', 14)"/>
+                                            </button>
+                                        </div>
+                                    </t>
+                                    <t t-if="state.form.whitelist.length === 0">
+                                        <div class="ic-whitelist-empty">No hosts in whitelist.</div>
+                                    </t>
+                                </div>
+                                <div class="ic-whitelist-add">
+                                    <input type="text" placeholder="e.g. api.example.com"
+                                           t-att-value="state.form.newWhitelistEntry"
+                                           t-on-input="(ev) => { state.form.newWhitelistEntry = ev.target.value; }"
+                                           t-on-keydown="onWhitelistKeydown"/>
+                                    <button class="rl-btn rl-btn-ghost"
+                                            t-on-click="() => this.addWhitelistEntry()">
+                                        <t t-out="env.icon('plus', 15)"/> Add
+                                    </button>
+                                </div>
+                                <t t-if="!isNew">
+                                    <div class="ic-whitelist-apply-row">
+                                        <button class="rl-btn rl-btn-primary" t-on-click="applyWhitelist">
+                                            <i class="fa fa-upload"/> Apply Whitelist on Host
+                                        </button>
+                                    </div>
+                                </t>
+                            </div>
+                        </t>
+
+                        <!-- ── Metrics: the server's performance, drawn by the
+                             panel from the metrics central. -->
+                        <t t-if="state.tab === 'metrics' and canViewMetrics">
+                            <div class="ic-host-metrics">
+                                <div class="ic-mb-seg ic-host-metrics-view" role="group" aria-label="Metrics view">
+                                    <button type="button" t-att-class="'ic-mb-segbtn' + (state.metricsView === 'performance' ? ' active' : '')"
+                                            t-att-aria-pressed="state.metricsView === 'performance' ? 'true' : 'false'"
+                                            data-view="performance"
+                                            t-on-click="() => { state.metricsView = 'performance'; }">Performance</button>
+                                    <button type="button" t-att-class="'ic-mb-segbtn' + (state.metricsView === 'security' ? ' active' : '')"
+                                            t-att-aria-pressed="state.metricsView === 'security' ? 'true' : 'false'"
+                                            data-view="security"
+                                            t-on-click="() => { state.metricsView = 'security'; }">Security</button>
+                                </div>
+                                <HostSecurityBoard t-if="state.metricsView === 'security'" hostId="props.host_id" canConfigure="canConfigureObservability"/>
+                                <HostBoard t-else="" hostId="props.host_id" canConfigure="canConfigureObservability"/>
+                            </div>
+                        </t>
+
+                        <!-- ── Access: how the panel signs in, who did, and
+                             what deleting the server takes off it. -->
+                        <t t-if="state.tab === 'access' and !isNew">
+                            <HostAccess hostId="props.host_id" onOpenSecurity.bind="openSecurityView"/>
+                        </t>
+
+                        <!-- ── Audit Logs ───────────────────────────────────── -->
+                        <t t-if="state.tab === 'activity'">
+                            <div class="ic-activity-panel">
+
+                                <!-- Filter bar -->
+                                <div class="ic-audit-filters">
+                                    <input class="ic-audit-search" type="text"
+                                           placeholder="Search user or action…"
+                                           t-att-value="state.auditFilter.q"
+                                           t-on-input="(ev) => { state.auditFilter.q = ev.target.value; }"/>
+                                    <div class="ic-audit-select" style="max-width:240px">
+                                        <RlSelect options="state.auditActions"
+                                                  emptyLabel.translate="All actions"
+                                                  value="state.auditFilter.action"
+                                                  onChange="(value) => { state.auditFilter.action = value; }"
+                                                  ariaLabel="'Filter by action'"/>
+                                    </div>
+                                    <input class="ic-audit-date" type="date"
+                                           t-att-value="state.auditFilter.date_from"
+                                           t-on-change="(ev) => { state.auditFilter.date_from = ev.target.value; }"/>
+                                    <span class="ic-audit-date-sep">→</span>
+                                    <input class="ic-audit-date" type="date"
+                                           t-att-value="state.auditFilter.date_to"
+                                           t-on-change="(ev) => { state.auditFilter.date_to = ev.target.value; }"/>
+                                    <button class="rl-btn rl-btn-ghost rl-btn-sm" t-on-click="applyAuditFilter">Apply</button>
+                                    <button class="rl-btn rl-btn-ghost rl-btn-sm" t-on-click="resetAuditFilter">Reset</button>
+                                    <div class="ic-audit-spacer"/>
+                                    <IcPager offset="state.auditOffset" limit="pageSize"
+                                             total="state.auditTotal"
+                                             onPage="(o) => this.auditGoPage(o)"/>
+                                </div>
+
+                                <t t-if="state.auditLogLoading">
+                                    <div class="history-loading">Loading…</div>
+                                </t>
+                                <t t-elif="!state.auditLog.length">
+                                    <div class="rl-stub">
+                                        <span class="rl-si"><i class="fa fa-history"/></span>
+                                        <h3>No entries found</h3>
+                                        <p>No audit log entries match the current filters.</p>
+                                    </div>
+                                </t>
+                                <t t-else="">
+                                    <table class="rl-table rl-table--audit">
+                                        <thead>
+                                            <tr>
+                                                <th>Date</th>
+                                                <th>User</th>
+                                                <th>Action</th>
+                                                <th>Details</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <t t-foreach="state.auditLog" t-as="entry" t-key="entry.id">
+                                                <tr>
+                                                    <td class="rl-mono" t-esc="formatDate(entry.create_date)"/>
+                                                    <td t-esc="entry.user_name"/>
+                                                    <td class="rl-mono" t-esc="entry.action"/>
+                                                    <td t-esc="entry.details || '—'"/>
+                                                </tr>
+                                            </t>
+                                        </tbody>
+                                    </table>
+                                </t>
+                            </div>
+                        </t>
+
+                    </t>
+
+                </div>
+
+                <!-- Footer: purge (activity tab), or Delete at the end of the
+                     page and, for a new host, the button that creates it;
+                     hidden on overview and metrics -->
+                <t t-if="state.tab !== 'overview' and state.tab !== 'metrics'">
+                    <div t-if="state.tab === 'activity' or isNew or env.permissions?.can_manage_hosts"
+                         class="rl-formfoot">
+                        <t t-if="state.tab === 'activity'">
+                            <button class="ic-audit-purge-btn"
+                                    t-att-disabled="state.auditPurging"
+                                    title="Delete entries older than the configured retention period"
+                                    t-on-click="purgeAuditLogs">
+                                <i t-att-class="'fa ' + (state.auditPurging ? 'fa-spinner fa-spin' : 'fa-trash-o')"/>
+                                Purge old logs
+                            </button>
+                        </t>
+                        <t t-elif="isNew">
+                            <span class="rl-ff-hint">Fill in the required fields *</span>
+                            <button class="rl-btn rl-btn-primary"
+                                    t-att-disabled="state.saving"
+                                    t-on-click="save">
+                                <t t-if="state.saving">
+                                    <i class="fa fa-spinner fa-spin" style="margin-right:5px"/>
+                                    <t t-if="isNew">Creating…</t>
+                                </t>
+                                <t t-else="">
+                                    <t t-if="isNew">Create Host</t>
+                                </t>
+                            </button>
+                        </t>
+                        <t t-else="">
+                            <button class="rl-btn rl-btn-danger ic-formfoot-delete" t-on-click="deleteHost">
+                                <t t-out="env.icon('trash', 15)"/> Delete
+                            </button>
+                        </t>
+                    </div>
+                </t>
+                <!-- Saving an existing host is the save bar's, on every tab -->
+                <SaveBar t-if="!isNew" count="unsavedCount" saving="state.saving"
+                         onSave.bind="save" onDiscard.bind="discard" reserveSpace="true"/>
+
+            </t>
+
+            <!-- Error state -->
+            <t t-elif="state.error">
+                <div class="ic-detail-error-state" role="alert">
+                    <p t-esc="state.error"/>
+                    <button t-on-click="goBack">← Back to Hosts</button>
+                </div>
+            </t>
+
+            <!-- Import instance file browser -->
+            <t t-if="state.showImportBrowser and props.host_id">
+                <RemoteFileBrowser
+                    hostId="props.host_id"
+                    onSelect="(r) => this.onImportSelect(r)"
+                    onCancel="() => this.closeImportBrowser()"/>
+            </t>
+
+            <!-- Hardening confirmation -->
+            <t t-if="hardeningState.open and state.host">
+                <HostHardeningModal
+                    hostId="state.host.id"
+                    hostName="state.host.name"
+                    offer="hardeningState.offer"
+                    onClose.bind="closeHardeningModal"
+                    onApplied.bind="onHardeningApplied"/>
+            </t>
+
+            <!-- Confirm dialog -->
+            <IcConfirmDialog t-if="state.confirmDialog"
+                             title="state.confirmDialog.title"
+                             message="state.confirmDialog.message"
+                             confirmLabel="state.confirmDialog.confirmLabel"
+                             isDanger="state.confirmDialog.isDanger"
+                             onConfirm="state.confirmDialog.onConfirm"
+                             onCancel="state.confirmDialog.onCancel"/>
+
+        </div>
+    </t>
+
+</templates>

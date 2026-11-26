@@ -1,0 +1,2984 @@
+"""CRUD endpoints for projects, hosts, instances, tags, users, secrets,
+dashboard, alerts, sync and general settings.
+
+Mixed into ``CloudDataLoadController`` in ``data_load.py``. Each method
+relies on ``self._sec()`` (defined on the controller) for permission
+checks.
+"""
+import logging
+
+import asyncssh
+
+from odoo import _, fields, http
+from odoo.exceptions import AccessError, UserError, ValidationError
+from odoo.http import request
+
+from ...models._repo_requirements import (
+    CONFLICT_RE,
+    GitReadBudget,
+    _parse_req_line,
+    _repo_alias,
+    apply_sync,
+    compare_instance_project,
+    create_pip_conflict_alert,
+    detect_pip_conflicts,
+    fetch_requirements_txt,
+    merge_pip_requirements,
+    on_git_provider,
+    repo_key_for_source_label,
+    resolved_pip_source,
+)
+from ...models._central_sizing import central_sizing
+from ...models._odoo_versions import (
+    offered_versions,
+    picker_facts,
+    pinned_template_ref,
+)
+from ...models.cloud_instance import ADDON_CHECK_SECONDS
+from ...models.cloud_settings import (
+    CONTAINER_LOG_MAX_FILE_DEFAULT,
+    LOG_DOWNLOAD_MAX_MB_DEFAULT,
+    LOG_SEARCH_MAX_FILES_DEFAULT,
+    LOG_SEARCH_TIMEOUT_S_DEFAULT,
+    ODOO_LOG_ARCHIVE_DAYS_DEFAULT,
+)
+from ...net.outbound import OutboundError, validate_url
+from .._client_ip import client_ip
+from .._safe_error import safe_error_response
+from ._helpers import (
+    _LIST_MAX,
+    _SECRET_FIELDS,
+    _TAG_MODEL_BY_SCOPE,
+    _capped_search,
+    _has_encrypted,
+    _job_response,
+)
+
+_logger = logging.getLogger(__name__)
+
+
+def _domain_vals(payload, env):
+    """Normalise one domain entry from the SPA into ORM values.
+
+    ``cert_resolver`` is clamped to the model's Selection rather than
+    passed through: the field used to be a free Char, so a cached SPA
+    bundle or a hand-made RPC call can still send a value outside the
+    domain. Clamping degrades it to the field's default instead of
+    raising a 500 on what is, from the caller's side, a stale client.
+
+    The options and the default are read from the field itself. A copy
+    kept here is how ``auto`` went missing: every save of the Networking
+    tab rewrote it to ``letsencrypt``.
+
+    :param dict payload: one entry of the request's ``domains`` list
+    :param env: environment the model is read through
+    :returns: dict of values for ``cloud.instance.domain``
+    """
+    Domain = env['cloud.instance.domain']
+    options = dict(Domain._fields['cert_resolver'].selection)
+    resolver = (payload.get('cert_resolver') or '').strip()
+    if resolver not in options:
+        resolver = Domain.default_get(['cert_resolver'])['cert_resolver']
+    return {
+        'hostname': (payload.get('hostname') or '').strip(),
+        'redirect_to': (payload.get('redirect_to') or '').strip(),
+        'cert_resolver': resolver,
+        'redirect_permanent': bool(payload.get('redirect_permanent')),
+    }
+
+
+def _repo_lines(instance):
+    """Return what an instance's repositories build from, in order.
+
+    :param instance: ``cloud.instance`` record
+    :return: list of ``(url, branch, addons, excludes)`` tuples
+    """
+    return [
+        (r.url, r.branch or '', r.addons or '', r.excludes or '')
+        for r in instance.repo_ids
+    ]
+
+
+class _SettingRefused(Exception):
+    """A value of a Settings save the model refused, with its field.
+
+    Raised inside the save's savepoint so everything written before the
+    refusal is undone, and caught outside it to answer under the field.
+
+    :param str field: the field the refusal is about
+    :param Exception exc: the refusal, whose first argument is the message
+    """
+
+    def __init__(self, field, exc):
+        """Keep *field* and *exc* for the answer."""
+        super().__init__(field, exc)
+        self.field = field
+        self.exc = exc
+
+
+class CrudMixin:
+    """Projects, hosts, instances, tags, users, secrets, dashboard,
+    alerts, conflict resolution, general settings."""
+
+    # Tag scope map kept on the class for subclass overrides.
+    _TAG_MODEL_BY_SCOPE = _TAG_MODEL_BY_SCOPE
+
+    @http.route(['/cloud/get_config'], type='jsonrpc', auth='user')
+    def cloud_get_config(self):
+        """Return feature flags and config for the SPA.
+
+        Dependent modules override this method and call super() to inject
+        additional feature flags. Example::
+
+            def cloud_get_config(self):
+                config = super().cloud_get_config()
+                config['features']['my_feature'] = True
+                return config
+        """
+        perms = self._sec()._get_user_permissions()
+        user = request.env.user
+        nav_counts = self._nav_counts(perms)
+        Settings = request.env['cloud.settings'].sudo()
+        return {
+            'features': {
+                # The three axes of what this panel can do with
+                # observability — collect / dashboards / configure. One
+                # descriptor rather than a flag per screen: the two flat
+                # booleans this replaces were read by four surfaces that
+                # each picked a different one, and a managed panel ended
+                # up offering a Monitoring entry whose only message was
+                # "configure it in Settings" — the one tab it hides.
+                # See cloud.settings._observability_capabilities.
+                'observability': Settings._observability_capabilities(),
+                # Where this panel may reach a Git provider: 'any' in the
+                # core, 'public' where a layer says so.
+                'git_providers': {
+                    'network': request.env[
+                        'cloud.git.provider'
+                    ].sudo()._network_policy(),
+                },
+            },
+            'role': perms.pop('role', 'stakeholder'),
+            'permissions': perms,
+            'nav_counts': nav_counts,
+            'user': {
+                'name': user.name or user.login or '',
+                'login': user.login or '',
+                'avatar_url': (
+                    f'/web/image?model=res.users'
+                    f'&id={user.id}&field=image_128'
+                ),
+            },
+        }
+
+    def _nav_counts(self, perms):
+        """The sidebar's count badges, for the user of this request.
+
+        ``search_count`` honours record rules, so each number reflects
+        only what this user may see, and each is gated by the same
+        permission flag that gates its nav item.
+
+        :param dict perms: ``_get_user_permissions()``
+        :return: ``{'projects': n, 'hosts': n, 'backups': n}``, each key
+            present only when its item is shown
+        :rtype: dict
+        """
+        nav_counts = {'projects': request.env['cloud.project'].search_count([])}
+        if perms.get('can_manage_hosts'):
+            nav_counts['hosts'] = request.env['cloud.host'].search_count([])
+        if perms.get('can_manage_settings'):
+            nav_counts['backups'] = request.env['cloud.backup.backend'].search_count([])
+        return nav_counts
+
+    @http.route(['/cloud/get_nav_counts'], type='jsonrpc', auth='user')
+    def cloud_get_nav_counts(self):
+        """The sidebar's count badges alone, as ``/cloud/get_config`` gives them.
+
+        Asked again by the panel when it moves between the sidebar's
+        sections, after a project, a host or a backup destination is
+        created or deleted, and when a job ends, so the badges do not
+        wait for a reload.
+
+        :return: ``{'nav_counts': {...}}`` (``_nav_counts``)
+        :rtype: dict
+        """
+        return {'nav_counts': self._nav_counts(self._sec()._get_user_permissions())}
+
+    @http.route(['/cloud/global_search'], type='jsonrpc', auth='user')
+    def cloud_global_search(self, query=''):
+        """Cross-entity search for the header search box. Returns matching
+        projects, instances and (if permitted) hosts. ``search()`` honours
+        record rules, so results respect each user's access."""
+        q = (query or '').strip()
+        if len(q) < 2:
+            return {'results': []}
+        perms = self._sec()._get_user_permissions()
+        results = [
+            {'type': 'project', 'label': p.name, 'sublabel': 'Project',
+             'route': 'project_detail', 'params': {'project_id': p.id}}
+            for p in request.env['cloud.project'].search([('name', 'ilike', q)], limit=6)
+        ]
+        for i in request.env['cloud.instance'].search(
+                ['|', ('name', 'ilike', q), ('domain', 'ilike', q)], limit=8):
+            sub = i.project_id.name or ''
+            if i.domain:
+                sub = (sub + ' · ' + i.domain) if sub else i.domain
+            results.append({
+                'type': 'instance', 'label': i.name, 'sublabel': sub,
+                'route': 'instance_detail',
+                'params': {'project_id': i.project_id.id, 'instance_id': i.id},
+            })
+        if perms.get('can_manage_hosts'):
+            for h in request.env['cloud.host'].search([('name', 'ilike', q)], limit=5):
+                results.append({
+                    'type': 'host', 'label': h.name, 'sublabel': 'Host',
+                    'route': 'host_detail', 'params': {'host_id': h.id},
+                })
+        return {'results': results}
+
+    @http.route(['/cloud/get_projects'], type='jsonrpc', auth='user')
+    def cloud_get_projects(self):
+        projects, total, truncated, limit = _capped_search(
+            request.env['cloud.project'], order='name',
+        )
+        items = []
+        for p in projects:
+            prod = p.instance_ids.filtered(lambda i: i.environment == 'production')
+            first_prod_id = prod[:1].id if prod else False
+            items.append({
+                'id': p.id,
+                'name': p.name,
+                'description': p.description,
+                'odoo_version': p.odoo_version or '',
+                'status': p.status,
+                'instance_count': len(p.instance_ids),
+                'environments': p.instance_ids.mapped('environment'),
+                'first_production_instance_id': first_prod_id,
+                'tags': [
+                    {'id': t.id, 'name': t.name, 'color': t.color}
+                    for t in p.tag_ids
+                ],
+            })
+        return {
+            'items': items,
+            'total': total,
+            'truncated': truncated,
+            'limit': limit,
+        }
+
+    # Map tag scope → tag model. Each scope has its own model to keep
+    # tags of one entity from polluting another's tag cloud.
+    _TAG_MODEL_BY_SCOPE = {
+        'project':  'cloud.tag',
+        'host':     'cloud.host.tag',
+        'instance': 'cloud.instance.tag',
+    }
+
+    @http.route(['/cloud/get_tags'], type='jsonrpc', auth='user')
+    def cloud_get_tags(self, scope='project'):
+        model = self._TAG_MODEL_BY_SCOPE.get(scope, 'cloud.tag')
+        # Defensive cap: tags are naturally bounded (tens in practice) but
+        # the cap prevents a runaway script from tanking the autocomplete.
+        tags = request.env[model].search([], limit=_LIST_MAX, order='name')
+        payload = {
+            'tags': [
+                {'id': t.id, 'name': t.name, 'color': t.color} for t in tags
+            ],
+        }
+        # Legacy contract: project scope also returns the defaults used by
+        # new_project form. Other scopes don't need it.
+        if scope == 'project':
+            defaults = request.env['cloud.project'].default_get(
+                ['pip_dependencies', 'odoo_version', 'project_author',
+                 'project_license']
+            )
+            payload['project_defaults'] = {
+                'pip_dependencies': defaults.get('pip_dependencies', ''),
+                # The field's default: the newest series this panel's
+                # pin renders (``_odoo_versions.new_record_default``).
+                'odoo_version': defaults.get('odoo_version', ''),
+                # The fields' defaults, which a layer may set (its own
+                # author, no licence).
+                'project_author': defaults.get('project_author', ''),
+                'project_license': defaults.get('project_license', ''),
+            }
+        return payload
+
+    @http.route(['/cloud/get_odoo_versions'], type='jsonrpc', auth='user')
+    def cloud_get_odoo_versions(self):
+        """Return the offered Odoo series for the version pickers.
+
+        Single source of truth: the series' cards (``_odoo_versions``),
+        the offered ones only, with what depends on the series picked,
+        the PostgreSQL versions first. The ``odoo_version`` Selection
+        holds every series with a card, so an instance keeps its value
+        when its series stops being offered; the pickers show what a new
+        one may choose. Serving it here keeps the SPA pickers from
+        hard-coding their own copy of the list. Only the series this
+        panel's pinned template can render: the newest of them is a new
+        project's default, and the pickers fall back to it.
+        """
+        pin = pinned_template_ref(request.env)
+        return {
+            'odoo_versions': list(offered_versions(pin)),
+            'facts': picker_facts(pin),
+        }
+
+    @http.route(['/cloud/get_users'], type='jsonrpc', auth='user')
+    def cloud_get_users(self, search='', **kw):
+        """Search internal users for member picker."""
+        self._sec()._check_cloud_group('group_cloud_project_manager')
+        # No sudo: PM+ already has read on res.users via implied groups,
+        # and Odoo's standard res.users record rules scope what they
+        # can see. The previous sudo() returned every internal user
+        # in the database — useful for targeted phishing if the picker
+        # search field accepts ``@``.
+        domain = [('share', '=', False)]
+        if search:
+            domain.append(('name', 'ilike', search))
+        users = request.env['res.users'].search(domain, limit=20)
+        return [{'id': u.id, 'name': u.name, 'email': u.email or ''} for u in users]
+
+    @http.route(['/cloud/create_tag'], type='jsonrpc', auth='user')
+    def cloud_create_tag(self, name, scope='project'):
+        # Consultant+ only: tags label projects / hosts / instances and
+        # are visible across the SPA. Without a gate any internal user
+        # could spam-create tags (table-bloat DoS) and pollute the
+        # autocomplete dropdowns of every project / host / instance.
+        self._sec()._check_cloud_group('group_cloud_consultant')
+        name = name.strip()
+        if not name:
+            return {'ok': False, 'error': _('Tag name cannot be empty')}
+        model = self._TAG_MODEL_BY_SCOPE.get(scope, 'cloud.tag')
+        Tag = request.env[model]
+        existing = Tag.search([('name', '=ilike', name)], limit=1)
+        if existing:
+            return {
+                'id': existing.id, 'name': existing.name,
+                'color': existing.color,
+            }
+        total = Tag.search_count([])
+        tag = Tag.create({'name': name, 'color': total % 10})
+        return {'id': tag.id, 'name': tag.name, 'color': tag.color}
+
+    @http.route(['/cloud/get_hosts'], type='jsonrpc', auth='user')
+    def cloud_get_hosts(self):
+        hosts, total, truncated, limit = _capped_search(
+            request.env['cloud.host'], order='name',
+        )
+        autoassign = (
+            request.env['ir.config_parameter'].sudo()
+            .get_param('incubacloud.host_autoassign', '0') == '1'
+        )
+        # Non-managers reach this endpoint only through the instance
+        # move-host picker, which needs id/name/capacity — not the SSH
+        # reconnaissance fields. Redact ip/port/user/login_type unless the
+        # caller manages hosts, so a stakeholder cannot enumerate every
+        # host's SSH endpoint.
+        is_manager = self._sec()._has_cloud_group('group_cloud_manager')
+        # Read once: whether a card can show live CPU and RAM at all.
+        metrics_enabled = (
+            request.env['cloud.settings'].sudo()._get_system().metrics_enabled
+        )
+        now = fields.Datetime.now()
+        return {
+            'autoassign_enabled': autoassign,
+            'total': total,
+            'truncated': truncated,
+            'limit': limit,
+            'hosts': [
+                {
+                    'id': host.id,
+                    'name': host.name,
+                    'type': host.type,
+                    'status': host.status,
+                    'description': host.description,
+                    'tags': [
+                        {'id': t.id, 'name': t.name, 'color': t.color}
+                        for t in host.tag_ids
+                    ],
+                    'ip_address': host.ip_address if is_manager else '',
+                    'port': host.port if is_manager else 0,
+                    'user': host.user if is_manager else '',
+                    'login_type': host.login_type if is_manager else '',
+                    # Existence only, read elevated: the credentials are
+                    # for system administrators.
+                    'has_password': _has_encrypted(host.sudo(), 'password'),
+                    'has_key_file': _has_encrypted(host.sudo(), 'key_file'),
+                    'has_known_hosts_key':
+                        _has_encrypted(host, 'known_hosts_key'),
+                    'known_hosts_fingerprint':
+                        host.known_hosts_fingerprint if is_manager else '',
+                    # Whether this host is actually reporting metrics.
+                    # Without it on screen, an unmonitored host is
+                    # indistinguishable from a monitored one — which is
+                    # what made the old manual enrolment so confusing.
+                    'metrics_agents_state': host.metrics_agents_state,
+                    'metrics_last_seen': (
+                        host.metrics_last_seen.isoformat()
+                        if host.metrics_last_seen else ''
+                    ),
+                    'cpu_cores': host.cpu_cores,
+                    'ram_total_gb': host.ram_total_gb,
+                    'disk': round(host.disk_usage),
+                    'disk_free_gb': round(host.disk_free_gb, 1),
+                    'last_probed': host.last_probed,
+                    'instance_count': len(host.instance_ids),
+                    'traefik_deployed': host.traefik_deployed,
+                    'exclude_from_autoassign': host.exclude_from_autoassign,
+                    'allocated_cpus': round(host.allocated_cpus, 2),
+                    'allocated_ram_gb': round(host.allocated_ram_gb, 2),
+                    'available_cpus': round(host.available_cpus, 2),
+                    'available_ram_gb': round(host.available_ram_gb, 2),
+                    'usage_ratio': round(host.usage_ratio or 0.0, 4),
+                    # What the host really uses, beside what its
+                    # instances are allowed (``allocated_*``).
+                    **host._usage_for_card(metrics_enabled, now),
+                    'alerts': [
+                        {
+                            'code': a.code,
+                            'message': a.message,
+                            'level': a.level,
+                        }
+                        for a in host.alert_ids.filtered(
+                            lambda a: a.state == 'active'
+                        )
+                    ],
+                }
+                for host in hosts
+            ],
+        }
+
+    @http.route(['/cloud/get_dashboard'], type='jsonrpc', auth='user')
+    def cloud_get_dashboard(self):
+        env = request.env
+        # Dashboard only needs counts for hosts/instances/projects. Using
+        # search_count avoids loading thousands of records into memory.
+        proj_total = env['cloud.project'].search_count([])
+        host_total = env['cloud.host'].search_count([])
+        inst_total = env['cloud.instance'].search_count([])
+        active_alerts = env['cloud.alert'].search(
+            [('state', '=', 'active')], limit=_LIST_MAX,
+        )
+        alerts_total = env['cloud.alert'].search_count(
+            [('state', '=', 'active')],
+        )
+        CloudJob = env['cloud.job']
+        recent_jobs = CloudJob.search(
+            [('job_type_id.code', 'not in', CloudJob._hidden_job_types)],
+            order='create_date desc', limit=10,
+        )
+        return {
+            'counts': {
+                'projects': proj_total,
+                'hosts': host_total,
+                'instances': inst_total,
+                'alerts': alerts_total,
+            },
+            'truncated': alerts_total > _LIST_MAX,
+            'limit': _LIST_MAX,
+            'alerts': [
+                {
+                    'id': a.id,
+                    'code': a.code,
+                    'host_id': a.host_id.id,
+                    'instance_id': a.instance_id.id,
+                    'project_id': a.instance_id.project_id.id if a.instance_id else False,
+                    'host': (
+                        a.host_id.name
+                        if a.host_id
+                        else f"{a.instance_id.project_id.name} / {a.instance_id.name}"
+                    ),
+                    'job_id': a.job_id.id,
+                    'message': a.message,
+                    'level': a.level,
+                }
+                for a in active_alerts
+            ],
+            'recent_jobs': [
+                {
+                    'id': j.id,
+                    # In the reader's language, as ``cloud.job._format``.
+                    'name': j.job_type_id.name or j.name,
+                    'host': j.host_id.name,
+                    'state': j.state,
+                    'create_date': j.create_date,
+                    'job_type': j.job_type_id.code,
+                }
+                for j in recent_jobs
+            ],
+        }
+
+    @http.route(['/cloud/get_alert_count'], type='jsonrpc', auth='user')
+    def cloud_get_alert_count(self):
+        count = request.env['cloud.alert'].search_count([('state', '=', 'active')])
+        return {'count': count}
+
+    @http.route(['/cloud/dismiss_alert'], type='jsonrpc', auth='user')
+    def cloud_dismiss_alert(self, alert_id):
+        # Consultant+ only: dismissing alerts is an operational
+        # decision (especially for ``pip_conflict`` / ``addon_conflict``
+        # which gate deploys), so stakeholders cannot silently mute
+        # them. Per-project scoping is still enforced by the record
+        # rule on cloud.alert via the ``write`` access check below.
+        self._sec()._check_cloud_group('group_cloud_consultant')
+        alert = request.env['cloud.alert'].browse(alert_id)
+        if not alert.exists():
+            return {'ok': False, 'error': _('Alert not found')}
+        alert.check_access('write')
+        alert.write({'state': 'dismissed', 'resolution': 'manual'})
+        return {'ok': True}
+
+    @http.route(['/cloud/compare_sync'], type='jsonrpc', auth='user')
+    def cloud_compare_sync(self, instance_id):
+        """Compare instance deps/repos with its project template."""
+        # Consultant+ only: same gate as ``cloud_apply_sync`` so the
+        # diff stays out of stakeholder hands.
+        self._sec()._check_cloud_group('group_cloud_consultant')
+        try:
+            instance_id = int(instance_id)
+        except (TypeError, ValueError):
+            return {'ok': False, 'error': _('Invalid instance id')}
+        inst = request.env['cloud.instance'].browse(instance_id)
+        if not inst.exists() or not inst.project_id:
+            return {'ok': False, 'error': _('Instance or project not found')}
+        inst.check_access('read')
+        try:
+            diff = compare_instance_project(inst)
+        except Exception as exc:
+            return safe_error_response(
+                exc, _("Failed to compare instance with project"),
+            )
+        return {'ok': True, 'diff': diff}
+
+    @http.route(['/cloud/apply_sync'], type='jsonrpc', auth='user')
+    def cloud_apply_sync(self, instance_id, actions):
+        """Apply user-selected sync actions between instance and project."""
+        # Consultant+ only: ``apply_sync`` mutates the instance's
+        # ``pip_dependencies`` and ``repo_ids`` (same blast radius as
+        # ``cloud_save_instance``), so the gate must match.
+        self._sec()._check_cloud_group('group_cloud_consultant')
+        try:
+            instance_id = int(instance_id)
+        except (TypeError, ValueError):
+            return {'ok': False, 'error': _('Invalid instance id')}
+        inst = request.env['cloud.instance'].browse(instance_id)
+        if not inst.exists() or not inst.project_id:
+            return {'ok': False, 'error': _('Instance or project not found')}
+        inst.check_access('write')
+        try:
+            apply_sync(inst, actions)
+        except Exception:
+            _logger.exception("apply_sync failed for instance %s", instance_id)
+            return {'ok': False, 'error': _('An internal error occurred. Check server logs.')}
+        return {'ok': True}
+
+    @http.route(['/cloud/get_job_brief'], type='jsonrpc', auth='user')
+    def cloud_get_job_brief(self, job_id):
+        """Minimal job info for the live toast: the bus only ships
+        ``{id, state}`` (it ignores record rules), so the client comes
+        back through this ACL-checked path for anything displayable.
+        Returns ``{'ok': False}`` for jobs the user cannot read and for
+        hidden background types — neither should ever toast.
+
+        Besides ``id``, ``name`` and ``state`` it returns what the job ran
+        on (``target_name``, ``host_id``, ``instance_id``), so the toast
+        says on what and can open its job history, and for a failed job
+        the same one-line ``error`` the failed-job alert shows.
+        """
+        try:
+            job_id = int(job_id)
+        except (TypeError, ValueError):
+            return {'ok': False}
+        job = request.env['cloud.job'].browse(job_id)
+        try:
+            if not job.exists():
+                return {'ok': False}
+            job.check_access('read')
+        except AccessError:
+            return {'ok': False}
+        if job.job_type_id.code in request.env['cloud.job']._get_hidden_job_types():
+            return {'ok': False}
+        # Muted projects never toast — same personal mute list the
+        # email/digest channels honour.
+        if request.env['cloud.job']._job_muted_for(job, request.env.user):
+            return {'ok': False}
+        # Read past the record rules on purpose: the caller can read the
+        # job, and the failed-job alert shows them the same target and
+        # excerpt. ``queue.job`` itself is not theirs to read.
+        job_sudo = job.sudo()
+        error = ''
+        if job.state == 'failed':
+            error = job_sudo._failure_excerpt(job_sudo.queue_job_id.exc_message)
+        return {
+            'ok': True,
+            'id': job.id,
+            # In the reader's language, as ``cloud.job._format`` gives it.
+            'name': job.job_type_id.name or job.name,
+            # A job that waits for an alert is stored done; it did nothing.
+            'state': 'blocked' if job_sudo.blocked_alert_id else job.state,
+            'target_name': job_sudo.instance_id.name or job_sudo.host_id.name or '',
+            'host_id': job_sudo.host_id.id or False,
+            'instance_id': job_sudo.instance_id.id or False,
+            'error': error,
+        }
+
+    @http.route(['/cloud/get_job_state'], type='jsonrpc', auth='user')
+    def cloud_get_job_state(self, job_id):
+        """Say whether a job the panel just asked for started or waits.
+
+        The answer of the endpoints that enqueue (``_job_response``), for
+        the buttons that enqueue through the ORM (``cloud.job.enqueue``,
+        a retry) or through an endpoint that answers with the id alone:
+        the panel's notice reads ``state``, ``job_type`` and
+        ``queued_behind`` from it. Asked once the request that queued
+        the job has committed, so a job the queue started at once reads
+        as started. Returns ``{'ok': False}`` for a job the caller
+        cannot read.
+
+        :param int job_id: the ``cloud.job`` to look at
+        :return: ``{'ok': True, **_job_response(...)}`` or ``{'ok': False}``
+        """
+        try:
+            job_id = int(job_id)
+        except (TypeError, ValueError):
+            return {'ok': False}
+        job = request.env['cloud.job'].browse(job_id)
+        try:
+            if not job.exists():
+                return {'ok': False}
+            job.check_access('read')
+        except AccessError:
+            return {'ok': False}
+        return {'ok': True, **_job_response(request.env, job.id)}
+
+    @http.route(['/cloud/dismiss_all_alerts'], type='jsonrpc', auth='user')
+    def cloud_dismiss_all_alerts(self, level_filter=None):
+        """Bulk-dismiss the active non-conflict alerts visible to the
+        caller. Same consultant gate as the single dismiss."""
+        self._sec()._check_cloud_group('group_cloud_consultant')
+        count = request.env['cloud.alert'].action_dismiss_all(
+            level_filter=level_filter,
+        )
+        return {'ok': True, 'count': count}
+
+    @http.route(['/cloud/get_alert_history'], type='jsonrpc', auth='user')
+    def cloud_get_alert_history(self, state_filter='all', level_filter='all',
+                                offset=0, limit=20):
+        domain = [] if state_filter == 'all' else [('state', '=', state_filter)]
+        if level_filter in ('warning', 'critical'):
+            domain.append(('level', '=', level_filter))
+        try:
+            offset = max(0, int(offset))
+            limit = min(100, max(1, int(limit)))
+        except (TypeError, ValueError):
+            offset, limit = 0, 20
+        Alert = request.env['cloud.alert']
+        total = Alert.search_count(domain)
+        alerts = Alert.search(
+            domain, order='create_date desc', offset=offset, limit=limit,
+        )
+        entries = [
+            {
+                'id': a.id,
+                'code': a.code,
+                'level': a.level,
+                'state': a.state,
+                'message': a.message,
+                'create_date': a.create_date,
+                'last_raised_at': a.last_raised_at,
+                'host': (
+                    a.host_id.name
+                    if a.host_id
+                    else (
+                        f"{a.instance_id.project_id.name} / {a.instance_id.name}"
+                        if a.instance_id
+                        else (a.project_id.name or '—')
+                    )
+                ),
+                'target': (
+                    a.host_id.name if a.host_id
+                    else (
+                        f"{a.instance_id.project_id.name} / {a.instance_id.name}"
+                        if a.instance_id and a.instance_id.project_id
+                        else (a.instance_id.name if a.instance_id
+                              else (a.project_id.name or '—'))
+                    )
+                ),
+                'job_id': a.job_id.id,
+                'resolution': a.resolution or False,
+                'resolved_at': a.resolved_at,
+                'resolved_by_job_id': a.resolved_by_job_id.id or False,
+                # In the reader's language, as the job lists say it.
+                'resolved_by_job_name': (
+                    a.resolved_by_job_id.job_type_id.name
+                    or a.resolved_by_job_id.name or False
+                ),
+                'conflict_data': a.conflict_data or [],
+                'payload': a.payload or None,
+                'instance_id': a.instance_id.id or False,
+                'project_id': (
+                    a.instance_id.project_id.id if a.instance_id
+                    else (a.project_id.id or False)
+                ),
+            }
+            for a in alerts
+        ]
+        return {'total': total, 'alerts': entries}
+
+    @http.route(['/cloud/resolve_pip_conflict'], type='jsonrpc', auth='user')
+    def cloud_resolve_pip_conflict(self, alert_id, resolutions):
+        """Resolve a pip dependency conflict alert.
+
+        alert_id: int
+        resolutions: {package_name_lowercase: chosen_spec_string}
+        Returns {'ok': bool, 'error'?: str, 'job_id'?: int|False}: the
+        job that waited on the alert and is back in its queue, if any,
+        so the panel can say whether it started.
+        """
+        # Consultant+ only: resolving a conflict mutates
+        # ``pip_dependencies`` of the parent (same blast radius as
+        # ``cloud_save_instance``) and unblocks the linked deploy job.
+        # Per-record scoping is enforced by ``check_access('write')``
+        # on the alert below.
+        self._sec()._check_cloud_group('group_cloud_consultant')
+        try:
+            alert_id = int(alert_id)
+        except (TypeError, ValueError):
+            return {'ok': False, 'error': _('Invalid alert id')}
+        alert = request.env['cloud.alert'].browse(alert_id)
+        if (not alert.exists()
+                or alert.code != 'pip_conflict'
+                or alert.state != 'active'):
+            return {
+                'ok': False, 'error': _('Alert not found or already resolved'),
+            }
+        alert.check_access('write')
+        parent = alert.instance_id or alert.project_id
+        if not parent:
+            return {'ok': False, 'error': _('No parent record found')}
+
+        # Replace each conflict block with the user's chosen spec.
+        # Track seen names to deduplicate if the same block appears twice.
+        new_text = parent.pip_dependencies or ''
+        sources = dict(parent.pip_dependency_sources or {})
+        for m in list(CONFLICT_RE.finditer(parent.pip_dependencies or '')):
+            existing_line = m.group('existing_line').strip()
+            parsed = _parse_req_line(existing_line)
+            if parsed:
+                chosen = resolutions.get(parsed[0])
+                if chosen is not None:
+                    new_text = new_text.replace(m.group(0), chosen, 1)
+                    sources[parsed[0]] = resolved_pip_source(
+                        parent.repo_ids, m, chosen.strip(),
+                        sources.get(parsed[0]),
+                    )
+
+        parent.with_context(pip_provenance_managed=True).write({
+            'pip_dependencies': new_text,
+            'pip_dependency_sources': sources,
+        })
+        alert.write({'state': 'dismissed', 'resolution': 'manual'})
+
+        # Unblock the linked job only if all conflicts are now resolved
+        job_id = False
+        if not detect_pip_conflicts(new_text):
+            blocked_job = request.env['cloud.job'].search(
+                [('blocked_alert_id', '=', alert.id)], limit=1,
+            )
+            if blocked_job:
+                blocked_job.unblock_and_enqueue()
+                job_id = blocked_job.id
+        return {'ok': True, 'job_id': job_id}
+
+    @http.route(['/cloud/resolve_addon_conflict'], type='jsonrpc', auth='user')
+    def cloud_resolve_addon_conflict(self, alert_id, resolutions):
+        """Resolve an addon conflict alert.
+
+        alert_id: int
+        resolutions: {addon_name: winner_repo_alias}
+            For each conflicting addon, the user picks which repo keeps it.
+            The addon is added to the excludes of all other repos involved.
+        Returns {'ok': bool, 'error'?: str, 'job_id'?: int|False}: the
+        job that waited on the alert and is back in its queue, if any.
+        """
+        # Consultant+ only: same blast radius as editing ``repo.excludes``
+        # directly. Per-record scoping enforced via the alert's
+        # write access below.
+        self._sec()._check_cloud_group('group_cloud_consultant')
+        try:
+            alert_id = int(alert_id)
+        except (TypeError, ValueError):
+            return {'ok': False, 'error': _('Invalid alert id')}
+        alert = request.env['cloud.alert'].browse(alert_id)
+        if (not alert.exists()
+                or alert.code != 'addon_conflict'
+                or alert.state != 'active'):
+            return {'ok': False, 'error': _('Alert not found or already resolved')}
+        alert.check_access('write')
+        inst = alert.instance_id
+        if not inst:
+            return {'ok': False, 'error': _('No instance linked to this alert')}
+
+        # For each repo, compute what modules need to be added to its excludes.
+        for repo in inst.repo_ids:
+            alias = _repo_alias(repo.url)
+            existing = {m.strip() for m in (repo.excludes or '').split(',') if m.strip()}
+            for conflict in (alert.conflict_data or []):
+                addon = conflict['addon']
+                winner = resolutions.get(addon)
+                # Add to excludes if this repo is a loser and involved in the conflict
+                if winner and alias != winner and alias in conflict.get('repos', []):
+                    existing.add(addon)
+            repo.excludes = ','.join(sorted(existing)) if existing else ''
+
+        alert.write({'state': 'dismissed', 'resolution': 'manual'})
+        blocked_job = request.env['cloud.job'].search(
+            [('blocked_alert_id', '=', alert.id)], limit=1,
+        )
+        if blocked_job:
+            blocked_job.unblock_and_enqueue()
+        return {'ok': True, 'job_id': blocked_job.id or False}
+
+    @http.route(['/cloud/get_secret'], type='jsonrpc', auth='user')
+    def cloud_get_secret(self, model, record_id, field):
+        """Return the plain-text value of an encrypted password field.
+
+        Only fields explicitly listed in _SECRET_FIELDS are accessible.
+        The user must have write access to the record (same check as saving).
+        """
+        self._sec()._check_cloud_group('group_cloud_developer')
+        allowed = _SECRET_FIELDS.get(model)
+        if not allowed or field not in allowed:
+            return {'ok': False, 'error': _('Field not allowed')}
+        record = request.env[model].browse(record_id)
+        if not record.exists():
+            return {'ok': False, 'error': _('Record not found')}
+        # Require write access as a proxy for "trusted user"
+        record.check_access('write')
+        # A host's SSH and dashboard passwords are readable by system
+        # administrators only: the write check above is what lets a
+        # Manager reveal them.
+        if model == 'cloud.host':
+            record = record.sudo()
+        value = getattr(record, field, None) or ''
+        return {'value': value}
+    @http.route(['/cloud/get_host'], type='jsonrpc', auth='user')
+    def cloud_get_host(self, host_id):
+        # Manager-gated like the host detail editor it feeds (save/delete
+        # are already manager-only). Exposes the full SSH endpoint config.
+        self._sec()._check_can_manage_hosts()
+        host = request.env['cloud.host'].browse(host_id)
+        if not host.exists():
+            return {'ok': False, 'error': _('Host not found')}
+        return {
+            'id': host.id,
+            'name': host.name,
+            'type': host.type,
+            'status': host.status,
+            'ip_address': host.ip_address,
+            'port': host.port,
+            'user': host.user,
+            'login_type': host.login_type,
+            # Without sshpass on the panel's server the form offers the key
+            # only (``cloud.host._password_login_available``).
+            'password_login_available': host._password_login_available(),
+            # Existence only, read elevated: the credentials are for system
+            # administrators.
+            'has_password': _has_encrypted(host.sudo(), 'password'),
+            'has_key_file': _has_encrypted(host.sudo(), 'key_file'),
+            # The public half only, derived from the stored key so it can
+            # be copied again; the private one never leaves the panel.
+            'ssh_public_key': host._ssh_public_key(),
+            'has_known_hosts_key': _has_encrypted(host, 'known_hosts_key'),
+            'known_hosts_fingerprint': host.known_hosts_fingerprint,
+            'revoked_key_fingerprint': host.revoked_key_fingerprint or '',
+            'description': host.description,
+            'tags': [
+                {'id': t.id, 'name': t.name, 'color': t.color}
+                for t in host.tag_ids
+            ],
+            'all_tags': [
+                {'id': t.id, 'name': t.name, 'color': t.color}
+                for t in request.env['cloud.host.tag'].search(
+                    [], limit=_LIST_MAX, order='name',
+                )
+            ],
+            'cpu_cores': host.cpu_cores,
+            'ram_total_gb': host.ram_total_gb,
+            'disk': round(host.disk_usage),
+            'disk_free_gb': round(host.disk_free_gb, 1),
+            'last_probed': host.last_probed,
+            'instance_count': len(host.instance_ids),
+            'traefik_deployed': host.traefik_deployed,
+            # Whether deleting it runs the teardown on the server.
+            'teardown_reaches_server': host._teardown_reaches_server(),
+            'hardened': host.hardened,
+            'hardened_at': (
+                host.hardened_at.isoformat() if host.hardened_at else ''
+            ),
+            'config_dirty': host.config_dirty,
+            'template_drift': host.template_drift,
+            'template_drift_details': host.template_drift_details or '',
+            'wildcard_domain': host.wildcard_domain or '',
+            # Read elevated, as the SSH credentials: a refused read would
+            # count as a stored password.
+            'has_traefik_panel_password':
+                _has_encrypted(host.sudo(), 'traefik_panel_password'),
+            'traefik_config_yml': host.traefik_config_yml or '',
+            'traefik_inverseproxy_yaml': host.traefik_inverseproxy_yaml or '',
+            'traefik_yml': host.traefik_yml or '',
+            'exclude_from_autoassign': host.exclude_from_autoassign,
+            'http_conn_rate': host.http_conn_rate,
+            'behind_cdn': host.behind_cdn,
+            'trusted_proxy_ranges': host.trusted_proxy_ranges or '',
+            'block_direct_access': host.block_direct_access,
+            'cdn_client_ca': host.cdn_client_ca or '',
+            'shared_guard': host.shared_guard,
+            # The default certificate is shown and described; its key is
+            # only ever reported as stored or not, never returned.
+            'tls_default_cert': host.tls_default_cert or '',
+            # Read elevated, as the SSH credentials above: a refused read
+            # would count as a stored key.
+            'has_tls_default_key':
+                _has_encrypted(host.sudo(), 'tls_default_key'),
+            'tls_default_info':
+                host._tls_certificate_info(host.tls_default_cert),
+            # The list the host is actually filtered against, and where
+            # it comes from. The field above is only the override, so
+            # showing it alone would say nothing about what applies.
+            'effective_trusted_proxy_ranges':
+                host._effective_trusted_proxy_ranges(),
+            'trusted_proxy_source': host._trusted_proxy_source(),
+            'trusted_proxies_shipped': host.trusted_proxies_shipped or '',
+            # The direct entrypoint: the port, the list it admits, and the
+            # URL the host's agents were installed with and why.
+            'direct_port': host.direct_port or 0,
+            'direct_port_shipped': host.direct_port_shipped or 0,
+            'direct_path_opt_out': host.direct_path_opt_out,
+            # This server's security logs: sent to the central, or not.
+            'security_logs_enabled': host.security_logs_enabled,
+            # Whether this panel may turn them on at all.
+            'security_logs_available': host._security_logs_available(),
+            'direct_allowlist_shipped': (
+                host.direct_allowlist_shipped or ''
+            ).split(),
+            'direct_allowlist_pending': host._direct_allowlist_pending(),
+            'metrics_agents_state': host.metrics_agents_state,
+            'metrics_last_seen': (
+                host.metrics_last_seen.isoformat()
+                if host.metrics_last_seen else ''
+            ),
+            'metrics_agents_write_url': host.metrics_agents_write_url or '',
+            'direct_reach_reason': host.direct_reach_reason or '',
+            'allocated_cpus': round(host.allocated_cpus, 2),
+            'allocated_ram_gb': round(host.allocated_ram_gb, 2),
+            'available_cpus': round(host.available_cpus, 2),
+            'available_ram_gb': round(host.available_ram_gb, 2),
+            'whitelist': host.whitelist_ids.mapped('hostname'),
+            'custom_actions': [
+                {
+                    'code': jt.code,
+                    'name': jt.name,
+                    'action_icon': jt.action_icon or 'fa-cog',
+                    'action_confirm': jt.action_confirm or '',
+                }
+                for jt in host._offered_actions()
+            ],
+        }
+
+    _HOST_ALLOWED = {
+        'name', 'type', 'ip_address', 'port', 'user', 'login_type',
+        'password', 'key_file', 'description', 'tag_ids',
+        'wildcard_domain', 'traefik_panel_password',
+        'traefik_config_yml', 'traefik_inverseproxy_yaml', 'traefik_yml',
+        'exclude_from_autoassign', 'http_conn_rate',
+        'trusted_proxy_ranges', 'block_direct_access', 'behind_cdn',
+        'cdn_client_ca', 'direct_port', 'direct_path_opt_out',
+        'security_logs_enabled', 'shared_guard',
+        # The key is write-only: the model ignores an empty one, so a
+        # save that does not paste a new key keeps the stored one.
+        'tls_default_cert', 'tls_default_key',
+    }
+
+    @http.route(['/cloud/host_defaults'], type='jsonrpc', auth='user')
+    def cloud_host_defaults(self):
+        self._sec()._check_can_manage_hosts()
+        Host = request.env['cloud.host']
+        defaults = Host.default_get([
+            'traefik_config_yml', 'traefik_inverseproxy_yaml', 'traefik_yml',
+        ])
+        return {
+            'traefik_config_yml': defaults.get('traefik_config_yml', ''),
+            'traefik_inverseproxy_yaml': defaults.get('traefik_inverseproxy_yaml', ''),
+            'traefik_yml': defaults.get('traefik_yml', ''),
+            'password_login_available': Host._password_login_available(),
+        }
+
+    @http.route(['/cloud/generate_host_key'], type='jsonrpc', auth='user')
+    def cloud_generate_host_key(self):
+        """Generate the SSH key of a host the new-host form is filling in.
+
+        Answers before the host exists, so its public half can go into the
+        provider's form while the server is ordered. The private half comes
+        back sealed (``cloud.host._generate_ssh_key``): the form sends it
+        back as ``generated_key`` to ``/cloud/create_host``.
+
+        :return: ``{'public_key': ..., 'sealed_key': ...}``
+        :rtype: dict
+        """
+        self._sec()._check_can_manage_hosts()
+        return request.env['cloud.host']._generate_ssh_key()
+
+    @http.route(['/cloud/create_host'], type='jsonrpc', auth='user')
+    def cloud_create_host(self, vals):
+        self._sec()._check_can_manage_hosts()
+        safe = {k: v for k, v in vals.items() if k in self._HOST_ALLOWED}
+        # A key from /cloud/generate_host_key, for a key host given no
+        # file of its own: stored in ``key_file`` as an uploaded one.
+        sealed = vals.get('generated_key')
+        if (sealed and not safe.get('key_file')
+                and safe.get('login_type', 'ssh_key') == 'ssh_key'):
+            safe['key_file'] = request.env['cloud.host']._unseal_ssh_key(
+                sealed,
+            )
+        if safe.get('port'):
+            safe['port'] = int(safe['port'])
+        if 'tag_ids' in safe:
+            safe['tag_ids'] = [fields.Command.set(safe['tag_ids'] or [])]
+        host = request.env['cloud.host'].create(safe)
+        return {'id': host.id, 'name': host.name}
+
+    @http.route(['/cloud/delete_host'], type='jsonrpc', auth='user')
+    def cloud_delete_host(self, host_id):
+        self._sec()._check_can_manage_hosts()
+        host = request.env['cloud.host'].browse(host_id)
+        if not host.exists():
+            return {'ok': False, 'error': _('Host not found')}
+        if host.instance_ids:
+            return {'ok': False, 'error': _('Host still has instances. Delete all instances first.')}
+        Settings = request.env['cloud.settings'].sudo()
+        if host == Settings._live_central_host():
+            # Before the teardown, which removes the host's proxy first.
+            return {'ok': False, 'error': Settings._central_host_refusal(host)}
+        if not host.traefik_deployed and not host._teardown_reaches_server():
+            # The panel never reached the server, or cannot log in to it
+            # any more: there is nothing it could take off it. A server it
+            # reached is torn down below even with no proxy deployed: its
+            # key, and the operator account and sudo grant of a hardening,
+            # may be there (a Full Setup that failed after the hardening).
+            # Two sub-cases by job history:
+            #
+            #   * The host has zero ``cloud.job`` rows referencing it
+            #     (truly-untouched fixture / cancel-before-provision):
+            #     ``unlink`` is safe and keeps the table clean.
+            #
+            #   * The host already accumulated jobs (e.g. on-demand VPS
+            #     where a layer's server provisioning succeeded but the
+            #     chained ``host_hardening`` + ``full_setup`` never ran,
+            #     so Traefik is not deployed yet but provision history
+            #     exists): ``unlink`` would violate the
+            #     ``cloud_job.host_id`` FK constraint (required + no
+            #     ``ondelete``). Archive instead — same semantics the
+            #     ``delete_host`` executor uses on the deployed branch,
+            #     preserves the job history, and ``write({'active':
+            #     False})`` still fires ``_release_external_resources``
+            #     so downstream modules (an on-demand server's release,
+            #     DNS, etc.) clean up provider-side state.
+            #
+            # A host shell leaves no job but the same kind of history: its
+            # audit rows hold the host with ``ondelete='restrict'``, and a
+            # shell can be opened before any setup has run.
+            has_jobs = bool(request.env['cloud.job'].sudo().search_count(
+                [('host_id', '=', host.id)],
+            ))
+            has_shell_sessions = bool(
+                request.env['cloud.host.session'].sudo().search_count(
+                    [('host_id', '=', host.id)],
+                )
+            )
+            if has_jobs or has_shell_sessions:
+                host.write({'active': False})
+            else:
+                host.unlink()
+            return {'ok': True}
+        job_id = request.env['cloud.job'].enqueue(host_id, False, 'delete_host')
+        return {'job_id': job_id}
+
+    @http.route(['/cloud/trust_host_key'], type='jsonrpc', auth='user', methods=['POST'])
+    def cloud_trust_host_key(self, host_id, expected_fingerprint=None):
+        """Connect once (without verification) to capture and store the server
+        host public key.  Subsequent connections will verify against it.
+
+        ``expected_fingerprint`` is the key a person approved after seeing
+        it (the MCP's confirmation shows it first): it is compared before
+        any credential is sent, and a server presenting another one is
+        refused — logged and audited by the model — with nothing stored."""
+        self._sec()._check_can_manage_hosts()
+        # sudo: trusted endpoint (manager-only gate); secret fields now
+        # require group_cloud_developer which manager inherits, but using
+        # sudo explicitly documents intent and survives future changes.
+        host = request.env['cloud.host'].sudo().browse(host_id)
+        if not host.exists():
+            return {'ok': False, 'error': _('Host not found')}
+        try:
+            captured = host._capture_known_host_key(
+                expected_fingerprint=expected_fingerprint,
+            )
+        except UserError as exc:
+            return {'ok': False, 'error': str(exc)}
+        except asyncssh.Error:
+            _logger.exception("trust_host_key SSH error for host %s", host_id)
+            return {'ok': False, 'error': _('SSH connection failed. Check host credentials and network.')}
+        except Exception:
+            _logger.exception("trust_host_key failed for host %s", host_id)
+            return {'ok': False, 'error': _('Connection failed. Check host credentials and network.')}
+        # The verdict travels to the panel: whether this key matches the one
+        # revoked by the last endpoint change is the only machine-identity
+        # check available, so it has to reach the operator who just clicked.
+        return {
+            'ok': True,
+            'fingerprint': captured['fingerprint'],
+            'previous_fingerprint': captured['previous_fingerprint'],
+            'changed': captured['changed'],
+        }
+
+    @http.route(
+        ['/cloud/preflight_host_hardening'], type='jsonrpc', auth='user',
+    )
+    def cloud_preflight_host_hardening(self, host_id):
+        """Return what the hardening confirmation needs to know about a host.
+
+        Read-only. The instance counts drive the dialog's warnings and the
+        typed confirmation a host running production asks for;
+        ``full_setup_done`` and ``connecting_user`` decide whether it
+        offers hardening and Full Setup as one chain,
+        ``has_known_hosts_key`` whether the host can be reached at all, and
+        ``has_active_job`` that a hardening is already asked for —
+        ``active_job_queued`` when it only waits in the host's queue —
+        and ``ssh_access`` who will be able to open SSH afterwards, and
+        whether the asker's own address can be offered
+        (``cloud.host._ssh_access_preview``).
+
+        :param int host_id: the ``cloud.host`` to harden
+        :returns: ``{'ok': True, ...}`` with the figures, or
+            ``{'ok': False, 'error': ...}`` when the host does not exist
+        :rtype: dict
+        """
+        self._sec()._check_can_manage_hosts()
+        host = request.env['cloud.host'].browse(host_id)
+        if not host.exists():
+            return {'ok': False, 'error': _('Host not found')}
+        # sudo: these are counts of what runs on the machine, which the
+        # warning is about whatever projects the caller belongs to.
+        Instance = request.env['cloud.instance'].sudo()
+        running = Instance.search_count([
+            ('host_id', '=', host.id),
+            ('running', '=', True),
+        ])
+        prod_running = Instance.search_count([
+            ('host_id', '=', host.id),
+            ('running', '=', True),
+            ('environment', '=', 'production'),
+        ])
+        Job = request.env['cloud.job'].sudo()
+        active_hardening = Job.search([
+            ('host_id', '=', host.id),
+            ('job_type_id.code', '=', 'host_hardening'),
+            ('state', 'in', Job._active_states),
+        ])
+        return {
+            'ok': True,
+            'host_id': host.id,
+            'host_name': host.name,
+            'running_instances': running,
+            'prod_running': prod_running,
+            # Full Setup is what brings Traefik up.
+            'full_setup_done': bool(host.traefik_deployed),
+            'has_hardened_before': bool(host.hardened),
+            'has_known_hosts_key': _has_encrypted(host, 'known_hosts_key'),
+            'connecting_user': host.user or '',
+            'has_active_job': bool(active_hardening),
+            # Every one of them still waiting in the host's queue: the
+            # dialog says it waits, not that it runs.
+            'active_job_queued': bool(active_hardening) and all(
+                job.state == 'queued' for job in active_hardening
+            ),
+            'ssh_access': host._ssh_access_preview(client_ip()),
+        }
+
+    @http.route(
+        ['/cloud/apply_host_hardening'], type='jsonrpc', auth='user',
+    )
+    def cloud_apply_host_hardening(
+        self, host_id, chain_full_setup=False, allow_ip=None,
+    ):
+        """Queue ``host_hardening`` for a host, optionally followed by Full Setup.
+
+        ``chain_full_setup`` queues ``host_hardening → full_setup``, the
+        order a host that was never set up needs: Full Setup then installs
+        its tools in the hardened user's home instead of root's.
+
+        ``allow_ip`` is the asker's own address, ticked in the dialog's
+        "Also allow my IP": added to the host's ``allowed_ssh_ips`` first,
+        and only when it is the address this request comes from and the
+        dialog could offer it (``cloud.host._allow_asker_ssh``). Nothing
+        else writes the list here: a caller that sends no address (the
+        MCP) leaves it as it is.
+
+        :param int host_id: the ``cloud.host`` to harden
+        :param bool chain_full_setup: queue Full Setup after the hardening
+        :param str allow_ip: the asker's address to allow, or nothing
+        :returns: ``{'ok': True, 'job_ids': [...]}`` in execution order,
+            with ``allowed_ssh_ips``, the list as stored, when an address
+            was added; or ``{'ok': False, 'error': ...}``
+        :rtype: dict
+        """
+        self._sec()._check_can_manage_hosts()
+        host = request.env['cloud.host'].browse(host_id)
+        if not host.exists():
+            return {'ok': False, 'error': _('Host not found')}
+        Job = request.env['cloud.job']
+        allowed = None
+        try:
+            # A refusal half-way (another job running on the host) must not
+            # leave the first job of the chain queued on its own, nor the
+            # asker's address in the list without a hardening to apply it.
+            with request.env.cr.savepoint():
+                if allow_ip:
+                    allowed = host._allow_asker_ssh(allow_ip, client_ip())
+                if chain_full_setup:
+                    job_ids = Job.enqueue_chain([
+                        {
+                            'host_id': host.id,
+                            'instance_id': False,
+                            'job_type_code': code,
+                        }
+                        for code in ('host_hardening', 'full_setup')
+                    ])
+                else:
+                    job_ids = [Job.enqueue(host.id, False, 'host_hardening')]
+        except Exception as exc:
+            return safe_error_response(exc, _("Failed to queue the hardening"))
+        result = {'ok': True, 'job_ids': job_ids}
+        if allowed is not None:
+            result['allowed_ssh_ips'] = allowed
+        return result
+
+    @http.route(['/cloud/save_host'], type='jsonrpc', auth='user')
+    def cloud_save_host(self, host_id, vals):
+        self._sec()._check_can_manage_hosts()
+        host = request.env['cloud.host'].browse(host_id)
+        if not host.exists():
+            return {'ok': False, 'error': _('Host not found')}
+        safe_vals = {k: v for k, v in vals.items() if k in self._HOST_ALLOWED}
+        # Only update key_file if a new one was uploaded
+        if not safe_vals.get('key_file'):
+            safe_vals.pop('key_file', None)
+        if 'tag_ids' in safe_vals:
+            safe_vals['tag_ids'] = [
+                fields.Command.set(safe_vals['tag_ids'] or [])
+            ]
+        host.write(safe_vals)
+
+        # Sync whitelist entries when provided.
+        # Use a direct search instead of host.whitelist_ids to avoid
+        # reading a stale ORM cache on a freshly-browsed record.
+        if 'whitelist' in vals:
+            hostnames = [
+                h.strip() for h in (vals['whitelist'] or [])
+                if h and h.strip()
+            ]
+            request.env['cloud.host.whitelist'].search(
+                [('host_id', '=', host.id)]
+            ).unlink()
+            if hostnames:
+                request.env['cloud.host.whitelist'].create([
+                    {'host_id': host.id, 'hostname': h, 'sequence': i * 10}
+                    for i, h in enumerate(hostnames, 1)
+                ])
+
+        return {'ok': True}
+
+    @http.route(['/cloud/setup_whitelist'], type='jsonrpc', auth='user')
+    def cloud_setup_whitelist(self, host_id):
+        self._sec()._check_can_manage_hosts()
+        host = request.env['cloud.host'].browse(host_id)
+        if not host.exists():
+            return {'ok': False, 'error': _('Host not found')}
+        job_id = request.env['cloud.job'].enqueue(
+            host_id, False, 'setup_whitelist'
+        )
+        return {'job_id': job_id}
+    # ── Project detail endpoints ────────────────────────────────────────────
+
+    @http.route(['/cloud/get_project'], type='jsonrpc', auth='user')
+    def cloud_get_project(self, project_id):
+        project = request.env['cloud.project'].browse(project_id)
+        if not project.exists():
+            return {'ok': False, 'error': _('Project not found')}
+        all_tags = request.env['cloud.tag'].search(
+            [], limit=_LIST_MAX, order='name',
+        )
+        return {
+            'id': project.id,
+            'name': project.name,
+            'description': project.description or '',
+            'project_author': project.project_author or 'IncubaCloud',
+            'project_license': project.project_license or 'BSL-1.0',
+            'status': project.status,
+            'instance_count': len(project.instance_ids),
+            # A new instance form opens on production until the project
+            # has one: a staging is a copy of it.
+            'has_production': any(
+                i.environment == 'production' for i in project.instance_ids
+            ),
+            'tags': [
+                {'id': t.id, 'name': t.name, 'color': t.color}
+                for t in project.tag_ids
+            ],
+            'all_tags': [
+                {'id': t.id, 'name': t.name, 'color': t.color}
+                for t in all_tags
+            ],
+            'odoo_version': project.odoo_version,
+            'odoo_commit_sha': project.odoo_commit_sha or '',
+            'odoo_initial_lang': (
+                project.odoo_initial_lang.id if project.odoo_initial_lang else None
+            ),
+            'pip_dependencies': project.pip_dependencies or '',
+            'apt_dependencies': project.apt_dependencies or '',
+            'member_ids': [{'id': u.id, 'name': u.name} for u in project.member_ids],
+            'backup_backend_id': (
+                project.backup_backend_id.id if project.backup_backend_id else None
+            ),
+            'pr_reviews_enabled': project.pr_reviews_enabled,
+            'repos': [
+                {
+                    'id': r.id,
+                    'url': r.url,
+                    'branch': r.branch or 'main',
+                    'addons': r.addons or '',
+                    'excludes': r.excludes or '',
+                    'commit_sha': r.commit_sha or '',
+                    'repo_capabilities': r.repo_capabilities,
+                }
+                for r in project.repo_ids
+            ],
+        }
+
+    #: The fields of a project the create and save routes write.
+    _PROJECT_ALLOWED = {
+        'name', 'description', 'project_author', 'project_license',
+        'odoo_version', 'odoo_commit_sha', 'odoo_initial_lang',
+        'pip_dependencies', 'apt_dependencies',
+        'backup_backend_id', 'pr_reviews_enabled',
+    }
+
+    @http.route(['/cloud/create_project'], type='jsonrpc', auth='user')
+    def cloud_create_project(self, vals):
+        self._sec()._check_can_create_project()
+        repos = vals.pop('repos', None)
+        tag_ids = vals.pop('tag_ids', None)
+        safe = {k: v for k, v in vals.items() if k in self._PROJECT_ALLOWED}
+        if isinstance(safe.get('odoo_version'), (int, float)):
+            safe['odoo_version'] = f"{float(safe['odoo_version']):.1f}"
+        # Never override pip_dependencies with an empty string: let the ORM
+        # default apply so every new project starts with the base packages.
+        if not safe.get('pip_dependencies'):
+            safe.pop('pip_dependencies', None)
+        if tag_ids is not None:
+            safe['tag_ids'] = [fields.Command.set(tag_ids)]
+        project = request.env['cloud.project'].create(safe)
+        git_budget = GitReadBudget(request.env)
+        # ── Create repos ─────────────────────────────────────────────────────
+        if repos:
+            Repo = request.env['cloud.project.repo'].with_context(
+                skip_apply_requirements=True,
+            )
+            for seq, repo in enumerate(repos, start=10):
+                if repo.get('url', '').strip():
+                    Repo.create({
+                        'project_id': project.id,
+                        'sequence': seq,
+                        'url': repo['url'].strip(),
+                        'branch': repo.get('branch', 'main').strip() or 'main',
+                        'addons': repo.get('addons', '').strip(),
+                        'excludes': repo.get('excludes', '').strip(),
+                        'commit_sha': repo.get('commit_sha', '').strip(),
+                    })
+            # ── Merge repo requirements into pip_dependencies ─────────────
+            # A GitLab line runs git on the panel: within the request's
+            # reads and the user's hourly cap, or not now.
+            merged = project.pip_dependencies or ''
+            for repo in repos:
+                url = repo.get('url', '').strip()
+                branch = (repo.get('branch') or 'main').strip() or 'main'
+                if url:
+                    deadline = None
+                    if on_git_provider(request.env, url):
+                        if not git_budget.take():
+                            continue
+                        deadline = git_budget.deadline
+                    content = fetch_requirements_txt(
+                        request.env, url, branch, deadline=deadline,
+                    )
+                    if content:
+                        result = merge_pip_requirements(
+                            merged, content, url, branch,
+                        )
+                        merged = result['content']
+            if merged != (project.pip_dependencies or ''):
+                project.pip_dependencies = merged
+        # ── Pip conflict detection ────────────────────────────────────────
+        conflicts = detect_pip_conflicts(project.pip_dependencies or '')
+        if conflicts:
+            create_pip_conflict_alert(
+                request.env, conflicts, project_id=project.id,
+            )
+        answer = {'id': project.id, 'name': project.name}
+        warning = git_budget.requirements_warning()
+        if warning:
+            answer['warning'] = warning
+        return answer
+
+    @http.route(['/cloud/save_project'], type='jsonrpc', auth='user')
+    def cloud_save_project(self, project_id, vals):
+        self._sec()._check_cloud_group('group_cloud_consultant')
+        project = request.env['cloud.project'].browse(project_id)
+        if not project.exists():
+            return {'ok': False, 'error': _('Project not found')}
+        repos = vals.pop('repos', None)
+        tag_ids = vals.pop('tag_ids', None)
+        member_ids = vals.pop('member_ids', None)
+        safe_vals = {k: v for k, v in vals.items() if k in self._PROJECT_ALLOWED}
+        if isinstance(safe_vals.get('odoo_version'), (int, float)):
+            safe_vals['odoo_version'] = f"{float(safe_vals['odoo_version']):.1f}"
+        if tag_ids is not None:
+            safe_vals['tag_ids'] = [fields.Command.set(tag_ids)]
+        if member_ids is not None:
+            safe_vals['member_ids'] = [fields.Command.set(member_ids)]
+        if safe_vals:
+            project.write(safe_vals)
+        saved_repos = []
+        if repos is not None:
+            # Rows are kept by id, as an instance's are: every save used
+            # to delete and recreate them, so the editor's rows carried
+            # ids that no longer existed and pinning one answered "Repo
+            # not found" (a customer's panel, 2026-10-15).
+            Repo = request.env['cloud.project.repo'].with_context(
+                skip_apply_requirements=True,
+            )
+            existing_ids = set(project.repo_ids.ids)
+            kept_ids = set()
+            for seq, repo in enumerate(repos, start=10):
+                url = (repo.get('url') or '').strip()
+                if not url:
+                    continue
+                rid = repo.get('id')
+                vals = {
+                    'sequence': seq,
+                    'url': url,
+                    'branch': (repo.get('branch') or 'main').strip() or 'main',
+                    'addons': (repo.get('addons') or '').strip(),
+                    'excludes': (repo.get('excludes') or '').strip(),
+                    'commit_sha': (repo.get('commit_sha') or '').strip(),
+                }
+                if rid and rid in existing_ids:
+                    row = Repo.browse(rid)
+                    row.write(vals)
+                    kept_ids.add(rid)
+                else:
+                    row = Repo.create({'project_id': project.id, **vals})
+                saved_repos.append({'id': row.id, 'url': url})
+            to_unlink = existing_ids - kept_ids
+            if to_unlink:
+                Repo.browse(list(to_unlink)).unlink()
+        # ── Pip conflict detection ────────────────────────────────────────────
+        pip_deps = project.pip_dependencies or ''
+        conflicts = detect_pip_conflicts(pip_deps)
+        Alert = request.env['cloud.alert']
+        if conflicts:
+            create_pip_conflict_alert(
+                request.env, conflicts, project_id=project.id,
+            )
+        else:
+            # The project's own alert, never one of its instances'.
+            Alert.resolve_alert(
+                'pip_conflict', **Alert._link_target('project_id', project.id),
+            )
+        # The rows' ids, in the order sent, so the editor keeps them.
+        return {'ok': True, 'repos': saved_repos}
+
+    @http.route(['/cloud/get_host_instances'], type='jsonrpc', auth='user')
+    def cloud_get_host_instances(self, host_id):
+        host = request.env['cloud.host'].browse(host_id)
+        if not host.exists():
+            return {'ok': False, 'error': _('Host not found')}
+        is_developer = self._sec()._has_cloud_group('group_cloud_developer')
+        return {
+            'host_name': host.name,
+            'instances': [
+                {
+                    'id': i.id,
+                    'name': i.name,
+                    'environment': i.environment,
+                    'status': i.status,
+                    'state': i.state,
+                    'deployed': i.deployed,
+                    'running': i.running,
+                    'service_states': i.service_states or {},
+                    'stop_is_expected': i.stop_is_expected,
+                    'host': i.host_id.name if i.host_id else '',
+                    'host_id': i.host_id.id if i.host_id else None,
+                    'host_ip': (
+                        i.host_id.ip_address
+                        if (i.host_id and is_developer) else ''
+                    ),
+                    'host_user': (
+                        i.host_id.user if (i.host_id and is_developer) else ''
+                    ),
+                    'host_port': (
+                        i.host_id.port if (i.host_id and is_developer) else 22
+                    ),
+                    'db_name': i.postgres_dbname or 'prod',
+                    'domain': i.domain or '',
+                    'compose_services': i.compose_services or 'odoo,db',
+                    'project_id': i.project_id.id if i.project_id else None,
+                    'project_name': i.project_id.name if i.project_id else '',
+                    'pr_number': i.pr_number or 0,
+                    'pr_kind': 'gitlab' if i.pr_provider_id else 'github',
+                }
+                for i in host.instance_ids
+            ],
+        }
+
+    @http.route(['/cloud/get_project_instances'], type='jsonrpc', auth='user')
+    def cloud_get_project_instances(self, project_id):
+        project = request.env['cloud.project'].browse(project_id)
+        if not project.exists():
+            return {'ok': False, 'error': _('Project not found')}
+        CloudJob = request.env['cloud.job']
+        is_developer = self._sec()._has_cloud_group('group_cloud_developer')
+        instances = []
+        for i in project.instance_ids:
+            latest = CloudJob.search(
+                [('instance_id', '=', i.id)],
+                order='create_date desc', limit=1,
+            )
+            instances.append({
+                'id': i.id,
+                'name': i.name,
+                'environment': i.environment,
+                'autopurge_days_left': i._autopurge_days_left(),
+                'status': i.status,
+                'state': i.state,
+                'deployed': i.deployed,
+                'running': i.running,
+                'service_states': i.service_states or {},
+                'stop_is_expected': i.stop_is_expected,
+                'host': i.host_id.name if i.host_id else '',
+                'host_id': i.host_id.id if i.host_id else None,
+                'host_ip': (
+                    i.host_id.ip_address
+                    if (i.host_id and is_developer) else ''
+                ),
+                'host_user': (
+                    i.host_id.user if (i.host_id and is_developer) else ''
+                ),
+                'host_port': (
+                    i.host_id.port if (i.host_id and is_developer) else 22
+                ),
+                'db_name': i.postgres_dbname or 'prod',
+                'domain': i.domain or '',
+                'compose_services': i.compose_services or 'odoo,db',
+                'latest_job_id': latest.id if latest else None,
+                'pr_number': i.pr_number or 0,
+                'pr_kind': 'gitlab' if i.pr_provider_id else 'github',
+                # Lets the refresh dialog tell "restore from the latest
+                # snapshot" apart from "there is no snapshot store, a
+                # live dump is the only option".
+                'effective_backup_backend_id': (
+                    i.effective_backup_backend.id
+                    if i.effective_backup_backend else None
+                ),
+            })
+        return {
+            'project_name': project.name,
+            'instances': instances,
+        }
+
+    @http.route(['/cloud/get_archived_instances'], type='jsonrpc',
+                auth='user')
+    def cloud_get_archived_instances(self, project_id):
+        """Archived instances of a project, with what their copy costs.
+
+        Archiving sets ``active = False``, so these are invisible to
+        every other listing — ``project.instance_ids`` skips them like
+        any one2many. Without a route of their own an archived instance
+        would be unreachable, which is why this ships together with the
+        flag rather than after it.
+
+        The size and the verification stamp are read from the record,
+        never measured here: listing a bucket prefix per row would put a
+        network call in the render path. A cron refreshes them and this
+        reports what it last saw, including how long ago that was, so a
+        stale figure is visible as stale rather than passing for current.
+
+        Where the copy lives is manager-only, the same rule SEC-009 set
+        for every other endpoint that could name a bucket: the frozen
+        destination and the backend's name are exactly the metadata the
+        backends list is gated on, and where a layer provides that storage
+        it is the layer's, not the user's. Everyone who can see the project still sees that
+        there is a copy, how big it is and when it was last checked —
+        none of which says where it is.
+        """
+        project = request.env['cloud.project'].browse(project_id)
+        if not project.exists():
+            return {'ok': False, 'error': _('Project not found')}
+        is_manager = self._sec()._has_cloud_group('group_cloud_manager')
+        archived = request.env['cloud.instance'].with_context(
+            active_test=False,
+        ).search([
+            ('project_id', '=', project_id),
+            ('active', '=', False),
+        ], order='name')
+        return {
+            'ok': True,
+            'project_name': project.name,
+            'instances': [{
+                'id': i.id,
+                'name': i.name,
+                'environment': i.environment,
+                'odoo_version': i.odoo_version or '',
+                'archived_on': i.archived_at or i.write_date,
+                'host_name': i.host_id.name or '',
+                # The frozen path: where the copy actually is, whatever
+                # the computed one would say now. Redacted below manager
+                # — it names a bucket.
+                'backup_dst': (
+                    i.custom_backup_dst or '' if is_manager else ''
+                ),
+                'backup_backend_name': (
+                    i.effective_backup_backend.name
+                    if is_manager and i.effective_backup_backend else ''
+                ),
+                # False when archiving found no destination: the teardown
+                # destroyed everything and there is nothing to revive
+                # from. The view must not offer the button.
+                'has_copy': bool(i.custom_backup_dst),
+                # The cron's last reading, shipped with its timestamp so
+                # the view can say how old it is instead of presenting a
+                # week-old check as the current state.
+                'copy_state': i.archive_copy_state or '',
+                'copy_bytes': i.archive_copy_bytes or 0.0,
+                'copy_checked_at': i.archive_copy_checked_at,
+            } for i in archived],
+        }
+
+    @http.route(['/cloud/revive_instance'], type='jsonrpc', auth='user')
+    def cloud_revive_instance(self, instance_id, host_id=None):
+        """Bring an archived instance back and restore its copy.
+
+        Gated as a deploy and a restore, as the panel offers it: this
+        builds an instance on a host and restores a database into it.
+        ``browse`` without sudo on purpose, so the record rules that
+        scope instances still apply — the archived flag hides a record
+        from lists, it does not make it anyone's to revive. ``revive``
+        un-archives the record before it queues the jobs: a refusal after
+        that rolls back to the savepoint, so the record stays archived.
+        """
+        self._sec()._check_can_deploy()
+        self._sec()._check_can_manage_backups()
+        inst = request.env['cloud.instance'].with_context(
+            active_test=False,
+        ).browse(instance_id)
+        if not inst.exists():
+            return {'ok': False, 'error': _('Instance not found')}
+        try:
+            with request.env.cr.savepoint():
+                job_ids = inst.revive(host_id=host_id)
+        except UserError as exc:
+            return {'ok': False, 'error': str(exc)}
+        return {'ok': True, 'job_ids': job_ids}
+
+    @http.route(['/cloud/delete_archived_instance'], type='jsonrpc',
+                auth='user')
+    def cloud_delete_archived_instance(self, instance_id, confirm_name=None):
+        """Delete an archived instance and the copy it still owns.
+
+        Manager-gated, and it asks for the name in writing. There is no
+        undo behind this: the chain is emptied and the record removed,
+        and unlike a live instance there is not even a running system to
+        notice the mistake afterwards. The typing is checked here and
+        not only in the browser, so a direct RPC call faces the same
+        friction the dialog does.
+        """
+        self._sec()._check_cloud_group('group_cloud_manager')
+        inst = request.env['cloud.instance'].with_context(
+            active_test=False,
+        ).browse(instance_id)
+        if not inst.exists():
+            return {'ok': False, 'error': _('Instance not found')}
+        if (confirm_name or '').strip() != inst.name:
+            return {'ok': False, 'error': _(
+                'Type the instance name exactly to confirm.'
+            )}
+        try:
+            job_ids = inst.delete_archived()
+        except UserError as exc:
+            return {'ok': False, 'error': str(exc)}
+        return {'ok': True, 'job_ids': job_ids}
+
+    _CREATE_INSTANCE_ALLOWED = {
+        'name', 'project_id', 'host_id', 'environment',
+        'odoo_version', 'odoo_commit_sha',
+        'odoo_initial_lang', 'odoo_admin_password', 'odoo_proxy',
+        'postgres_version', 'postgres_dbname', 'postgres_username', 'postgres_password',
+        'pip_dependencies', 'apt_dependencies', 'tag_ids',
+        'smtp_relay_host', 'smtp_relay_port', 'smtp_relay_security',
+        'smtp_relay_user', 'smtp_relay_password',
+        'smtp_relay_auth', 'smtp_relay_oauth_directory_id',
+        'smtp_relay_oauth_client_id', 'smtp_relay_oauth_client_secret',
+        'odoo_memory_limit', 'odoo_cpus', 'db_memory_limit', 'db_cpus',
+        'backup_memory_limit', 'backup_cpus', 'smtp_memory_limit', 'smtp_cpus',
+        # The form offers it for a production; who may choose it is the
+        # model's to say (``cloud.instance._check_guarded_vals``).
+        'backup_backend_id',
+    }
+
+    def _pre_auto_assign_host_hook(self, vals, safe):
+        """Extension point for inheriting modules to inject host
+        provisioning logic before auto-assign runs.
+
+        Return ``None`` to let the default auto-assign logic run, or a
+        response dict (e.g. ``{'blocked': True, 'message': ...}``) to
+        abort early.
+        """
+        return None
+
+    @http.route(['/cloud/create_instance'], type='jsonrpc', auth='user')
+    def cloud_create_instance(self, vals):
+        self._sec()._check_can_create_instance()
+        repos = vals.pop('repos', None) if isinstance(vals, dict) else None
+        domains = vals.pop('domains', None) if isinstance(vals, dict) else None
+        safe = {k: v for k, v in vals.items() if k in self._CREATE_INSTANCE_ALLOWED}
+        # If a single domain string was passed, convert to domain_ids
+        domain_str = vals.get('domain', '').strip()
+        if domain_str:
+            safe['domain_ids'] = [(0, 0, {'hostname': domain_str})]
+        elif domains:
+            safe['domain_ids'] = [
+                (0, 0, _domain_vals(d, request.env))
+                for d in domains if (d.get('hostname') or '').strip()
+            ]
+        # ── Normalize odoo_version to string (frontend may send a number) ──
+        if 'odoo_version' in safe:
+            v = safe['odoo_version']
+            if isinstance(v, (int, float)):
+                safe['odoo_version'] = f"{float(v):.1f}"
+        if 'tag_ids' in safe:
+            safe['tag_ids'] = [fields.Command.set(safe['tag_ids'] or [])]
+        # ── Inherit odoo_version and odoo_initial_lang from project ──────────
+        project_id = safe.get('project_id')
+        if project_id:
+            project = request.env['cloud.project'].browse(project_id)
+            if project.exists():
+                if project.odoo_version:
+                    safe['odoo_version'] = project.odoo_version
+                if project.odoo_initial_lang and 'odoo_initial_lang' not in safe:
+                    safe['odoo_initial_lang'] = project.odoo_initial_lang.id
+        # ── Block if project has unresolved pip conflicts ──────────────────
+        if project_id:
+            # The project's own conflict: one of its instances' carries
+            # the project too, and blocks only that instance's deploys.
+            Alert = request.env['cloud.alert']
+            pip_alert = Alert.search(
+                Alert._dedup_domain(
+                    'pip_conflict', **Alert._link_target('project_id', project_id),
+                ),
+                limit=1,
+            )
+            if pip_alert:
+                return {
+                    'blocked': True,
+                    'reason': 'pip_conflict',
+                    'message': _(
+                        'Project has unresolved pip dependency conflicts. '
+                        'Resolve them in the project settings before '
+                        'creating an instance.'
+                    ),
+                }
+        # Hook for inheriting modules to inject a host before auto-assign
+        # runs. Core knows nothing about external VPS providers — that
+        # logic belongs to the modules that extend this controller.
+        hook_result = self._pre_auto_assign_host_hook(vals, safe)
+        if hook_result is not None:
+            return hook_result
+
+        # ── Auto-assign host when not explicitly provided ─────────────────
+        if not safe.get('host_id'):
+            autoassign = (
+                request.env['ir.config_parameter'].sudo()
+                .get_param('incubacloud.host_autoassign', '0') == '1'
+            )
+            if not autoassign:
+                return {
+                    'blocked': True,
+                    'reason': 'host_required',
+                    'message': _(
+                        'Please select a host for the instance.'
+                    ),
+                }
+            cpus, ram = (
+                request.env['cloud.instance']
+                ._compute_instance_resources(safe)
+            )
+            best_host = request.env['cloud.host'].select_best_host(cpus, ram)
+            if not best_host:
+                return {
+                    'blocked': True,
+                    'reason': 'no_host',
+                    'message': _(
+                        'No host with sufficient resources is available.'
+                    ),
+                }
+            safe['host_id'] = best_host.id
+        Instance = request.env['cloud.instance']
+        if repos:
+            Instance = Instance.with_context(skip_project_repos=True)
+        instance = Instance.create(safe)
+        if repos:
+            # skip_apply_requirements: the frontend already merged requirements
+            # via _fetchAndMergeRequirements on branch change; re-fetching here
+            # would block the request with N synchronous GitHub API calls.
+            # The model says which repositories the user may name.
+            instance.with_context(
+                skip_apply_requirements=True,
+            )._create_repo_lines([
+                {
+                    'sequence': seq,
+                    'url': repo['url'].strip(),
+                    'branch': (
+                        (repo.get('branch') or 'main').strip() or 'main'
+                    ),
+                    'addons': repo.get('addons') or '',
+                    'excludes': repo.get('excludes') or '',
+                    'commit_sha': repo.get('commit_sha') or '',
+                }
+                for seq, repo in enumerate(repos, start=10)
+                if (repo.get('url') or '').strip()
+            ])
+        git_budget = GitReadBudget(request.env, seconds=ADDON_CHECK_SECONDS)
+        instance._check_addon_conflicts(
+            seconds=ADDON_CHECK_SECONDS, git_budget=git_budget,
+        )
+        answer = {'id': instance.id, 'name': instance.name}
+        warning = git_budget.addons_warning()
+        if warning:
+            answer['warning'] = warning
+        return answer
+
+    # ── General settings ──────────────────────────────────────────────────
+
+    @http.route(['/cloud/get_general_settings'], type='jsonrpc', auth='user')
+    def cloud_get_general_settings(self):
+        # Manager-gated, matching save_general_settings. The reads below
+        # use sudo, so without this any logged-in user could see them.
+        self._sec()._check_can_manage_hosts()
+        ICP = request.env['ir.config_parameter'].sudo()
+        bb_id = int(ICP.get_param(
+            'incubacloud.backup_backend_id', 0,
+        ) or 0)
+        Settings = request.env['cloud.settings'].sudo()
+        settings = Settings._get()
+        central = Settings._live_central_host()
+        return {
+            'autoassign_enabled': ICP.get_param(
+                'incubacloud.host_autoassign', '0',
+            ) == '1',
+            'default_backup_backend_id': bb_id or None,
+            'audit_log_retention_days': int(
+                ICP.get_param('incubacloud.audit_log_retention_days', '90') or 90
+            ),
+            'job_log_retention_days': settings.job_log_retention_days or 0,
+            'job_retention_days': settings.job_retention_days or 0,
+            'host_session_retention_days': (
+                settings.host_session_retention_days or 0
+            ),
+            'move_frozen_source_hours': settings.move_frozen_source_hours or 0,
+            'move_cut_alert_seconds': settings.move_cut_alert_seconds or 0,
+            'staging_autopurge_days': (
+                settings.staging_autopurge_days or 0
+            ),
+            'default_backup_alert_threshold_pct': (
+                settings.default_backup_alert_threshold_pct or 0
+            ),
+            'github_event_retention_days': (
+                settings.github_event_retention_days or 0
+            ),
+            'github_event_truncate_days': (
+                settings.github_event_truncate_days or 0
+            ),
+            # ── Container log rotation ─────────────────────────────────
+            'container_log_max_size': settings.container_log_max_size or '',
+            'container_log_max_file': settings.container_log_max_file or 0,
+            'odoo_log_archive_days': settings.odoo_log_archive_days or 0,
+            'log_download_max_mb': settings.log_download_max_mb or 0,
+            'log_search_max_files': settings.log_search_max_files or 0,
+            'log_search_timeout_s': settings.log_search_timeout_s or 0,
+            'cron_heartbeat_url': settings.cron_heartbeat_url or '',
+            # ── Observability ──────────────────────────────────────────
+            # The remote-write token is write-only, like the GitHub PAT:
+            # it is a fleet-wide write credential, so the browser only
+            # learns whether one is set, never its value.
+            'metrics_enabled': bool(settings.metrics_enabled),
+            'metrics_central_url': settings.metrics_central_url or '',
+            'metrics_remote_write_url': settings.metrics_remote_write_url or '',
+            'has_metrics_remote_write_token': bool(
+                settings.metrics_remote_write_token
+            ),
+            'metrics_retention_days': settings.metrics_retention_days or 0,
+            'metrics_collect_pg': bool(settings.metrics_collect_pg),
+            'metrics_central_public_host':
+                settings.metrics_central_public_host or '',
+            'metrics_central_operator_sources':
+                settings.metrics_central_operator_sources or '',
+            'metrics_central_direct_host':
+                settings.metrics_central_direct_host or '',
+            'metrics_central_direct': {
+                'state': settings.metrics_central_direct_state or 'unknown',
+                'checked_at': settings.metrics_central_direct_checked_at or '',
+                'failing_since':
+                    settings.metrics_central_direct_failing_since or '',
+                'cert_expires':
+                    settings.metrics_central_direct_cert_expires or '',
+            },
+            # Write-only, as the remote-write token above.
+            'has_acme_dns_token': bool(settings.acme_dns_cloudflare_token),
+            # The single path: its switch, who may write, and what the
+            # central's name answered from its server.
+            'metrics_central_single_path': bool(
+                settings.metrics_central_single_path
+            ),
+            'metrics_central_write_access': Settings._central_write_access(),
+            'metrics_central_write_access_fixed': bool(
+                Settings._central_write_access_fixed()
+            ),
+            'metrics_central_name': self._central_name_status(settings),
+            # Where the central runs, while that host is in the fleet:
+            # which of Enable observability and Start an empty central
+            # the chosen host gets, and what Retire names.
+            'metrics_central_host': (
+                {'id': central.id, 'name': central.name} if central else False
+            ),
+            # Whether Retire the central is offered: a layer may keep a
+            # central that serves more than this panel.
+            'metrics_central_retirable': not Settings._central_retire_refusal(),
+            # ── Edge ───────────────────────────────────────────────────
+            # The override plus what actually applies and where it comes
+            # from, because the field alone says nothing about the list
+            # in force when a layer above supplies one.
+            'trusted_proxy_ranges': settings.trusted_proxy_ranges or '',
+            'effective_trusted_proxy_ranges': Settings
+            ._effective_trusted_proxy_ranges(),
+            'trusted_proxy_source': Settings._trusted_proxy_source(),
+        }
+
+    @http.route(['/cloud/save_general_settings'], type='jsonrpc', auth='user')
+    def cloud_save_general_settings(
+        self, autoassign_enabled=None, default_backup_backend_id=None,
+        audit_log_retention_days=None, job_log_retention_days=None,
+        job_retention_days=None, staging_autopurge_days=None,
+        host_session_retention_days=None,
+        move_frozen_source_hours=None, move_cut_alert_seconds=None,
+        default_backup_alert_threshold_pct=None,
+        github_event_retention_days=None, github_event_truncate_days=None,
+        metrics_enabled=None, metrics_central_url=None,
+        metrics_remote_write_url=None, metrics_remote_write_token=None,
+        metrics_retention_days=None,
+        container_log_max_size=None, container_log_max_file=None,
+        odoo_log_archive_days=None, log_download_max_mb=None,
+        log_search_max_files=None, log_search_timeout_s=None,
+        trusted_proxy_ranges=None, metrics_central_public_host=None,
+        metrics_central_operator_sources=None,
+        metrics_collect_pg=None,
+        metrics_central_direct_host=None, acme_dns_cloudflare_token=None,
+        metrics_central_single_path=None, metrics_central_write_access=None,
+        cron_heartbeat_url=None,
+    ):
+        """Save the settings a Settings section sent, and only those.
+
+        Each section of Settings saves its own fields, so every argument
+        is written only when the client sent it: a section never blanks
+        out, or puts back to its default, a setting of another. A value
+        the model refuses is answered with the name of its field, so the
+        page shows the message under it, and nothing of the save is kept.
+
+        :returns: ``{'ok': True}``, or ``{'ok': False, 'error': message,
+            'field': name}`` with nothing saved
+        """
+        self._sec()._check_can_manage_hosts()
+        # Coerce numeric inputs through try/except so a non-numeric
+        # value reaches the user as a friendly error instead of
+        # surfacing a ValueError stack trace through Odoo's default
+        # JSON-RPC handler.
+        def _safe_int(value, default=0):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        # One savepoint for the whole save: a value refused half-way
+        # undoes what was written before it, so an answer of ``ok:
+        # False`` never comes with half of the section saved.
+        try:
+            with request.env.cr.savepoint():
+                ICP = request.env['ir.config_parameter'].sudo()
+                if default_backup_backend_id is not None:
+                    # 0 (or an empty value) is "no default destination".
+                    backend_id = _safe_int(default_backup_backend_id, 0)
+                    if backend_id and not request.env[
+                        'cloud.backup.backend'
+                    ].sudo().browse(backend_id).exists():
+                        raise _SettingRefused(
+                            'default_backup_backend_id',
+                            ValidationError(_('Unknown backup destination.')),
+                        )
+                    ICP.set_param(
+                        'incubacloud.backup_backend_id',
+                        str(backend_id) if backend_id else '0',
+                    )
+                if autoassign_enabled is not None:
+                    ICP.set_param(
+                        'incubacloud.host_autoassign',
+                        '1' if autoassign_enabled else '0',
+                    )
+                if audit_log_retention_days is not None:
+                    ICP.set_param(
+                        'incubacloud.audit_log_retention_days',
+                        str(max(0, _safe_int(audit_log_retention_days, 90))),
+                    )
+                retention = {}
+                if default_backup_alert_threshold_pct is not None:
+                    # Clamp to 0–100; 0 falls through to "no alerts by default" in
+                    # the backend's threshold-resolution logic, a safe lower bound.
+                    retention['default_backup_alert_threshold_pct'] = max(0, min(
+                        100, _safe_int(default_backup_alert_threshold_pct, 80),
+                    ))
+                for name, value, default in (
+                    ('job_log_retention_days', job_log_retention_days, 30),
+                    ('job_retention_days', job_retention_days, 180),
+                    ('host_session_retention_days',
+                     host_session_retention_days, 365),
+                    ('github_event_retention_days', github_event_retention_days, 90),
+                    ('github_event_truncate_days', github_event_truncate_days, 7),
+                    ('move_frozen_source_hours', move_frozen_source_hours, 48),
+                    ('move_cut_alert_seconds', move_cut_alert_seconds, 90),
+                ):
+                    if value is not None:
+                        retention[name] = max(0, _safe_int(value, default))
+                if retention:
+                    request.env['cloud.settings'].sudo()._get().write(retention)
+
+                # ── Staging autopurge ─────────────────────────────────────
+                # Written only when the client sent it, and through the model so
+                # the floor on the window is enforced in one place. A window too
+                # short for the warnings to land is refused by name rather than
+                # silently clamped, because clamping would leave the operator
+                # believing a number that is not in force.
+                if staging_autopurge_days is not None:
+                    try:
+                        with request.env.cr.savepoint():
+                            request.env['cloud.settings'].sudo()._get().write({
+                                'staging_autopurge_days': _safe_int(
+                                    staging_autopurge_days, 90,
+                                ),
+                            })
+                    except ValidationError as exc:
+                        raise _SettingRefused('staging_autopurge_days', exc) from exc
+
+                # ── Edge ──────────────────────────────────────────────────
+                # Written only when the client sent them, so a caller that
+                # predates these knobs cannot blank them out. The range list goes
+                # through the model constraint on purpose: a typo there narrows
+                # who we believe without saying so, and the caller is told which
+                # entries were rejected instead of having them dropped.
+                edge_vals = {}
+                if trusted_proxy_ranges is not None:
+                    edge_vals['trusted_proxy_ranges'] = str(
+                        trusted_proxy_ranges or '',
+                    ).strip()
+                if edge_vals:
+                    try:
+                        with request.env.cr.savepoint():
+                            request.env['cloud.settings'].sudo()._get().write(
+                                edge_vals,
+                            )
+                    except ValidationError as exc:
+                        raise _SettingRefused('trusted_proxy_ranges', exc) from exc
+
+                # ── Container log rotation ────────────────────────────────
+                # Written only when the client sent them, so a caller that
+                # predates the knobs cannot blank them out. The size is
+                # normalised to the one spelling the model accepts; anything
+                # else is left to the model constraint, whose message names the
+                # expected format.
+                log_vals = {}
+                if container_log_max_size is not None:
+                    log_vals['container_log_max_size'] = (
+                        str(container_log_max_size or '').strip().lower()
+                    )
+                if container_log_max_file is not None:
+                    log_vals['container_log_max_file'] = _safe_int(
+                        container_log_max_file, CONTAINER_LOG_MAX_FILE_DEFAULT,
+                    )
+                if odoo_log_archive_days is not None:
+                    log_vals['odoo_log_archive_days'] = _safe_int(
+                        odoo_log_archive_days, ODOO_LOG_ARCHIVE_DAYS_DEFAULT,
+                    )
+                for field, value, default in (
+                    ('log_download_max_mb', log_download_max_mb,
+                     LOG_DOWNLOAD_MAX_MB_DEFAULT),
+                    ('log_search_max_files', log_search_max_files,
+                     LOG_SEARCH_MAX_FILES_DEFAULT),
+                    ('log_search_timeout_s', log_search_timeout_s,
+                     LOG_SEARCH_TIMEOUT_S_DEFAULT),
+                ):
+                    if value is not None:
+                        log_vals[field] = _safe_int(value, default)
+                # One at a time, so a refusal names the field it is about.
+                for name, value in log_vals.items():
+                    try:
+                        with request.env.cr.savepoint():
+                            request.env['cloud.settings'].sudo()._get().write({
+                                name: value,
+                            })
+                    except ValidationError as exc:
+                        raise _SettingRefused(name, exc) from exc
+
+                # ── Heartbeat of the scheduled actions ────────────────────
+                # Empty turns it off. Checked here so a typo is said under
+                # the field; ``ping`` checks it again at every send, as DNS
+                # may change meanwhile (see :mod:`...net.outbound`).
+                if cron_heartbeat_url is not None:
+                    url = str(cron_heartbeat_url or '').strip()
+                    if url:
+                        try:
+                            validate_url(url)
+                        except OutboundError as exc:
+                            raise _SettingRefused(
+                                'cron_heartbeat_url', ValidationError(_(
+                                    'This URL cannot be used: %s.', exc,
+                                )),
+                            ) from exc
+                    request.env['cloud.settings'].sudo()._get().write({
+                        'cron_heartbeat_url': url or False,
+                    })
+
+                # ── Observability ─────────────────────────────────────────
+                # Each field is written only when the client actually sent it, so
+                # a caller that predates these settings cannot blank them out.
+                metrics_vals = {}
+                if metrics_enabled is not None:
+                    metrics_vals['metrics_enabled'] = bool(metrics_enabled)
+                if metrics_collect_pg is not None:
+                    metrics_vals['metrics_collect_pg'] = bool(metrics_collect_pg)
+                if metrics_central_single_path is not None:
+                    metrics_vals['metrics_central_single_path'] = bool(
+                        metrics_central_single_path
+                    )
+                Settings = request.env['cloud.settings'].sudo()
+                if (
+                    metrics_central_write_access in ('servers', 'anyone')
+                    and not Settings._central_write_access_fixed()
+                ):
+                    metrics_vals['metrics_central_write_access'] = (
+                        metrics_central_write_access
+                    )
+                for field, value in (
+                    ('metrics_central_url', metrics_central_url),
+                    ('metrics_remote_write_url', metrics_remote_write_url),
+                ):
+                    if value is not None:
+                        metrics_vals[field] = (value or '').strip()
+                if metrics_retention_days is not None:
+                    metrics_vals['metrics_retention_days'] = max(
+                        1, _safe_int(metrics_retention_days, 90),
+                    )
+                # Write-only secret: an empty string means "leave it alone", which
+                # is what the form sends back when the operator did not retype it.
+                if (metrics_remote_write_token or '').strip():
+                    metrics_vals['metrics_remote_write_token'] = (
+                        metrics_remote_write_token.strip()
+                    )
+                if (acme_dns_cloudflare_token or '').strip():
+                    metrics_vals['acme_dns_cloudflare_token'] = (
+                        acme_dns_cloudflare_token.strip()
+                    )
+                if metrics_vals:
+                    request.env['cloud.settings'].sudo()._get().write(metrics_vals)
+
+                # Where the central is published, and who may delete series on
+                # it. Through the model constraints, which name what is wrong: a
+                # URL or a typo'd range here would publish nothing usable. In a
+                # savepoint, because a refused value stays in the cache and the
+                # request would otherwise commit it with the answer.
+                central_vals = {}
+                if metrics_central_public_host is not None:
+                    central_vals['metrics_central_public_host'] = (
+                        str(metrics_central_public_host or '').strip().lower()
+                    )
+                if metrics_central_direct_host is not None:
+                    central_vals['metrics_central_direct_host'] = (
+                        str(metrics_central_direct_host or '').strip().lower()
+                    )
+                if metrics_central_operator_sources is not None:
+                    central_vals['metrics_central_operator_sources'] = str(
+                        metrics_central_operator_sources or '',
+                    ).strip()
+                for name, value in central_vals.items():
+                    try:
+                        with request.env.cr.savepoint():
+                            request.env['cloud.settings'].sudo()._get().write({
+                                name: value,
+                            })
+                    except ValidationError as exc:
+                        raise _SettingRefused(name, exc) from exc
+        except _SettingRefused as refusal:
+            exc = refusal.exc
+            return {
+                'ok': False,
+                'error': exc.args[0] if exc.args else str(exc),
+                'field': refusal.field,
+            }
+        return {'ok': True}
+
+    @staticmethod
+    def _central_name_status(settings):
+        """Return what Settings shows of the central's single name.
+
+        :param settings: the ``cloud.settings`` singleton.
+        :return: ``{"state", "checked_at", "failing_since", "error",
+            "cert_expires", "in_force", "record"}``, or False without a
+            single path.
+        :rtype: dict | bool
+        """
+        Settings = settings.env['cloud.settings'].sudo()
+        if not Settings._central_single_path():
+            return False
+        in_force = Settings._central_single_in_force()
+        return {
+            'state': settings.metrics_central_name_state or 'unknown',
+            'checked_at': settings.metrics_central_name_checked_at or '',
+            'failing_since': settings.metrics_central_name_failing_since or '',
+            'error': settings.metrics_central_name_error or '',
+            'cert_expires': settings.metrics_central_cert_expires or '',
+            'in_force': in_force,
+            'url': Settings._central_single_base(),
+            'record': (
+                '' if in_force or not settings.metrics_central_host_id
+                else Settings._central_dns_record_text()
+            ),
+        }
+
+    @http.route(['/cloud/monitoring/check_central_name'], type='jsonrpc',
+                auth='user')
+    def cloud_monitoring_check_central_name(self):
+        """Check the central's single name now, from the central's server.
+
+        Queues the direct path's job there, which checks the name and,
+        when it answers, moves the panel and the agents to it. The 15-minute
+        cron does the same while the name is pending.
+        """
+        self._sec()._check_can_manage_hosts()
+        Settings = request.env['cloud.settings'].sudo()
+        host = Settings._live_central_host()
+        if not (Settings._central_single_path() and host and host.direct_port_shipped):
+            return {
+                'ok': False,
+                'error': _(
+                    "There is nothing to check: the central needs a public "
+                    "name, One path, without a CDN, and a server with a "
+                    "direct port."
+                ),
+            }
+        job_id = host._enqueue_direct_sync("Check now, in Settings")
+        if not job_id:
+            return {'ok': False, 'error': _("The check could not be queued.")}
+        return {'ok': True, 'job_id': job_id}
+
+    @http.route(['/cloud/monitoring/deploy_central'], type='jsonrpc',
+                auth='user')
+    def cloud_monitoring_deploy_central(self, host_id):
+        """Queue the metrics central deployment against *host_id*.
+
+        Lives in Settings rather than on every host page on purpose: the
+        central is one per platform, and an action offered from each host
+        invites deploying several by accident.
+        """
+        self._sec()._check_can_manage_hosts()
+        host = request.env['cloud.host'].browse(int(host_id or 0))
+        if not host.exists():
+            return {'ok': False, 'error': _('Host not found')}
+        Settings = request.env['cloud.settings'].sudo()
+        central = Settings._live_central_host()
+        if central and central != host:
+            # It would start an empty central there and leave the history
+            # behind; the job refuses it too (``pre_run_checks``).
+            return {
+                'ok': False,
+                'error': Settings._central_elsewhere_refusal(central),
+            }
+        try:
+            job_id = request.env['cloud.job'].sudo().enqueue(
+                host.id, False, 'deploy_metrics_central',
+            )
+        except Exception as exc:
+            return safe_error_response(
+                exc, _("Failed to queue the central deployment"),
+            )
+        return {'ok': True, 'job_id': job_id}
+
+    @http.route(['/cloud/monitoring/empty_central'], type='jsonrpc',
+                auth='user')
+    def cloud_monitoring_empty_central(self, host_id):
+        """Start an empty central on *host_id*, leaving the history behind.
+
+        The way out when the central's server is lost, or must go and its
+        history need not follow: the deployment runs as *Enable
+        observability* does and moves the panel to the new central, while
+        the old one is left as it was on its server, no longer read. The
+        browser asks the person first; the payload's ``discard_history``
+        is what lets the job run on a host other than the central's, and
+        only this route may set it (``_check_internal_queue_flags``).
+
+        :param int host_id: the host to start the empty central on
+        :return: ``{'ok': True, 'job_id': ...}``, or ``{'ok': False,
+            'error': ...}`` when there is no central elsewhere to replace
+        """
+        self._sec()._check_can_manage_hosts()
+        host = request.env['cloud.host'].browse(int(host_id or 0))
+        if not host.exists():
+            return {'ok': False, 'error': _('Host not found')}
+        central = request.env['cloud.settings'].sudo()._live_central_host()
+        if not central:
+            return {'ok': False, 'error': _(
+                "There is no central to replace: use Enable observability.",
+            )}
+        if central == host:
+            return {'ok': False, 'error': _(
+                'The central already runs on "%(host)s": Enable '
+                "observability deploys it again there, with its history.",
+                host=host.name,
+            )}
+        try:
+            job_id = request.env['cloud.job'].sudo().enqueue(
+                host.id, False, 'deploy_metrics_central',
+                {'discard_history': True},
+            )
+        except Exception as exc:
+            return safe_error_response(
+                exc, _("Failed to queue the central deployment"),
+            )
+        request.env['cloud.audit.log'].sudo().create({
+            'action': 'Empty metrics central started',
+            'details': f'{host.name} (was on {central.name})',
+        })
+        return {'ok': True, 'job_id': job_id}
+
+    @http.route(['/cloud/monitoring/retire_central'], type='jsonrpc',
+                auth='user')
+    def cloud_monitoring_retire_central(self):
+        """Forget the metrics central, after the person confirmed.
+
+        :return: ``{'ok': True, 'host': name}``, or ``{'ok': False,
+            'error': ...}`` saying why not
+        """
+        self._sec()._check_can_manage_hosts()
+        try:
+            name = request.env['cloud.settings'].retire_metrics_central()
+        except UserError as exc:
+            return {'ok': False, 'error': exc.args[0]}
+        return {'ok': True, 'host': name}
+
+    @http.route(['/cloud/monitoring/central_sizing'], type='jsonrpc',
+                auth='user')
+    def cloud_monitoring_central_sizing(self, host_id):
+        """Say whether the central fits on *host_id*: a note, not a refusal.
+
+        From the host's last measures (the metrics agents), the servers
+        that would send to the central and its retention
+        (``models/_central_sizing.py`` holds the figures and their source).
+
+        :param int host_id: the host picked under Where the central runs
+        :return: the figures and ``notes``, each a sentence to show
+        """
+        self._sec()._check_can_manage_hosts()
+        host = request.env['cloud.host'].browse(int(host_id or 0))
+        if not host.exists():
+            return {'ok': False, 'error': _('Host not found')}
+        settings = request.env['cloud.settings'].sudo()._get_system()
+        senders = request.env['cloud.host'].sudo().search([
+            ('traefik_deployed', '=', True),
+        ]) | host
+        sizing = central_sizing(
+            servers=len(senders),
+            retention_days=settings.metrics_retention_days or 0,
+            disk_free_gb=host.disk_free_gb or 0.0,
+            ram_total_gb=host.ram_total_gb or 0.0,
+            ram_available_gb=host.available_ram_gb or 0.0,
+            cpu_cores=host.cpu_cores or 0,
+            has_instances=bool(host.instance_ids),
+            full_setup=bool(host.traefik_deployed),
+        )
+        words = {
+            'no_full_setup': lambda v: _(
+                "Full Setup has not been run on this server: the deployment "
+                "refuses it until it is.",
+            ),
+            'keeps_everything': lambda v: _(
+                "The central keeps everything (retention 0): its disk grows "
+                "without end. Watch it.",
+            ),
+            'not_measured': lambda v: _(
+                "%(servers)s servers would send to it: past 20 these figures "
+                "are not measured. Give it more memory and watch it.",
+                servers=v['servers'],
+            ),
+            'disk': lambda v: _(
+                "Free disk %(free)s GB, about %(needed)s GB needed.",
+                free=v['free'], needed=v['needed'],
+            ),
+            'ram': lambda v: _(
+                "Memory %(total)s GB, %(needed)s GB recommended.",
+                total=v['total'], needed=v['needed'],
+            ),
+            'ram_free': lambda v: _(
+                "Its instances leave %(free)s GB of memory unassigned; the "
+                "central needs about %(needed)s GB.",
+                free=v['free'], needed=v['needed'],
+            ),
+            'cpu': lambda v: _(
+                "%(cores)s CPU core(s), %(needed)s recommended.",
+                cores=v['cores'], needed=v['needed'],
+            ),
+        }
+        notes = [words[code](values) for code, values in sizing['warnings']]
+        if not sizing['measured']:
+            notes.insert(0, _(
+                "Not measured yet: the server's disk, memory and cores are "
+                "read from its metrics agents.",
+            ))
+        return {
+            'ok': True,
+            'servers': len(senders),
+            'measured': sizing['measured'],
+            'disk_free_gb': host.disk_free_gb or 0.0,
+            'disk_needed_gb': sizing['disk_needed_gb'],
+            'ram_total_gb': host.ram_total_gb or 0.0,
+            'ram_needed_gb': sizing['ram_needed_gb'],
+            'cpu_cores': host.cpu_cores or 0,
+            'cpu_needed': sizing['cpu_needed'],
+            'fits': not sizing['warnings'] and sizing['measured'],
+            'notes': notes,
+        }
+
+    # ── Core rate-limit settings ──────────────────────────────────────────
+
+    @http.route(['/cloud/get_core_rate_limits'], type='jsonrpc', auth='user')
+    def cloud_get_core_rate_limits(self):
+        """Return the configured caps for the core-owned rate limits.
+
+        Mirrored on the Rates tab in Settings. Units are encoded in each key.
+        """
+        self._sec()._check_can_manage_hosts()
+        s = request.env['cloud.settings'].sudo()._get()
+        return {
+            'rate_limit_webhook_per_min': s.rate_limit_webhook_per_min or 0,
+            'rate_limit_terminal_per_min': s.rate_limit_terminal_per_min or 0,
+            'rate_limit_terminal_user_per_min': (
+                s.rate_limit_terminal_user_per_min or 0
+            ),
+            'rate_limit_host_console_per_min': (
+                s.rate_limit_host_console_per_min or 0
+            ),
+            'rate_limit_connect_per_min': s.rate_limit_connect_per_min or 0,
+            'rate_limit_connect_user_per_min': (
+                s.rate_limit_connect_user_per_min or 0
+            ),
+            'rate_limit_logs_per_min': s.rate_limit_logs_per_min or 0,
+            'rate_limit_mail_reads_per_min': (
+                s.rate_limit_mail_reads_per_min or 0
+            ),
+            'rate_limit_log_search_per_min': (
+                s.rate_limit_log_search_per_min or 0
+            ),
+            'rate_limit_github_previews_per_hour': (
+                s.rate_limit_github_previews_per_hour or 0
+            ),
+            'rate_limit_github_imports_per_hour': (
+                s.rate_limit_github_imports_per_hour or 0
+            ),
+            'rate_limit_git_reads_per_hour': (
+                s.rate_limit_git_reads_per_hour or 0
+            ),
+        }
+
+    @http.route(['/cloud/save_core_rate_limits'], type='jsonrpc', auth='user')
+    def cloud_save_core_rate_limits(self, vals):
+        """Persist the core rate-limit caps. Any non-positive value is
+        stored as 0 and the model treats 0 as "use documented default"
+        so a misconfiguration can't accidentally lock everyone out.
+        """
+        self._sec()._check_can_manage_hosts()
+        allowed = {
+            'rate_limit_webhook_per_min',
+            'rate_limit_terminal_per_min',
+            'rate_limit_terminal_user_per_min',
+            'rate_limit_host_console_per_min',
+            'rate_limit_connect_per_min',
+            'rate_limit_connect_user_per_min',
+            'rate_limit_logs_per_min',
+            'rate_limit_mail_reads_per_min',
+            'rate_limit_log_search_per_min',
+            'rate_limit_github_previews_per_hour',
+            'rate_limit_github_imports_per_hour',
+            'rate_limit_git_reads_per_hour',
+        }
+        safe = {
+            k: max(0, int(v or 0))
+            for k, v in (vals or {}).items() if k in allowed
+        }
+        request.env['cloud.settings'].sudo()._get().write(safe)
+        return {'ok': True}
+
+    @http.route(['/cloud/get_langs'], type='jsonrpc', auth='user')
+    def cloud_get_langs(self):
+        langs = request.env['res.lang'].with_context(active_test=False).search(
+            [], order='name asc'
+        )
+        return [{'id': l.id, 'code': l.code, 'name': l.name} for l in langs]
+
+    def _serialize_instance(self, inst):
+        """Serialize a cloud.instance to a dict (shared by get_instance and get_project_full)."""
+        Job = request.env['cloud.job']
+        last_deploy = Job.search([
+            ('instance_id', '=', inst.id),
+            ('job_type_id.code', 'in',
+             ('deploy_instance', 'rebuild_instance')),
+            ('state', 'in', ('done', 'failed')),
+        ], order='id desc', limit=1)
+        timeline = Job._get_instance_timeline(inst.id, max_visible=5)
+        jobs_total = timeline['total']
+        # SSH endpoint (ip/user/port) is developer-gated at the ORM layer
+        # (same gate as the host credential) — redact it below that role.
+        # Reading it directly here would AccessError for a consultant; the
+        # guard keeps this serializer usable by project-member stakeholders
+        # while a Developer still gets the real endpoint (their restore
+        # dialog builds an rsync command from it).
+        is_developer = self._sec()._has_cloud_group('group_cloud_developer')
+        return {
+            'id': inst.id,
+            'name': inst.name,
+            'environment': inst.environment,
+            'status': inst.status,
+            'state': inst.state,
+            'deployed': inst.deployed,
+            'running': inst.running,
+            'service_states': inst.service_states or {},
+            'stop_is_expected': inst.stop_is_expected,
+            'auto_rebuild': inst.auto_rebuild,
+            'auto_update': inst.auto_update,
+            'boot_test': inst.boot_test,
+            'autopurge_exempt': inst.autopurge_exempt,
+            # A preview's request, for the project's list: «PR #n» on
+            # GitHub, «MR !n» on GitLab.
+            'pr_number': inst.pr_number or 0,
+            'pr_kind': 'gitlab' if inst.pr_provider_id else 'github',
+            'website_info_public': inst.website_info_public,
+            'autopurge_days_left': inst._autopurge_days_left(),
+            'tags': [
+                {'id': t.id, 'name': t.name, 'color': t.color}
+                for t in inst.tag_ids
+            ],
+            'all_tags': [
+                {'id': t.id, 'name': t.name, 'color': t.color}
+                for t in request.env['cloud.instance.tag'].search(
+                    [], limit=_LIST_MAX, order='name',
+                )
+            ],
+            'host_id': inst.host_id.id if inst.host_id else None,
+            'host': inst.host_id.name if inst.host_id else '',
+            'host_ip': (
+                inst.host_id.ip_address
+                if (inst.host_id and is_developer) else ''
+            ),
+            'host_user': (
+                inst.host_id.user if (inst.host_id and is_developer) else ''
+            ),
+            'host_port': (
+                inst.host_id.port if (inst.host_id and is_developer) else 22
+            ),
+            'move_origin_host_id': (
+                inst.move_origin_host_id.id
+                if inst.move_origin_host_id else None
+            ),
+            'move_origin_host': (
+                inst.move_origin_host_id.name
+                if inst.move_origin_host_id else ''
+            ),
+            'move_target_host_id': (
+                inst.move_target_host_id.id
+                if inst.move_target_host_id else None
+            ),
+            'move_target_host': (
+                inst.move_target_host_id.name
+                if inst.move_target_host_id else ''
+            ),
+            'move_rollback_in_progress': inst.move_rollback_in_progress,
+            'move_frozen_source_host': (
+                inst.move_frozen_source_host_id.name
+                if inst.move_frozen_source_host_id else ''
+            ),
+            'move_frozen_until': inst.move_frozen_until or None,
+            'odoo_version': inst.odoo_version,
+            'odoo_commit_sha': inst.odoo_commit_sha or '',
+            'last_deploy_date': last_deploy.create_date if last_deploy else None,
+            'last_deploy_state': last_deploy.state if last_deploy else None,
+            'config_dirty': inst.config_dirty,
+            'odoo_initial_lang': inst.odoo_initial_lang.id if inst.odoo_initial_lang else None,
+            'has_odoo_admin_password':
+                _has_encrypted(inst, 'odoo_admin_password'),
+            'odoo_proxy': inst.odoo_proxy or 'traefik',
+            'postgres_version': inst.postgres_version or '17',
+            'postgres_dbname': inst.postgres_dbname or '',
+            'postgres_username': inst.postgres_username or '',
+            'has_postgres_password':
+                _has_encrypted(inst, 'postgres_password'),
+            'domain': inst.domain or '',
+            'smtp_relay_host': inst.smtp_relay_host or '',
+            'smtp_relay_port': inst.smtp_relay_port or 587,
+            'smtp_relay_security': inst.smtp_relay_security or 'starttls',
+            'smtp_relay_user': inst.smtp_relay_user or '',
+            'has_smtp_relay_password':
+                _has_encrypted(inst, 'smtp_relay_password'),
+            'smtp_relay_auth': inst.smtp_relay_auth or 'password',
+            'smtp_relay_oauth_directory_id': inst.smtp_relay_oauth_directory_id or '',
+            'smtp_relay_oauth_client_id': inst.smtp_relay_oauth_client_id or '',
+            # Whether one is saved, never the secret: unlike the
+            # password, ``/cloud/get_secret`` does not reveal it either.
+            # Only the system reads the field.
+            'has_smtp_relay_oauth_client_secret':
+                _has_encrypted(inst.sudo(), 'smtp_relay_oauth_client_secret'),
+            'smtp_relay_state': inst.smtp_relay_state or 'unknown',
+            'smtp_relay_checked_at': inst.smtp_relay_checked_at or None,
+            'smtp_relay_error': inst.smtp_relay_error or '',
+            # Why "Send test mail" is disabled; empty when it is not.
+            'relay_test_refusal': inst._relay_test_refusal(),
+            'odoo_conf': inst.odoo_conf or '',
+            'odoo_memory_limit': inst.odoo_memory_limit or '',
+            'odoo_cpus': inst.odoo_cpus or 0,
+            'db_memory_limit': inst.db_memory_limit or '',
+            'db_cpus': inst.db_cpus or 0,
+            'backup_memory_limit': inst.backup_memory_limit or '',
+            'backup_cpus': inst.backup_cpus or 0,
+            'smtp_memory_limit': inst.smtp_memory_limit or '',
+            'smtp_cpus': inst.smtp_cpus or 0,
+            'pip_dependencies': inst.pip_dependencies or '',
+            'apt_dependencies': inst.apt_dependencies or '',
+            'compose_services': (inst.compose_services or 'odoo,db').split(','),
+            # What the shell selector may offer. Derived on the
+            # server, not filtered in the SPA: the terminal route
+            # answers to whatever service name reaches it, so the
+            # list the browser draws must not be the only gate.
+            'shell_services': inst._shell_services(),
+            'whitelist': inst.whitelist_ids.mapped('hostname'),
+            'backup_backend_id': (
+                inst.backup_backend_id.id if inst.backup_backend_id else None
+            ),
+            'effective_backup_backend_id': (
+                inst.effective_backup_backend.id
+                if inst.effective_backup_backend else None
+            ),
+            'effective_backup_backend_name': (
+                inst.effective_backup_backend.name
+                if inst.effective_backup_backend else ''
+            ),
+            'domains': [
+                {
+                    'id': d.id,
+                    'hostname': d.hostname or '',
+                    'redirect_to': d.redirect_to or '',
+                    'cert_resolver': d.cert_resolver or 'letsencrypt',
+                    'redirect_permanent': d.redirect_permanent,
+                }
+                for d in inst.domain_ids
+            ],
+            'repos': [
+                {
+                    'id': r.id,
+                    'url': r.url or '',
+                    'branch': r.branch or 'main',
+                    'addons': r.addons or '',
+                    'excludes': r.excludes or '',
+                    'commit_sha': r.commit_sha or '',
+                    'repo_capabilities': r.repo_capabilities,
+                }
+                for r in inst.repo_ids
+            ],
+            'activeJobs': timeline['active'],
+            'recentJobs': timeline['recent'],
+            'jobsTotal': jobs_total,
+            'custom_actions': [
+                {
+                    'code': jt.code,
+                    'name': jt.name,
+                    'action_icon': jt.action_icon or 'fa-cog',
+                    'action_confirm': jt.action_confirm or '',
+                }
+                for jt in request.env['cloud.job.type'].search([
+                    ('show_as_action', '=', True),
+                    ('apply_to', '=', 'instance'),
+                ], order='action_order, id')
+            ],
+        }
+
+    @http.route(['/cloud/get_instance'], type='jsonrpc', auth='user')
+    def cloud_get_instance(self, instance_id):
+        inst = request.env['cloud.instance'].browse(instance_id)
+        if not inst.exists():
+            return {'ok': False, 'error': _('Instance not found')}
+        return self._serialize_instance(inst)
+
+    @http.route(['/cloud/get_project_full'], type='jsonrpc', auth='user')
+    def cloud_get_project_full(self, project_id):
+        """Load entire project data in one RPC for instant switching."""
+        project = request.env['cloud.project'].browse(project_id)
+        if not project.exists():
+            return {'ok': False, 'error': _('Project not found')}
+        is_manager = self._sec()._has_cloud_group('group_cloud_manager')
+        instances = {}
+        for inst in project.instance_ids:
+            instances[inst.id] = self._serialize_instance(inst)
+        hosts = request.env['cloud.host'].search([], limit=_LIST_MAX, order='name')
+        backends = request.env['cloud.backup.backend'].search(
+            [], limit=_LIST_MAX, order='name',
+        )
+        return {
+            'project': {
+                'id': project.id,
+                'name': project.name,
+                'odoo_version': project.odoo_version,
+            },
+            'instances': instances,
+            'hosts': [{
+                'id': h.id, 'name': h.name,
+                'status': h.status,
+                'traefik_deployed': h.traefik_deployed,
+                'available_cpus': round(h.available_cpus, 2),
+                'available_ram_gb': round(h.available_ram_gb, 2),
+                'cpu_cores': h.cpu_cores,
+                'ram_total_gb': h.ram_total_gb,
+            } for h in hosts],
+            'backup_backends': [{
+                'id': b.id, 'name': b.name,
+                # backup_dst embeds the bucket path — manager-only, like
+                # the SSH endpoint above. Non-managers still get id/name so
+                # the instance form can label the effective backend.
+                'backup_dst': (b.backup_dst or '') if is_manager else '',
+            } for b in backends],
+        }
+
+    _SAVE_INSTANCE_ALLOWED = {
+        'name', 'host_id',
+        'odoo_version', 'odoo_commit_sha',
+        'odoo_initial_lang', 'odoo_admin_password',
+        'odoo_proxy',
+        'postgres_version', 'postgres_dbname', 'postgres_username',
+        'postgres_password',
+        'smtp_relay_host', 'smtp_relay_port', 'smtp_relay_security',
+        'smtp_relay_user', 'smtp_relay_password',
+        'smtp_relay_auth', 'smtp_relay_oauth_directory_id',
+        'smtp_relay_oauth_client_id', 'smtp_relay_oauth_client_secret',
+        'odoo_conf', 'pip_dependencies', 'apt_dependencies',
+        'backup_backend_id', 'auto_rebuild', 'auto_update', 'boot_test',
+        'tag_ids',
+        'autopurge_exempt',
+        # The exception to the edge guard; never on create: an instance
+        # is born with /website/info blocked.
+        'website_info_public',
+        'odoo_memory_limit', 'odoo_cpus',
+        'db_memory_limit', 'db_cpus',
+        'backup_memory_limit', 'backup_cpus',
+        'smtp_memory_limit', 'smtp_cpus',
+    }
+
+    @http.route(['/cloud/save_instance'], type='jsonrpc', auth='user')
+    def cloud_save_instance(self, instance_id, vals):
+        self._sec()._check_cloud_group('group_cloud_consultant')
+        inst = request.env['cloud.instance'].browse(instance_id)
+        if not inst.exists():
+            return {'ok': False, 'error': _('Instance not found')}
+        repos = vals.pop('repos', None)
+        domains = vals.pop('domains', None)
+        whitelist = vals.pop('whitelist', None)
+        git_budget = None
+        # The form sends the environment back as it is; a change, which
+        # an agent may ask for through ``update_instance``, is refused
+        # with its reason rather than dropped without a word: it is
+        # chosen when the instance is created
+        # (``cloud.instance._check_guarded_vals``).
+        environment = vals.pop('environment', None)
+        if environment and environment != inst.environment:
+            return {'ok': False, 'error': _(
+                "The environment of an instance is chosen when it is created "
+                "and cannot be changed. For another staging or production, "
+                "create a new instance."
+            )}
+        safe = {
+            k: v for k, v in vals.items()
+            if k in self._SAVE_INSTANCE_ALLOWED
+        }
+        if 'odoo_version' in safe:
+            v = safe['odoo_version']
+            if isinstance(v, (int, float)):
+                safe['odoo_version'] = f"{float(v):.1f}"
+        if 'tag_ids' in safe:
+            safe['tag_ids'] = [fields.Command.set(safe['tag_ids'] or [])]
+        # Track whether host_id is changing (auto-domain may fire in write)
+        host_changed = 'host_id' in safe and safe['host_id'] != (
+            inst.host_id.id if inst.host_id else None
+        )
+        inst.write(safe)
+        # Sync domains — skip if host just changed and frontend sent
+        # empty domains, because write() auto-generated them.
+        if domains is not None and not (
+            host_changed and not domains and inst.domain_ids
+        ):
+            Domain = request.env['cloud.instance.domain']
+            existing_ids = set(inst.domain_ids.ids)
+            kept_ids = set()
+            for d in domains:
+                did = d.get('id')
+                hostname = (d.get('hostname') or '').strip()
+                if not hostname:
+                    continue
+                dvals = _domain_vals(d, request.env)
+                if did and did in existing_ids:
+                    Domain.browse(did).write(dvals)
+                    kept_ids.add(did)
+                else:
+                    new = Domain.create({
+                        **dvals, 'instance_id': inst.id,
+                    })
+                    kept_ids.add(new.id)
+            to_delete = existing_ids - kept_ids
+            if to_delete:
+                Domain.browse(list(to_delete)).unlink()
+        if repos is not None:
+            # Skip GitHub fetches: pip_dependencies is already merged by the
+            # frontend before saving (via /cloud/get_repo_requirements).
+            Repo = request.env['cloud.instance.repo'].with_context(
+                skip_apply_requirements=True,
+            )
+            repos_before = _repo_lines(inst)
+            existing_ids = set(inst.repo_ids.ids)
+            kept_ids = set()
+            for repo in repos:
+                rid = repo.get('id')
+                url = (repo.get('url') or '').strip()
+                if not url:
+                    continue
+                branch = (repo.get('branch') or 'main').strip() or 'main'
+                addons = (repo.get('addons') or '').strip()
+                excludes = (repo.get('excludes') or '').strip()
+                commit_sha = (repo.get('commit_sha') or '').strip()
+                if rid and rid in existing_ids:
+                    Repo.browse(rid).write({
+                        'url': url,
+                        'branch': branch,
+                        'addons': addons,
+                        'excludes': excludes,
+                        'commit_sha': commit_sha,
+                    })
+                    kept_ids.add(rid)
+                else:
+                    Repo.create({
+                        'instance_id': inst.id,
+                        'url': url,
+                        'branch': branch,
+                        'addons': addons,
+                        'excludes': excludes,
+                        'commit_sha': commit_sha,
+                    })
+            to_unlink = existing_ids - kept_ids
+            if to_unlink:
+                Repo.browse(list(to_unlink)).unlink()
+            inst.invalidate_recordset(['repo_ids'])
+            # Only when they changed: the check asks GitHub for every
+            # repository listed with "all its modules", and an instance
+            # saved for its domains or its notes must not wait on that.
+            if _repo_lines(inst) != repos_before:
+                git_budget = GitReadBudget(
+                    request.env, seconds=ADDON_CHECK_SECONDS,
+                )
+                inst._check_addon_conflicts(
+                    seconds=ADDON_CHECK_SECONDS, git_budget=git_budget,
+                )
+        # Egress whitelist — replaced wholesale, like the host's. The
+        # list is short, ordered by the operator, and its order is part
+        # of the copier answer, so rewriting it is both simpler and
+        # more faithful than diffing it. Searched rather than read off
+        # ``inst.whitelist_ids`` for the same reason the host route
+        # does: the recordset was browsed before this write.
+        if whitelist is not None:
+            Whitelist = request.env['cloud.instance.whitelist']
+            hostnames = [
+                h.strip() for h in (whitelist or []) if h and h.strip()
+            ]
+            Whitelist.search([('instance_id', '=', inst.id)]).unlink()
+            if hostnames:
+                Whitelist.create([
+                    {'instance_id': inst.id, 'hostname': h, 'sequence': i * 10}
+                    for i, h in enumerate(hostnames, 1)
+                ])
+        # What the pill "Changes not deployed" shows, as it is after this
+        # save: the form lights it without a reload.
+        inst.invalidate_recordset(['config_dirty'])
+        answer = {'ok': True, 'config_dirty': inst.config_dirty}
+        warning = git_budget and git_budget.addons_warning()
+        if warning:
+            answer['warning'] = warning
+        return answer
+
+    @http.route(['/cloud/keep_instance'], type='jsonrpc', auth='user')
+    def cloud_keep_instance(self, instance_id):
+        """Start an expiring staging's window over, from one click.
+
+        The whole escape hatch from the autopurge, and the reason two
+        warnings are enough notice: acting on them costs a button.
+        Consultant-gated, the same role that can deploy — somebody who
+        can start an instance can keep one.
+
+        :param int instance_id: the staging to keep.
+        :returns: ``{'ok': True, 'days_left': False}`` once the ladder
+            has been reset, so the caller can drop the pill without a
+            reload.
+        """
+        self._sec()._check_cloud_group('group_cloud_consultant')
+        inst = request.env['cloud.instance'].browse(instance_id)
+        if not inst.exists():
+            return {'ok': False, 'error': _('Instance not found')}
+        if inst.environment != 'staging':
+            return {
+                'ok': False,
+                'error': _('Only staging instances expire.'),
+            }
+        inst._touch_autopurge_clock()
+        request.env['cloud.audit.log'].sudo().create({
+            'action': 'Keep instance',
+            'details': f"'{inst.name}' kept: the expiry window starts over",
+            **inst._audit_target_vals(),
+        })
+        return {'ok': True, 'days_left': inst._autopurge_days_left()}

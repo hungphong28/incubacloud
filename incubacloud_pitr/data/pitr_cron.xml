@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+
+        <record id="cron_pitr_watch" model="ir.cron">
+            <field name="name">Continuous recovery: watch and reconcile</field>
+            <field name="model_id" ref="incubacloud.model_cloud_instance"/>
+            <field name="state">code</field>
+            <field name="code">model._cron_pitr_watch()</field>
+            <field name="interval_number">10</field>
+            <field name="interval_type">minutes</field>
+        </record>
+
+    </data>
+</odoo>

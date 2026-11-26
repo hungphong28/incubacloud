@@ -1,0 +1,124 @@
+// ============================================================================
+//  ImportProjectModal — Relay-styled standalone dialog (dialog-service mount).
+//  Mounts OUTSIDE `.ic-app`, so relay `--rl-*` vars do not resolve here; we use
+//  literal Relay palette hex values. Shared chrome (`.ic-modal-overlay`,
+//  `.ic-modal`, `.ic-frow`, `.ic-btn`, `.ic-alert`) is defined in
+//  create_project_modal.scss; this file only adds import-specific bits.
+// ============================================================================
+
+.ic-modal--import {
+    width: 580px;
+    max-height: 85vh;
+}
+
+// ── Header ──────────────────────────────────────────────────────────────────
+.ic-import-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+
+    h3 { margin: 0; }
+}
+
+.ic-import-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--rl-surf3);
+    border: 1px solid var(--rl-line2);
+    color: var(--rl-fg2);
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 10.5px;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 6px;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+
+    svg { width: 13px; height: 13px; }
+}
+
+// ── Input step ──────────────────────────────────────────────────────────────
+.ic-import-hint {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 12px;
+    color: var(--rl-muted);
+    margin: 0 0 16px;
+    line-height: 1.55;
+}
+
+.ic-import-url-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+
+    input { flex: 1; }
+
+    .ic-repo-spinner {
+        flex: none;
+        display: inline-flex;
+        align-items: center;
+    }
+}
+
+.ic-repo-fetch-error {
+    margin-top: 7px;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 11px;
+    color: var(--rl-red-text);
+}
+
+// ── Spinner ─────────────────────────────────────────────────────────────────
+.ic-spin {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--rl-line2);
+    border-top-color: var(--rl-amber);
+    border-radius: 50%;
+    animation: ic-spin-rot 0.7s linear infinite;
+}
+
+@keyframes ic-spin-rot { to { transform: rotate(360deg); } }
+
+// ── Step list (progress / done / error) — Relay rl-jstep look ───────────────
+.ic-import-steps {
+    display: flex;
+    flex-direction: column;
+    padding: 4px 0;
+}
+
+.ic-jstep {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    padding: 9px 0;
+    border-bottom: 1px solid var(--rl-line);
+    font-family: 'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    font-size: 13px;
+
+    &:last-child { border-bottom: none; }
+
+    .ic-jstep__icon {
+        width: 18px;
+        height: 18px;
+        flex: none;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    svg { width: 15px; height: 15px; }
+
+    &.pending { color: var(--rl-faint); }
+
+    &.run {
+        color: var(--rl-amber-ink);
+        .ic-jstep__icon svg { display: none; }
+    }
+
+    &.done {
+        color: var(--rl-fg2);
+        .ic-jstep__icon { color: var(--rl-green); }
+    }
+}

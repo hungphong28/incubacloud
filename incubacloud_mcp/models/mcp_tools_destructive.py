@@ -1,0 +1,477 @@
+"""Destructive tools: each says exactly what it will do and waits for approval.
+
+The confirmation method runs the route's own role check first, so a call
+that would be refused is refused before anyone is asked.
+"""
+
+from odoo import api, models
+from odoo.exceptions import UserError
+
+from odoo.addons.incubacloud.models.abstract_executor import validate_dup_time
+
+from ..protocol.tool_spec import ToolSpec, boolean, obj, record_id, string
+from .mcp_catalog import tool_policies
+from .mcp_tools import quoted
+
+_CONSULTANT = "group_cloud_consultant"
+_DEVELOPER = "group_cloud_developer"
+_MANAGER = "group_cloud_manager"
+
+_INSTANCE = record_id("The instance.")
+
+
+def _destructive(name, description, min_group, schema, **kwargs):
+    """Return the spec of a destructive tool, which always asks."""
+    return ToolSpec(
+        name,
+        description,
+        min_group,
+        schema,
+        destructive=True,
+        confirm="always",
+        **kwargs,
+    )
+
+
+TOOLS = (
+    _destructive(
+        "delete_project",
+        "Delete a project that has no instances left.",
+        _MANAGER,
+        obj({"project_id": record_id("The project.")}, required=("project_id",)),
+        route="/cloud/delete_project",
+        requires="no instances left in it, archived ones included.",
+    ),
+    _destructive(
+        "delete_instance",
+        "Delete an instance with its stack and data. A production one needs a "
+        "manager. A deployed one is taken off its server by a job: answers the "
+        "job_id; follow it with get_job. With keep_in_panel=true a deployed one "
+        "is only taken off its server, and stays in the panel as a draft that "
+        "can be deployed again.",
+        _CONSULTANT,
+        obj(
+            {
+                "instance_id": _INSTANCE,
+                "keep_in_panel": boolean(
+                    "Keep it in the panel as a draft (false by default)."
+                ),
+            },
+            required=("instance_id",),
+        ),
+        handler="_tool_delete_instance",
+        requires="for keep_in_panel, an instance that was deployed.",
+    ),
+    _destructive(
+        "delete_archived_instance",
+        "Delete an archived instance and the backup copy it still keeps.",
+        _MANAGER,
+        obj({"instance_id": _INSTANCE}, required=("instance_id",)),
+        handler="_tool_delete_archived_instance",
+        requires="an archived instance.",
+    ),
+    _destructive(
+        "delete_host",
+        "Remove a server from the panel; its panel services are taken off it.",
+        _MANAGER,
+        obj({"host_id": record_id("The server.")}, required=("host_id",)),
+        route="/cloud/delete_host",
+        enqueues=True,
+        requires="no instances left on the server.",
+    ),
+    _destructive(
+        "delete_backup_backend",
+        "Delete a backup destination nothing uses any more.",
+        _MANAGER,
+        obj(
+            {"backend_id": record_id("The backup destination.")},
+            required=("backend_id",),
+        ),
+        route="/cloud/delete_backup_backend",
+        requires="no project, instance or setting using the destination.",
+    ),
+    _destructive(
+        "restore_backup",
+        "Restore a production instance from one of its backups (list_backups "
+        "gives the times).",
+        _DEVELOPER,
+        obj(
+            {
+                "instance_id": _INSTANCE,
+                "time": string("The backup's time.", max_length=64),
+            },
+            required=("instance_id", "time"),
+        ),
+        route="/cloud/restore_backup",
+        enqueues=True,
+        requires=(
+            "a deployed production instance with a backup destination, and a "
+            "time list_backups gives."
+        ),
+    ),
+    _destructive(
+        "refresh_staging",
+        "Replace a staging's data with a copy of production: its last backup "
+        "(source=backup, the default) or a dump taken now (live); neutralized "
+        "unless neutralize=false.",
+        _DEVELOPER,
+        obj(
+            {
+                "instance_id": record_id("The staging."),
+                "source_instance_id": record_id("The production instance."),
+                "source": string("Where the copy comes from.", enum=("backup", "live")),
+                "neutralize": boolean("Neutralize the copy (true by default)."),
+            },
+            required=("instance_id", "source_instance_id"),
+        ),
+        route="/cloud/refresh_from_production",
+        enqueues=True,
+        requires=(
+            "a deployed staging and a production instance of the same project; "
+            "source=backup needs a backup destination on production (otherwise "
+            "a dump is taken now)."
+        ),
+    ),
+    _destructive(
+        "move_instance",
+        "Move an instance to another server.",
+        _MANAGER,
+        obj(
+            {"instance_id": _INSTANCE, "target_host_id": record_id("The new server.")},
+            required=("instance_id", "target_host_id"),
+        ),
+        route="/cloud/move_instance",
+        enqueues=True,
+        requires=(
+            "a deployed instance with no move in progress, and another server "
+            "that is compatible and has its proxy (Traefik) deployed "
+            "(list_hosts)."
+        ),
+    ),
+    _destructive(
+        "rollback_move",
+        "Undo a move that failed before its cutover.",
+        _MANAGER,
+        obj({"instance_id": _INSTANCE}, required=("instance_id",)),
+        route="/cloud/rollback_move",
+        enqueues=True,
+        requires="a move of the instance that failed before its cutover.",
+    ),
+    _destructive(
+        "reset_github_app",
+        "Delete the panel's GitHub App credentials.",
+        _MANAGER,
+        obj(),
+        route="/cloud/reset_github_app",
+        requires="the panel's GitHub App set up.",
+    ),
+)
+
+ROUTES = {
+    "/cloud/delete_project": "delete_project",
+    "/cloud/delete_instance": "delete_instance",
+    "/cloud/delete_archived_instance": "delete_archived_instance",
+    "/cloud/delete_host": "delete_host",
+    "/cloud/delete_backup_backend": "delete_backup_backend",
+    "/cloud/restore_backup": "restore_backup",
+    "/cloud/refresh_from_production": "refresh_staging",
+    "/cloud/move_instance": "move_instance",
+    "/cloud/rollback_move": "rollback_move",
+    "/cloud/reset_github_app": "reset_github_app",
+}
+
+
+class McpCatalogDestructive(models.AbstractModel):
+    """The destructive tools, and the routes they call."""
+
+    _inherit = "incubacloud.mcp.catalog"
+
+    @api.model
+    def _tool_specs(self):
+        """Add the destructive tools."""
+        return super()._tool_specs() + list(TOOLS)
+
+    @api.model
+    def _route_policies(self):
+        """Classify the destructive routes."""
+        return {**super()._route_policies(), **tool_policies(ROUTES)}
+
+
+class McpToolsDestructive(models.AbstractModel):
+    """What each destructive tool asks the user, and the ones with a handler."""
+
+    _inherit = "incubacloud.mcp.tools"
+
+    @api.model
+    def _record(self, model, record_id, missing):
+        """Return the record as the user may read it, archived included.
+
+        :param str model: the model's name
+        :param int record_id: the record's id
+        :param str missing: what to say when it does not exist
+        :raises UserError: *missing*, when it does not exist
+        :raises AccessError: when the user may not read it
+        """
+        record = (
+            self.env[model].with_context(active_test=False).browse(record_id).exists()
+        )
+        if not record:
+            raise UserError(missing)
+        record.check_access("read")
+        return record
+
+    @api.model
+    def _instance(self, instance_id):
+        """Return the instance *instance_id* the user may read."""
+        return self._record(
+            "cloud.instance", instance_id, self.env._("Instance not found")
+        )
+
+    @api.model
+    def _tool_delete_instance(self, args):
+        """Delete an instance as the panel's Delete does.
+
+        A deployed instance is taken off its server by a ``delete_instance``
+        job and leaves the panel when it ends, as the panel's Remove does
+        without keeping it, or stays in it as a draft with
+        ``keep_in_panel`` (the panel's "Keep in panel"); the route deletes
+        only one never deployed.
+
+        :param dict args: ``instance_id`` and ``keep_in_panel``
+        :return: the route's answer, or the job's id and state
+        :rtype: dict
+        """
+        instance = self._instance(args["instance_id"])
+        if not instance.deployed:
+            return self._route("/cloud/delete_instance", instance_id=instance.id)
+        self.env["cloud.security.mixin"]._check_can_delete_instance(instance)
+        job_id = self.env["cloud.job"].enqueue(
+            instance.host_id.id,
+            instance.id,
+            "delete_instance",
+            {"keep_in_panel": bool(args.get("keep_in_panel"))},
+        )
+        return self._with_job_state({"ok": True, "job_id": job_id})
+
+    @api.model
+    def _tool_delete_archived_instance(self, args):
+        """Delete an archived instance; the approval stands for typing its name."""
+        instance = self._instance(args["instance_id"])
+        return self._route(
+            "/cloud/delete_archived_instance",
+            instance_id=instance.id,
+            confirm_name=instance.name,
+        )
+
+    @api.model
+    def _confirm_delete_project(self, args):
+        """Name the project."""
+        self.env["cloud.security.mixin"]._check_can_delete_project()
+        project = self._record(
+            "cloud.project", args["project_id"], self.env._("Project not found")
+        )
+        return self.env._(
+            "Delete the project %(name)s. This cannot be undone.",
+            name=quoted(project.name),
+        )
+
+    @api.model
+    def _confirm_delete_instance(self, args):
+        """Name the instance, say whether it is production, and whether it
+        stays in the panel.
+
+        Keeping one never deployed is refused before anyone is asked:
+        nothing of it is on a server.
+        """
+        sec = self.env["cloud.security.mixin"]
+        sec._check_cloud_group(_CONSULTANT)
+        instance = self._instance(args["instance_id"])
+        sec._check_can_delete_instance(instance)
+        if args.get("keep_in_panel"):
+            if not instance.deployed:
+                raise UserError(
+                    self.env._(
+                        "This instance was never deployed: there is nothing to "
+                        "take off its server. Delete it without keep_in_panel."
+                    )
+                )
+            if instance.environment == "production":
+                return self.env._(
+                    "Take the production instance %(name)s (project %(project)s) "
+                    "off its server, with its database and files there. It stays "
+                    "in the panel as a draft that can be deployed again.",
+                    name=quoted(instance.name),
+                    project=quoted(instance.project_id.name or ""),
+                )
+            return self.env._(
+                "Take the instance %(name)s (project %(project)s) off its server, "
+                "with its database and files there. It stays in the panel as a "
+                "draft that can be deployed again.",
+                name=quoted(instance.name),
+                project=quoted(instance.project_id.name or ""),
+            )
+        if instance.environment == "production":
+            return self.env._(
+                "Delete the production instance %(name)s (project %(project)s). "
+                "This cannot be undone.",
+                name=quoted(instance.name),
+                project=quoted(instance.project_id.name or ""),
+            )
+        return self.env._(
+            "Delete the instance %(name)s (project %(project)s). "
+            "This cannot be undone.",
+            name=quoted(instance.name),
+            project=quoted(instance.project_id.name or ""),
+        )
+
+    @api.model
+    def _confirm_delete_archived_instance(self, args):
+        """Name the archived instance and its backup copy."""
+        self.env["cloud.security.mixin"]._check_cloud_group(_MANAGER)
+        instance = self._instance(args["instance_id"])
+        return self.env._(
+            "Delete the archived instance %(name)s and the backup copy it still "
+            "keeps. This cannot be undone.",
+            name=quoted(instance.name),
+        )
+
+    @api.model
+    def _confirm_delete_host(self, args):
+        """Name the server and its address."""
+        self.env["cloud.security.mixin"]._check_can_manage_hosts()
+        host = self._record("cloud.host", args["host_id"], self.env._("Host not found"))
+        return self.env._(
+            "Remove the server %(name)s (%(ip)s) from the panel and take the "
+            "panel's services off it. This cannot be undone.",
+            name=quoted(host.name),
+            ip=host.ip_address,
+        )
+
+    @api.model
+    def _confirm_delete_backup_backend(self, args):
+        """Name the backup destination."""
+        self.env["cloud.security.mixin"]._check_can_manage_settings()
+        backend = self._record(
+            "cloud.backup.backend", args["backend_id"], self.env._("Backend not found")
+        )
+        return self.env._(
+            "Delete the backup destination %(name)s. This cannot be undone.",
+            name=quoted(backend.name),
+        )
+
+    @api.model
+    def _confirm_restore_backup(self, args):
+        """Name the instance and the backup's time.
+
+        The panel restores production instances only, from a backup time
+        it reads: any other instance, or a time that is not one, is
+        refused here, before anyone is asked.
+        """
+        self.env["cloud.security.mixin"]._check_can_manage_backups()
+        instance = self._instance(args["instance_id"])
+        if instance.environment != "production":
+            raise UserError(self.env._("Backup restore only supported for production."))
+        try:
+            validate_dup_time(args["time"])
+        except ValueError as exc:
+            raise UserError(str(exc)) from exc
+        return self.env._(
+            "Restore the production instance %(name)s from its backup of "
+            "%(time)s. What changed after it is lost.",
+            name=quoted(instance.name),
+            time=quoted(args["time"]),
+        )
+
+    @api.model
+    def _prepare_refresh_staging(self, args):
+        """Resolve where the copy comes from, and bind the call to it.
+
+        The last backup, by default — a dump taken now when production has
+        no backup destination, as the panel degrades it — neutralized
+        unless told otherwise.
+        """
+        source = args.get("source") or "backup"
+        if source == "backup":
+            production = self._instance(args["source_instance_id"])
+            if not production.sudo().effective_backup_backend:
+                source = "live"
+        return {**args, "source": source, "neutralize": args.get("neutralize", True)}
+
+    @api.model
+    def _confirm_refresh_staging(self, args):
+        """Name the staging, its source and how the copy is taken.
+
+        A production instance is never refreshed: refused here, before
+        anyone is asked.
+        """
+        self.env["cloud.security.mixin"]._check_can_clone_to_staging()
+        staging = self._instance(args["instance_id"])
+        if staging.environment == "production":
+            raise UserError(
+                self.env._("Production instances cannot be refreshed from production.")
+            )
+        source = self._instance(args["source_instance_id"])
+        if args.get("source") == "live":
+            how = self.env._("a dump taken now")
+        else:
+            how = self.env._("its last backup")
+        if args.get("neutralize", True):
+            neutralized = self.env._("neutralized")
+        else:
+            neutralized = self.env._("not neutralized")
+        return self.env._(
+            "Replace the staging %(staging)s with a copy of %(origin)s "
+            "(%(how)s, %(neutralized)s). Everything in the staging is lost.",
+            staging=quoted(staging.name),
+            origin=quoted(source.name),
+            how=how,
+            neutralized=neutralized,
+        )
+
+    @api.model
+    def _confirm_move_instance(self, args):
+        """Name the instance, whether it is production, and where it goes."""
+        self.env["cloud.security.mixin"]._check_can_manage_hosts()
+        instance = self._instance(args["instance_id"])
+        target = self._record(
+            "cloud.host", args["target_host_id"], self.env._("Host not found")
+        )
+        if instance.environment == "production":
+            return self.env._(
+                "Move the production instance %(name)s to the server %(host)s. "
+                "It is unavailable while it moves.",
+                name=quoted(instance.name),
+                host=quoted(target.name),
+            )
+        return self.env._(
+            "Move the instance %(name)s to the server %(host)s. It is "
+            "unavailable while it moves.",
+            name=quoted(instance.name),
+            host=quoted(target.name),
+        )
+
+    @api.model
+    def _confirm_rollback_move(self, args):
+        """Name the instance and whether it is production."""
+        self.env["cloud.security.mixin"]._check_can_manage_hosts()
+        instance = self._instance(args["instance_id"])
+        if instance.environment == "production":
+            return self.env._(
+                "Undo the move of the production instance %(name)s and bring it "
+                "back to its previous server.",
+                name=quoted(instance.name),
+            )
+        return self.env._(
+            "Undo the move of the instance %(name)s and bring it back to its "
+            "previous server.",
+            name=quoted(instance.name),
+        )
+
+    @api.model
+    def _confirm_reset_github_app(self, args):
+        """Say what resetting the App takes away."""
+        self.env["cloud.security.mixin"]._check_can_manage_settings()
+        return self.env._(
+            "Delete the panel's GitHub App credentials: every repository has to "
+            "be connected again."
+        )

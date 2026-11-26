@@ -1,0 +1,164 @@
+<templates>
+
+    <t t-name="incubacloud.RepoEditor">
+        <div class="rl-repo">
+
+            <!-- ── Main row: URL + Branch + Freeze + Remove ──────────────── -->
+            <div class="rl-repo-main">
+
+                <!-- URL input + inline branch-fetch spinner -->
+                <input type="text"
+                       class="rl-repo-url"
+                       placeholder="https:// URL of a GitHub or GitLab repository"
+                       t-att-value="props.repo.url"
+                       t-att-readonly="urlLocked"
+                       t-att-title="urlLocked ? urlLockedTitle : false"
+                       t-on-input="onUrlInput"
+                       t-on-blur="onUrlBlur"/>
+                <span t-if="state.loadingBranches" class="ic-repo-spinner" title="Fetching branches…">⟳</span>
+
+                <!-- Branch (SearchSelect lives where rl-repo-bval would be) -->
+                <div class="rl-repo-branch">
+                    <span class="rl-repo-lbl">Branch</span>
+                    <SearchSelect
+                        options="state.branches"
+                        value="props.repo.branch"
+                        onChange.bind="onBranchChange"
+                        onOpen.bind="onBranchOpen"
+                        placeholder="'main'"
+                        loading="state.loadingBranches"
+                        allowFreeText="true"
+                        emptyLabel.translate="— select branch —"
+                    />
+                </div>
+
+                <!-- Freeze / Unfreeze toggle -->
+                <button t-if="!props.hideFreeze"
+                        class="rl-repo-freeze"
+                        t-att-class="{ 'on': isFrozen }"
+                        t-att-disabled="state.freezing or (!props.repo.url or !props.repo.branch)"
+                        t-att-title="isFrozen ? 'Pinned to ' + props.repo.commit_sha + ' — click to unfreeze' : 'Freeze to current HEAD'"
+                        t-on-click.stop="toggleFreeze">
+                    <t t-if="state.freezing"><span class="ic-repo-spinner">⟳</span></t>
+                    <t t-else="">
+                        <t t-if="isFrozen"><t t-out="env.icon('lock', 13)"/></t>
+                        <t t-else=""><t t-out="env.icon('unlock', 13)"/></t>
+                        <span t-if="isFrozen" class="ic-repo-sha" t-esc="shortSha"/>
+                    </t>
+                </button>
+
+                <!-- Remove repository -->
+                <button class="rl-repo-rm" t-on-click="props.onRemove" title="Remove repository">
+                    <t t-out="env.icon('x', 13)"/>
+                </button>
+            </div>
+
+            <!-- URL / branch error -->
+            <div t-if="state.branchError" class="ic-repo-fetch-error">
+                <span t-esc="state.branchError"/>
+                <t t-if="state.branchSettingsHint and env.permissions?.can_manage_settings">
+                    <a t-if="state.branchSettingsHint === 'git_providers'"
+                       class="ic-repo-fetch-error-link"
+                       t-on-click.prevent="() => env.navigate('settings', { section: 'git-providers' })">
+                        Open Git providers →
+                    </a>
+                    <a t-else=""
+                       class="ic-repo-fetch-error-link"
+                       t-on-click.prevent="() => env.navigate('settings', { section: 'github' })">
+                        Open GitHub settings →
+                    </a>
+                </t>
+            </div>
+
+            <!-- A GitLab line: its server and its webhook, which also brings merge request previews -->
+            <div t-if="gitlabHost" class="ic-repo-provider">
+                <span class="ic-repo-provider-badge">GitLab · <t t-esc="gitlabHost"/></span>
+                <t t-set="push" t-value="pushRebuild"/>
+                <span t-if="push === 'ok'" class="ic-repo-hook ic-repo-hook--ok">
+                    <i class="fa fa-check"/> Webhook active: a push rebuilds.
+                </span>
+                <span t-elif="push === 'hook_pending'" class="ic-repo-hook ic-repo-hook--warn">
+                    Webhook registered, no delivery yet: verify it in Git providers.
+                </span>
+                <span t-elif="push === 'hook_failing'" class="ic-repo-hook ic-repo-hook--error">
+                    GitLab disabled the webhook: pushes do not rebuild. Verify it in Git providers.
+                </span>
+                <span t-elif="push === 'no_hook'" class="ic-repo-hook ic-repo-hook--warn">
+                    No webhook: pushes do not rebuild.
+                </span>
+                <span t-else="" class="ic-repo-provider-next">
+                    Save the line to register its webhook.
+                </span>
+                <button t-if="push === 'no_hook' and props.repoModel"
+                        class="ic-repo-hook-action"
+                        t-att-disabled="state.registering"
+                        t-on-click.stop="registerHook">
+                    <i t-if="state.registering" class="fa fa-spinner fa-spin"/>
+                    Register webhook
+                </button>
+                <a t-if="(push === 'hook_pending' or push === 'hook_failing') and env.permissions?.can_manage_settings"
+                   class="ic-repo-fetch-error-link"
+                   t-on-click.prevent="() => env.navigate('settings', { section: 'git-providers' })">
+                    Open Git providers →
+                </a>
+            </div>
+            <div t-if="state.hookError" class="ic-repo-fetch-error">
+                <span t-esc="state.hookError"/>
+            </div>
+            <div t-if="state.hookManualReason" class="ic-repo-fetch-error">
+                <span>The panel could not register the webhook: <t t-esc="state.hookManualReason"/> Set it up by hand with the URL and secret in Git providers.</span>
+                <a t-if="env.permissions?.can_manage_settings"
+                   class="ic-repo-fetch-error-link"
+                   t-on-click.prevent="() => env.navigate('settings', { section: 'git-providers' })">
+                    Set up by hand →
+                </a>
+            </div>
+
+            <!-- ── Modules (instance repos only) ─────────────────────────── -->
+            <t t-if="props.hasAddons">
+                <div class="rl-repo-mods">
+                    <span class="rl-repo-lbl">Modules</span>
+                    <span class="rl-repo-chip">
+                        <ModuleSelector
+                            value="props.repo.addons || ''"
+                            onChange="(v) => props.onChange('addons', v)"
+                            modules="state.modules"
+                            loading="state.loadingModules"
+                            error="state.moduleError"
+                            disabled="!props.repo.branch"
+                            blockedSet="excludedSet"
+                            placeholder.translate="Add module…"
+                            emptyLabel="'ALL'"
+                            resetLabel="'ALL'"
+                            showEmpty="true"
+                            onOpen.bind="onModuleOpen"
+                        />
+                    </span>
+                </div>
+
+                <!-- ── Exclude Modules ───────────────────────────────────── -->
+                <div class="rl-repo-mods">
+                    <span class="rl-repo-lbl">Exclude</span>
+                    <span class="rl-repo-chip">
+                        <ModuleSelector
+                            value="props.repo.excludes || ''"
+                            onChange="(v) => props.onChange('excludes', v)"
+                            modules="state.modules"
+                            loading="state.loadingModules"
+                            error="state.moduleError"
+                            disabled="!props.repo.branch"
+                            blockedSet="includedSet"
+                            placeholder.translate="Exclude module…"
+                            emptyLabel="'NONE'"
+                            resetLabel="'Clear'"
+                            showEmpty="false"
+                            onOpen.bind="onModuleOpen"
+                        />
+                    </span>
+                </div>
+            </t>
+
+        </div>
+    </t>
+
+</templates>

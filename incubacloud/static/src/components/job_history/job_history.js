@@ -1,0 +1,440 @@
+import { Component, useEffect, useRef, useState } from "@odoo/owl";
+import { _t } from "@web/core/l10n/translation";
+import { useService } from "@web/core/utils/hooks";
+import { parseUTC, userLocale } from "../../utils/dates";
+import { ACTIVE_STATES, jobStateText, stateLabel } from "../../utils/job_queue";
+import { SearchSelect } from "../search_select/search_select";
+
+/** Label of each timeline window, by hours. */
+const GANTT_WINDOW_LABELS = { 1: "1h", 6: "6h", 24: "24h", 168: "7d" };
+
+const ALL_STATES = [...ACTIVE_STATES, "done", "failed", "cancelled"];
+
+/** Widest the timeline's axis cuts its window into, in steps. */
+const GANTT_MAX_STEPS = 12;
+
+/**
+ * Least room between two labels of the timeline's axis, in pixels: an
+ * ``HH:MM`` label takes about 32 px, and the first and last ones sit
+ * against the ends rather than centred on their mark.
+ */
+const GANTT_TICK_MIN_PX = 64;
+
+/**
+ * How many steps the timeline's axis is cut into: as many as the window
+ * has hours, up to ``GANTT_MAX_STEPS``, and fewer when the axis is too
+ * narrow for their labels. A smaller count divides the larger one, so
+ * the marks kept are some of the ones a wide axis shows.
+ *
+ * @param {number} hours the window, in hours.
+ * @param {number} [width=0] the axis's width in pixels; 0 when not
+ *   measured, which keeps every step.
+ * @returns {number} the number of steps, 1 or more (one more mark).
+ */
+export function ganttStepCount(hours, width = 0) {
+    const steps = Math.max(1, Math.min(hours, GANTT_MAX_STEPS));
+    if (!width) return steps;
+    const fit = Math.max(1, Math.floor(width / GANTT_TICK_MIN_PX));
+    for (let n = Math.min(steps, fit); n > 1; n--) {
+        if (steps % n === 0) return n;
+    }
+    return 1;
+}
+
+export class JobHistory extends Component {
+    static template = "incubacloud.JobHistory";
+    static components = { SearchSelect };
+    static props = {
+        job_id: { type: [Number, Boolean], optional: true },
+        instance_id: { type: [Number, Boolean], optional: true },
+        host_id: { type: [Number, Boolean], optional: true },
+        embedded: { type: Boolean, optional: true },
+    };
+
+    setup() {
+        const jobId = this.props.job_id || null;
+        const instanceId = this.props.instance_id || null;
+        const hostId = this.props.host_id || null;
+        this.state = useState({
+            jobs: [],
+            hosts: [],
+            instances: [],
+            users: [],
+            loading: true,
+            alertMode: !!jobId,
+            preClaim: false,
+            filter: {
+                include_pre_claim: false,
+                states: [],
+                host_id: hostId,
+                user_id: null,
+                date_from: "",
+                date_to: "",
+                job_category: jobId ? "all" : "operational",
+                job_id: jobId,
+                instance_id: instanceId,
+            },
+            ganttHours: 24,
+            // The filters of the last load: what the list shows, as
+            // against the draft being edited in the filter row.
+            applied: {},
+            // The state, host, instance, user and date filters fold under
+            // one row, and the timeline folds away: with little height the
+            // list of jobs is what has to be seen on opening.
+            filtersOpen: false,
+            ganttOpen: true,
+            // Width of the timeline's axis, in pixels: how many of its
+            // marks fit. 0 until measured.
+            ganttAxisWidth: 0,
+        });
+
+        this.orm = useService("orm");
+        // The axis comes and goes with the timeline and its jobs: it is
+        // watched while it is on screen.
+        this.ganttAxis = useRef("ganttAxis");
+        useEffect((el) => {
+            if (!el) return;
+            const observer = new ResizeObserver(() => {
+                this.state.ganttAxisWidth = Math.round(el.getBoundingClientRect().width);
+            });
+            observer.observe(el);
+            return () => observer.disconnect();
+        }, () => [this.ganttAxis.el]);
+        this.loadHistory();
+    }
+
+    // ───────────── Data ─────────────
+
+    async loadHistory() {
+        this.state.loading = true;
+        const filters = this._buildFilters();
+        this.state.applied = {
+            ...filters,
+            states: filters.states || [],
+            host_id: filters.host_id || null,
+            instance_id: filters.instance_id || null,
+            user_id: filters.user_id || null,
+            date_from: filters.date_from || "",
+            date_to: filters.date_to || "",
+        };
+        const result = await this.orm.call("cloud.job", "load_history", [filters]);
+        this.state.jobs = result.jobs;
+        this.state.hosts = result.hosts;
+        this.state.instances = result.instances || [];
+        this.state.users = result.users || [];
+        this.state.preClaim = result.preClaim || false;
+        this.state.loading = false;
+    }
+
+    // ───────────── SearchSelect options ─────────────
+
+    get hostOptions() {
+        return this.state.hosts.map(h => ({ value: h.id, label: h.name }));
+    }
+
+    get instanceOptions() {
+        return this.state.instances.map(i => ({ value: i.id, label: i.name }));
+    }
+
+    get userOptions() {
+        return this.state.users.map(u => ({ value: u.id, label: u.name }));
+    }
+
+    setHost(value) {
+        this.state.filter.host_id = value ? parseInt(value) : null;
+    }
+
+    setInstance(value) {
+        this.state.filter.instance_id = value ? parseInt(value) : null;
+    }
+
+    setUser(value) {
+        this.state.filter.user_id = value ? parseInt(value) : null;
+    }
+
+    _buildFilters() {
+        const f = this.state.filter;
+        const filters = { job_category: f.job_category };
+        if (f.job_id) filters.job_id = f.job_id;
+        if (f.states.length) filters.states = f.states;
+        if (f.host_id) filters.host_id = f.host_id;
+        if (f.date_from) filters.date_from = f.date_from;
+        if (f.date_to) filters.date_to = f.date_to;
+        if (f.instance_id) filters.instance_id = f.instance_id;
+        if (f.user_id) filters.user_id = f.user_id;
+        if (f.include_pre_claim) filters.include_pre_claim = true;
+        // When opened from a host or instance, restrict to that scope
+        if (this.props.host_id) filters.apply_to = 'host';
+        if (this.props.instance_id) filters.apply_to = 'instance';
+        return filters;
+    }
+
+    clearAlertMode() {
+        this.state.alertMode = false;
+        this.state.filter.job_id = null;
+        this.state.filter.job_category = "operational";
+        this.loadHistory();
+    }
+
+    resetFilters() {
+        const hostId = this.props.host_id || null;
+        const instanceId = this.props.instance_id || null;
+        this.state.filter.states = [];
+        this.state.filter.host_id = hostId;
+        this.state.filter.user_id = null;
+        this.state.filter.date_from = "";
+        this.state.filter.date_to = "";
+        this.state.filter.job_category = "operational";
+        this.state.filter.job_id = null;
+        this.state.filter.instance_id = instanceId;
+        this.state.filter.include_pre_claim = false;
+        this.state.alertMode = false;
+        this.loadHistory();
+    }
+
+    resetFilter() {
+        this.resetFilters();
+    }
+
+    /**
+     * Show or hide the jobs that predate this instance's handover.
+     *
+     * Only reachable when the backend reported a cutoff, so the flag
+     * stays off for every instance that owns its whole history.
+     */
+    togglePreClaim() {
+        this.state.filter.include_pre_claim = !this.state.filter.include_pre_claim;
+        this.loadHistory();
+    }
+
+    // ───────────── Filters ─────────────
+
+    toggleState(s) {
+        const idx = this.state.filter.states.indexOf(s);
+        if (idx >= 0) {
+            this.state.filter.states.splice(idx, 1);
+        } else {
+            this.state.filter.states.push(s);
+        }
+    }
+
+    isStateActive(s) {
+        return this.state.filter.states.length === 0 || this.state.filter.states.includes(s);
+    }
+
+    applyFilter() {
+        this.loadHistory();
+    }
+
+    setCategory(cat) {
+        this.state.filter.job_category = cat;
+        this.loadHistory();
+    }
+
+    onDateFromChange(ev) {
+        this.state.filter.date_from = ev.target.value;
+    }
+
+    onDateToChange(ev) {
+        this.state.filter.date_to = ev.target.value;
+    }
+
+    setGanttWindow(hours) {
+        this.state.ganttHours = hours;
+    }
+
+    /** Show or fold the filters under the category row. */
+    toggleFilters() {
+        this.state.filtersOpen = !this.state.filtersOpen;
+    }
+
+    /** Show or fold the timeline. */
+    toggleGantt() {
+        this.state.ganttOpen = !this.state.ganttOpen;
+    }
+
+    /**
+     * How many of the folded filters are applied, as of the last load: a
+     * box ticked and not yet applied does not count.
+     *
+     * The category is always on view and so is not counted; a host or an
+     * instance that the panel was opened for is the scope, not a filter
+     * picked. The states count as one, each date as one.
+     *
+     * @returns {number}
+     */
+    get activeFilterCount() {
+        const f = this.state.applied;
+        return [
+            f.states.length > 0,
+            f.host_id && f.host_id !== (this.props.host_id || null),
+            f.instance_id && f.instance_id !== (this.props.instance_id || null),
+            f.user_id,
+            f.date_from,
+            f.date_to,
+        ].filter(Boolean).length;
+    }
+
+    /**
+     * Text of the toggle that folds the filters: «Filters», with how many
+     * are set when any is.
+     *
+     * @returns {string}
+     */
+    get filtersLabel() {
+        const n = this.activeFilterCount;
+        if (!n) return _t("Filters");
+        return n === 1 ? _t("Filters · 1 active") : _t("Filters · %s active", n);
+    }
+
+    /**
+     * The timeline's window as it reads on its toggle.
+     *
+     * @returns {string} ``1h``, ``6h``, ``24h`` or ``7d``.
+     */
+    get ganttWindowLabel() {
+        return GANTT_WINDOW_LABELS[this.state.ganttHours] || `${this.state.ganttHours}h`;
+    }
+
+    // ───────────── Gantt ─────────────
+
+    get ganttJobs() {
+        const now = Date.now();
+        const windowMs = this.state.ganttHours * 3600 * 1000;
+        const rangeEnd = now;
+        const rangeStart = rangeEnd - windowMs;
+
+        return this.state.jobs
+            .map(job => {
+                const start = parseUTC(job.create_date).getTime();
+                const isActive = ACTIVE_STATES.includes(job.state);
+                const end = (isActive || !job.duration_s)
+                    ? (isActive ? now : start + 1000)
+                    : start + job.duration_s * 1000;
+
+                const left = Math.max(0, (start - rangeStart) / windowMs * 100);
+                const right = Math.min(100, (end - rangeStart) / windowMs * 100);
+                const width = Math.max(0.4, right - left);
+
+                return { ...job, ganttLeft: left, ganttWidth: width, _inRange: right > 0 && left < 100 };
+            })
+            .filter(j => j._inRange)
+            .slice(0, 50);
+    }
+
+    /**
+     * The marks of the timeline's axis, as many as its width has room for
+     * (``ganttStepCount``).
+     *
+     * @returns {{pct: string, label: string}[]} each mark's place, as a
+     *   percentage of the axis, and its ``HH:MM``.
+     */
+    get ganttTicks() {
+        const count = ganttStepCount(this.state.ganttHours, this.state.ganttAxisWidth);
+        const step = this.state.ganttHours / count;
+        const now = Date.now();
+        const ticks = [];
+        for (let i = 0; i <= count; i++) {
+            const ms = now - (this.state.ganttHours - i * step) * 3600 * 1000;
+            const d = new Date(ms);
+            const label = d.getHours().toString().padStart(2, "0") + ":" +
+                          d.getMinutes().toString().padStart(2, "0");
+            ticks.push({ pct: (i / count * 100).toFixed(1), label });
+        }
+        return ticks;
+    }
+
+    // ───────────── Formatters ─────────────
+
+    formatDuration(s) {
+        if (!s || s <= 0) return "—";
+        if (s < 60) return `${s}s`;
+        const m = Math.floor(s / 60);
+        const sec = s % 60;
+        if (m < 60) return sec > 0 ? `${m}m ${sec}s` : `${m}m`;
+        const h = Math.floor(m / 60);
+        const min = m % 60;
+        return min > 0 ? `${h}h ${min}m` : `${h}h`;
+    }
+
+    formatDate(dateStr) {
+        if (!dateStr) return "—";
+        const d = parseUTC(dateStr);
+        return d.toLocaleString(userLocale(), {
+            month: "2-digit", day: "2-digit",
+            hour: "2-digit", minute: "2-digit",
+        });
+    }
+
+    /**
+     * A job's instance as its column shows it: "project/name", free to
+     * break after the slash (a zero-width space) so a narrow table wraps
+     * it there rather than widening; a dash for a host's job.
+     *
+     * @param {{instance_name?: string}} job a ``_format_history`` row
+     * @returns {string}
+     */
+    instanceText(job) {
+        return job.instance_name ? job.instance_name.split("/").join("/\u200b") : "—";
+    }
+
+    /**
+     * Label of a state, for the filter and the Gantt bars
+     * (``job_queue.stateLabel``).
+     *
+     * @param {string} state
+     * @returns {string}
+     */
+    stateLabel(state) {
+        return stateLabel(state);
+    }
+
+    /**
+     * Text of a job's state in the table, as the lists' pill says it
+     * (``job_queue.jobStateText``).
+     *
+     * @param {{state: string, queue_position?: number}} job
+     * @returns {string}
+     */
+    rowStateText(job) {
+        return jobStateText(job);
+    }
+
+    /**
+     * View-only mapping of a raw job ``state`` to the Relay state-class used by
+     * the timeline dot (``rl-tl-dot``) and the bare status pill (``rl-pill``):
+     * ``done`` / ``failed`` / ``queued`` (amber, waiting on a runner) /
+     * ``running`` (cyan, pulsing), and ``waiting`` (amber) for a job
+     * waiting in its queue; ``running`` too for a job cancelled that still
+     * stops what it left on its server (``stopping``).
+     * No business logic — purely picks the CSS modifier for the chosen state.
+     * @param {string} state raw cloud.job state
+     * @param {boolean} [stopping] ``stopping`` of the same row
+     * @returns {string} one of "done" | "failed" | "queued" | "running" | "waiting"
+     */
+    ganttDotClass(state, stopping = false) {
+        if (state === "cancelled" && stopping) {
+            return "running";
+        }
+        return {
+            done: "done",
+            failed: "failed",
+            cancelled: "failed",
+            queued: "waiting",
+            started: "running",
+            pending: "queued",
+            enqueued: "queued",
+            wait_dependencies: "queued",
+        }[state] || "queued";
+    }
+
+    // ───────────── Actions ─────────────
+
+    openLog(job) {
+        window.open(`/cloud/log/${job.id}`, "_blank");
+    }
+
+    get allStateKeys() {
+        return ALL_STATES;
+    }
+}

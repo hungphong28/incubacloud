@@ -1,0 +1,631 @@
+"""Host hardening — layer-1 in-host security recipe (core).
+
+Repatriated to core per the architecture decision (2026-07-17): the
+in-host hardening recipe is generic and belongs in the distributable
+core, while the network-edge firewall (layer 2 — Hetzner Cloud Firewall,
+etc.) follows the provider and stays in a layer that knows it. Such a
+layer keeps only a thin subclass that overrides the edge-firewall hook.
+
+The recipe itself lives in ``ansible/playbooks/host_hardening.yml``
+(machine-state convergence via Ansible). This executor supplies the
+per-host values (rotated SSH port, operator user, allowlist, reboot
+policy) as extra-vars and performs the one step a playbook cannot do
+safely from inside its own connection: disable root login only AFTER
+proving the hardened user can log in on the new port.
+
+Lock-out safety: the playbook deliberately leaves
+``PermitRootLogin prohibit-password`` — key-based root still works — so a
+failed run never locks the operator out. ``on_success`` opens the edge
+firewall on the new port (a hook; no-op in core), connects as the
+hardened user on the new port, and only then flips root to ``no``. If
+that connection fails, root is left reachable and the job fails.
+"""
+import asyncio
+import hashlib
+import logging
+import secrets
+from datetime import datetime, timezone
+
+import asyncssh
+
+from odoo.tools import file_path
+
+from .ansible_executor import AnsibleExecutor
+from .cloud_host_posture import HARDENING_OUTDATED_ALERT_CODE
+
+_logger = logging.getLogger(__name__)
+
+# Default operator user created when starting from root. Hardcoded by
+# design — tooling, scripts and audit-log filters rely on the well-known
+# name.
+DEFAULT_HARDENED_USER = "incubacloud"
+
+_SSH_PORT_MIN = 22000
+_SSH_PORT_MAX = 29999
+
+# Path of the sshd drop-in the playbook writes; the final root-disable
+# step edits this same file.
+_SSHD_DROPIN = "/etc/ssh/sshd_config.d/00-incubacloud-hardening.conf"
+
+#: Make the running sshd read the drop-in. Under socket activation
+#: (Debian 13 after the playbook: ``ssh.socket`` holds the port) a reload
+#: makes sshd re-exec and bind the port itself, which the socket holds:
+#: «Cannot bind any address», and the daemon dies. That is what failed the
+#: hardening of a panel's own host on 2 November 2026, and of a fresh Debian 13 server
+#: after it. A restart of the service is handed the socket's port by
+#: systemd instead (verified on that server: new logins read the new
+#: file, and a reboot brings both units back). Without the socket, a
+#: running daemon is reloaded as before; an idle one has nothing to read.
+_SSHD_APPLY_COMMAND = (
+    "if systemctl is-active --quiet ssh.socket; then "
+    "sudo systemctl restart ssh.service; "
+    "elif systemctl is-active --quiet ssh.service; then "
+    "sudo systemctl reload ssh.service; fi"
+)
+
+#: Seconds to wait before each new attempt to reach the rotated port for
+#: the new-login proof, one more attempt than delays. An edge firewall
+#: (Hetzner's, a BYOH one) can take minutes to let the port in after it
+#: was asked to: on 3 November 2026 Hetzner still dropped it two minutes
+#: after the request. A timeout or a network error is tried again on a
+#: fresh connection, waiting longer each time, so the attempts span some
+#: three minutes; anything else is final at once.
+_FINALIZE_CONNECT_DELAYS = (5, 10, 15, 20, 30)
+_FINALIZE_CONNECT_ATTEMPTS = len(_FINALIZE_CONNECT_DELAYS) + 1
+
+#: Seconds one attempt waits for the rotated port to answer. A dropped SYN
+#: is resent at 1, 3, 7 and 15 s: past 20 s a fresh connection, with a new
+#: source port, has better chances than the same one waiting the 30 s the
+#: other connections to a host get.
+_FINALIZE_CONNECT_TIMEOUT = 20
+
+
+def _pick_new_ssh_port(current_port):
+    """Return the current port if already non-default, else a random one."""
+    if current_port and current_port != 22:
+        return current_port
+    return secrets.choice(range(_SSH_PORT_MIN, _SSH_PORT_MAX + 1))
+
+
+def _recipe_fingerprint_of(text):
+    """Return the fingerprint of a hardening recipe's text.
+
+    Full-line comments -- the playbook's own and those of the files it
+    writes on the host -- and blank lines are left out: the recipe
+    explains itself at length, and rewording an explanation must not
+    make every hardened host read as behind. Everything else counts.
+
+    :param str text: the playbook's content
+    :return: the first 12 hex digits of its SHA-256
+    :rtype: str
+    """
+    lines = [
+        line.rstrip() for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()[:12]
+
+
+#: Recipes a host hardened with is as current as with the one shipped:
+#: {shipped fingerprint: {earlier fingerprints it stands for}}. Only for a
+#: change that leaves every host already hardened as the new recipe would,
+#: so asking the whole fleet to harden again would gain nothing.
+#: An entry names a shipped fingerprint, so the next change to the recipe
+#: leaves it unused and every host reads as behind again, as it should.
+_EQUIVALENT_RECIPES = {
+    # 16-nov-2026: root's keys are added to the operator user's instead of
+    # copied over it, without the lines that run a forced command
+    # (files/copy_root_keys.sh). That changes only a host whose panel
+    # connected as a user of its image (AWS's ``admin``), where the copy
+    # locked the panel out, so no such host was left hardened. A host
+    # hardened from root got root's keys, which is what the new step gives.
+    # 18-nov-2026: the preflight admits Ubuntu 26.04, and the check of
+    # ``sshd -T`` also takes ``prohibit-password``, which OpenSSH 10.2
+    # prints where 10.0 and before print ``without-password``. A host on
+    # any OS admitted before runs the same steps with the same values.
+    "261515794a0b": frozenset({"0b5a14aa18f2", "3ab1139825de"}),
+}
+
+
+def _recipe_is_current(applied, shipped):
+    """Return whether a host hardened with *applied* is up to date.
+
+    :param str applied: the fingerprint the host's last hardening recorded
+    :param str shipped: the fingerprint of the recipe this panel ships
+    :return: True when they are the same, or *applied* stands for
+        *shipped* (:data:`_EQUIVALENT_RECIPES`)
+    :rtype: bool
+    """
+    return applied == shipped or applied in _EQUIVALENT_RECIPES.get(shipped, ())
+
+
+def _ssh_rollback_error(facts):
+    """Return the job's error when the playbook put the SSH setup back.
+
+    The playbook's SSH phase runs in a block whose rescue restores the
+    files and units it found, waits for sshd on the port it had, and
+    exports what it saw (``ic_ssh_rolled_back``, ``ic_ssh_restored_port``,
+    ``ic_ssh_restored_answers``) before failing the play.
+
+    :param dict facts: the playbook's exported stats
+    :return: the error to show, or ``""`` when the play did not reach the
+        rescue
+    :rtype: str
+    """
+    if str(facts.get("ic_ssh_rolled_back", "")).lower() not in ("true", "1"):
+        return ""
+    port = facts.get("ic_ssh_restored_port") or 22
+    head = (
+        "Hardening stopped while moving sshd to its new port (see the "
+        "log); the previous SSH configuration was put back"
+    )
+    if str(facts.get("ic_ssh_restored_answers", "")).lower() in ("true", "1"):
+        return f"{head} and sshd answers on port {port} again."
+    return (
+        f"{head}, but sshd does not answer on port {port}: reach the "
+        f"server through the provider's console."
+    )
+
+
+def _moved_ssh_port(facts, panel_port):
+    """Return the port sshd was moved to, when the panel does not use it.
+
+    The playbook exports ``ic_ssh_moved_port`` once sshd answers on its new
+    port, before the firewall and everything after it. A run that fails
+    after that leaves sshd there alone, while the panel still has the port
+    it reached the host on.
+
+    :param dict facts: the playbook's exported stats
+    :param int panel_port: the port the panel has for the host
+    :return: the new port; ``0`` when sshd was not moved, or was moved to
+        the port the panel already has
+    :rtype: int
+    """
+    try:
+        moved = int(facts.get("ic_ssh_moved_port") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return moved if moved and moved != panel_port else 0
+
+
+def _ssh_moved_error(moved, panel_port):
+    """Return the job's error when the playbook failed after moving sshd.
+
+    :param int moved: the port sshd listens on now (see
+        :func:`_moved_ssh_port`)
+    :param int panel_port: the port the panel had for the host
+    :rtype: str
+    """
+    return (
+        f"Hardening failed after moving sshd (see the log for the step): "
+        f"sshd already listens on port {moved}, no longer on {panel_port}, "
+        f"so the panel now reaches the host on port {moved}. Re-run the "
+        f"hardening, or reach the server through the provider's console."
+    )
+
+
+def _build_ssh_allowlist(primary_ip, extra_ips):
+    """Build the nftables set of source IPs allowed to reach SSH.
+
+    Falls back to ``0.0.0.0/0`` when nothing is known, so a missing
+    operator IP degrades to "reachable" rather than locking everyone out.
+    """
+    parts = []
+    if primary_ip:
+        parts.append(primary_ip.strip())
+    for raw in (extra_ips or "").split(","):
+        ip = raw.strip()
+        if ip and ip not in parts:
+            parts.append(ip)
+    if not parts:
+        parts.append("0.0.0.0/0")
+    return ", ".join(parts)
+
+
+class HostHardeningExecutor(AnsibleExecutor):
+    """Apply the in-host hardening recipe and finish by disabling root."""
+
+    _job_type = "host_hardening"
+    _playbook = "playbooks/host_hardening.yml"
+    # The alert a failed run files with what failed in it; while it is
+    # open, ``cloud.job._create_job_failed_alert`` raises no
+    # ``job_failed`` for the same job, which told the same failure twice
+    # (job 382128, 27-oct-2026).
+    _failure_alert_code = "hardening_failed"
+
+    @classmethod
+    def _recipe_fingerprint(cls):
+        """Return the fingerprint of the recipe this executor applies.
+
+        Read from the playbook a run would use: that of the most derived
+        addon shipping it, as ``_addon_overlay`` resolves it.
+
+        :return: see :func:`_recipe_fingerprint_of`; ``""`` when no addon
+            ships the playbook
+        :rtype: str
+        """
+        for addon in cls._addon_chain():
+            try:
+                path = file_path(f"{addon}/ansible/{cls._playbook}")
+            except FileNotFoundError:
+                continue
+            with open(path, encoding="utf-8") as fh:
+                return _recipe_fingerprint_of(fh.read())
+        return ""
+
+    def _host(self):
+        """Return the host record this job targets."""
+        return self.job.host_id
+
+    def _prepare(self):
+        """Resolve the rotated port, operator user and allowlist once.
+
+        ``AnsibleExecutor`` does not call ``before_execute``, so the setup
+        the old SSH executor did there happens here — invoked from
+        ``get_extra_vars`` (before the playbook) and cached for
+        ``on_success`` (after it).
+        """
+        if getattr(self, "_prepared", False):
+            return
+        host = self._host()
+        self._is_first_run = not host.hardened
+        self._new_port = _pick_new_ssh_port(host.port)
+
+        # Keep the existing non-root user when the host is BYOH (cloud
+        # images ship ubuntu / ec2-user / azureuser…); only migrate
+        # root → the default operator when starting fresh.
+        connecting_user = (host.user or "").strip() or "root"
+        if connecting_user == "root":
+            self._hardened_user = DEFAULT_HARDENED_USER
+            self._needs_user_creation = True
+        else:
+            self._hardened_user = connecting_user
+            self._needs_user_creation = False
+
+        self._ssh_allowlist = _build_ssh_allowlist(
+            self._operator_ip(), host.allowed_ssh_ips,
+        )
+        # Resolved once, like the rest: what the playbook is handed is
+        # what ``on_success`` records as applied, even if the flags move
+        # while the run is under way.
+        self._http_allowlist = self._http_allowlist_vars()
+        self._prepared = True
+
+    def _operator_ip(self):
+        """Return the primary IP to seed the allowlist with: the panel's own.
+
+        The host says it (``cloud.host._hardening_panel_ip``), and the
+        hardening dialog reads the same answer to tell who will be able to
+        open SSH. Core knows no address of its own, so it is ``''`` there
+        and the allowlist is built entirely from ``allowed_ssh_ips`` —
+        open to any address when that is empty; the layers that know where
+        the panel connects from answer on the host.
+        """
+        return self._host()._hardening_panel_ip()
+
+    def get_extra_vars(self):
+        """Hand the per-host hardening values to the playbook."""
+        self._prepare()
+        host = self._host()
+        self._sys(
+            f"Hardening {host.name} ({host.ip_address}). "
+            f"First run: {self._is_first_run}. "
+            f"Operator user: {self._hardened_user} "
+            f"({'create' if self._needs_user_creation else 'reuse'}). "
+            f"SSH port: {host.port} → {self._new_port}. "
+            f"Security updates: installed; the server never restarts by"
+            f" itself, the panel restarts it"
+            f"{' inside its window' if host.auto_security_updates else ' only when asked'}."
+        )
+        return {
+            "ic_hardened_user": self._hardened_user,
+            "ic_ssh_port": self._new_port,
+            "ic_ssh_allowlist": self._ssh_allowlist,
+            # The server never restarts by itself (15-nov-2026): its own
+            # restart at 04:00 cut whatever the panel ran there. The panel
+            # restarts it, inside its window and only once nothing of its
+            # runs there (``cloud.host.reboot``). The playbook's line stays
+            # as it was, so the recipe's fingerprint does not change and the
+            # fleet is not asked to harden again; the hosts hardened before
+            # get the policy fixed by their first ``host_reboot_check``.
+            "ic_auto_reboot": False,
+            # The per-source cap counts new connections by the address
+            # that opened them. Behind a CDN every visitor arrives from
+            # the same handful of edge addresses, so the cap would throttle
+            # the CDN itself and protect nobody -- whether or not the host
+            # also refuses direct traffic. A host still open at the origin
+            # while behind the CDN (the state a pool host is in between
+            # moving its names and closing its firewall) therefore gets no
+            # cap at all, exactly as before the cap existed. The rate is
+            # kept on the host record: it comes back the day the host
+            # leaves the CDN.
+            "ic_http_conn_rate": 0 if host.behind_cdn else (host.http_conn_rate or 0),
+            # The web-login jail bans by the address that opened the
+            # connection. Behind a CDN that address is the CDN's, and
+            # banning it would cut every visitor that edge serves.
+            "ic_behind_cdn": bool(host.behind_cdn),
+            # Addresses the proxy is told to trust as proxies are never
+            # visitors, so the web-login jail must not ban them either:
+            # a failed login arriving through one is the visitor's, not
+            # the proxy's.
+            "ic_trusted_proxy_ranges": " ".join(host._effective_trusted_proxy_ranges()),
+            # Filtering 80/443 to the CDN's ranges replaces the per-source
+            # rate cap; both at once would count the edge as one visitor.
+            # Deliberately gated on the host also refusing direct access
+            # at the proxy: enabling the firewall half on its own is how
+            # a host stops answering anybody without the panel saying so.
+            **self._http_allowlist,
+            # The direct port's set and rules, with the list the host has
+            # in force, so hardening again does not lose them.
+            **self._direct_vars(),
+        }
+
+    def _direct_vars(self):
+        """Return the firewall variables of the host's direct port, if any.
+
+        The port the last Full Setup published and the list the last sync
+        applied; a host whose list was never applied gets the one it
+        should have.
+
+        :rtype: dict
+        """
+        host = self.job.host_id
+        port = host.direct_port_shipped or 0
+        if not port:
+            return {}
+        entries = (host.direct_allowlist_shipped or "").split()
+        if not entries:
+            entries = host._direct_peers_entries()
+        return {"ic_direct_port": port, "ic_direct_allowlist": ", ".join(entries)}
+
+    def _http_allowlist_vars(self):
+        """Return the firewall variables for a host behind a CDN.
+
+        Empty — the pre-existing behaviour, 80/443 open to the world —
+        unless the host says its hardening admits only its proxies
+        (``cloud.host._hardening_admits_only_proxies``, which the posture
+        check asks too). Split by address family because nftables needs
+        ``ip saddr`` and ``ip6 saddr`` in separate rules.
+
+        :rtype: dict
+        """
+        host = self.job.host_id
+        if not host._hardening_admits_only_proxies():
+            return {}
+        ranges = host._effective_trusted_proxy_ranges()
+        v4 = [r for r in ranges if ":" not in r]
+        v6 = [r for r in ranges if ":" in r]
+        return {
+            "ic_http_allowed_ranges": ", ".join(ranges),
+            "ic_http_allowed_ranges_v4": ", ".join(v4),
+            "ic_http_allowed_ranges_v6": ", ".join(v6),
+        }
+
+    def parse_results(self, results):
+        """Confirm the playbook proved the new SSH port came up."""
+        errors = []
+        facts = self.playbook_facts()
+        rc = results.get(self._playbook, {}).get("exit_status", 1)
+        if rc != 0:
+            panel_port = self._host().port
+            moved = _moved_ssh_port(facts, panel_port)
+            errors.append(
+                _ssh_rollback_error(facts)
+                or (moved and _ssh_moved_error(moved, panel_port))
+                or f"Hardening playbook failed (rc={rc}) — see the log."
+            )
+            return errors
+        port_listening = str(facts.get("ic_port_listening", "")).lower()
+        if port_listening not in ("true", "1"):
+            errors.append(
+                f"sshd is not listening on the new port {self._new_port} "
+                f"after the playbook — aborting before disabling root SSH."
+            )
+        return errors
+
+    async def on_success(self, results):
+        """Open the edge firewall, prove the new login, then disable root."""
+        self._prepare()
+        host = self._host()
+
+        # Layer 2: open SSH on the rotated port at the network edge. No-op
+        # in core; a layer that knows the provider overrides it.
+        await self._open_edge_firewall_port(self._new_port)
+
+        if not await self._finalize_disable_root():
+            self._alert(
+                "hardening_failed",
+                f"Hardening aborted: could not log in as "
+                f"{self._hardened_user} on port {self._new_port} after "
+                f"applying the recipe. Root SSH was preserved. Check "
+                f"allowed_ssh_ips and any edge firewall, then retry.",
+                level="critical",
+            )
+            raise RuntimeError(
+                f"Hardening aborted: SSH as {self._hardened_user} on port "
+                f"{self._new_port} failed; root SSH preserved."
+            )
+
+        vals = {
+            "hardened": True,
+            "hardened_at": datetime.now(timezone.utc).replace(tzinfo=None),
+            # What this run applied, which the hourly posture check
+            # compares with what the panel wants now: the recipe, and
+            # whether 80/443 were closed to all but the trusted proxies.
+            "hardening_recipe": self._recipe_fingerprint(),
+            "hardening_cdn_only": bool(self._http_allowlist),
+            # The run built the host's SSH list from allowed_ssh_ips: an
+            # edit made by hand before it is on the host now.
+            "ssh_allowlist_unconfirmed": False,
+        }
+        if self._is_first_run:
+            vals["port"] = self._new_port
+            if self._needs_user_creation:
+                vals["user"] = self._hardened_user
+        # Hardening rotates the SSH port from inside its own running job;
+        # the endpoint-change guard would self-block. Opt out, as only
+        # superuser rights may.
+        host.sudo().with_context(skip_endpoint_change_guard=True).write(vals)
+        # Same machine, new port — so the verified key stays and is simply
+        # re-filed under the rotated endpoint. Skipping this leaves the
+        # entry labelled for the old port, which asyncssh tolerates but
+        # OpenSSH (every Ansible-backed job) reads as "host unknown".
+        host._relabel_known_hosts_entry()
+        # The address the run came from: one of the panel's for this host
+        # (plan #84, A1), as the agents' install records it too. Nothing
+        # until the recipe exports ``ic_panel_source``, which waits for its
+        # next real change: a new recipe asks every hardened server to be
+        # hardened again.
+        host._record_panel_source(self.playbook_facts().get("ic_panel_source"))
+        self._resolve_alert("hardening_failed")
+        self._resolve_alert(HARDENING_OUTDATED_ALERT_CODE)
+        self._sys(
+            f"✓ Host hardened. Reachable as {self._hardened_user} on port "
+            f"{self._new_port}; root SSH disabled."
+        )
+
+    async def on_failure(self, results, errors):
+        """Report hardening failure, with what failed; root SSH remains reachable.
+
+        The one alert of the failure: it says what failed, which only
+        ``job_failed`` used to, and that one is no longer raised beside
+        it (``_failure_alert_code``). When the playbook failed after
+        moving sshd, the panel takes the new port first
+        (``_adopt_moved_ssh_port``), so a retry reaches the host.
+        """
+        moved = _moved_ssh_port(self.playbook_facts(), self._host().port)
+        if moved:
+            await self._adopt_moved_ssh_port(moved)
+        for err in errors:
+            self._sys(f"✗ {err}")
+        detail = " ".join(errors) or "Check the job log for details."
+        self._alert(
+            self._failure_alert_code,
+            f"Hardening {self._host().name} failed: {detail} "
+            f"Root SSH was preserved so you can recover; re-run to retry.",
+            level="critical",
+        )
+
+    async def _adopt_moved_ssh_port(self, port):
+        """Make the panel reach the host on *port*, where sshd now listens.
+
+        For a run that failed after moving sshd: nothing answers on the
+        port the panel had, and a retry that knocked on it would never
+        reach the host; with the new port on the record, the retry also
+        keeps it (``_pick_new_ssh_port`` keeps any but 22). The edge
+        firewall is opened on *port*, as ``on_success`` does before its
+        login proof, the host record takes it, and the trusted key is
+        filed under it. Root and the user are left as they are: the
+        retry's own ``on_success`` settles them.
+
+        :param int port: the port sshd listens on
+        """
+        self._prepare()
+        host = self._host()
+        await self._open_edge_firewall_port(port)
+        # On on_failure's durable cursor, its only caller: the port
+        # outlives the rollback of the failed job's transaction.
+        host.sudo().with_context(skip_endpoint_change_guard=True).write(
+            {"port": port},
+        )
+        host._relabel_known_hosts_entry()
+        self._sys(f"⚠ sshd listens on port {port} now: the panel uses it.")
+
+    # ── Layer-2 edge firewall hook (overridden by a layer) ───────────────────
+
+    async def _open_edge_firewall_port(self, new_port):
+        """Open SSH on *new_port* at the network edge firewall.
+
+        No-op in core: a self-hosted / BYOH host has no provider-managed
+        edge firewall. A layer that knows the provider overrides this to
+        update its firewall, or to ask the panel that can, so the
+        new-port login test below is not dropped by a stale allowlist.
+        """
+        return None
+
+    # ── New-login proof + root disable ────────────────────────────────────
+
+    async def _finalize_disable_root(self):
+        """Connect as the hardened user on the new port, then disable root.
+
+        Returns True when the login succeeds and root has been disabled;
+        False on any failure (root is then left as the playbook set it —
+        ``prohibit-password`` — so the operator can still recover).
+
+        Only reaching the port is tried again: a timeout or a network
+        error before the session opens gets a fresh connection, after the
+        growing waits of ``_FINALIZE_CONNECT_DELAYS``, each attempt
+        waiting ``_FINALIZE_CONNECT_TIMEOUT`` seconds for the port. A
+        refused login, a different identity or a failure once connected
+        is final.
+        """
+        host = self._host()
+        # Trusted reader, same pattern as ``get_transport``: the job was
+        # authorized at enqueue and the credential fields are gated for
+        # raw reads. Masked today (hardening is manager-mapped) but the
+        # elevation must not depend on the type's floor never changing.
+        connect_kw = dict(host.sudo().ssh_connect_kwargs())
+        connect_kw["username"] = self._hardened_user
+        connect_kw["port"] = self._new_port
+        # The host key is unchanged but the port rotated; skip the pin for
+        # this internal proof connection only.
+        connect_kw["known_hosts"] = None
+        connect_kw["connect_timeout"] = _FINALIZE_CONNECT_TIMEOUT
+        error = None
+        for attempt in range(1, _FINALIZE_CONNECT_ATTEMPTS + 1):
+            connected = False
+            try:
+                async with asyncssh.connect(**connect_kw) as conn:
+                    connected = True
+                    idr = await conn.run("id", check=True)
+                    if self._hardened_user not in (idr.stdout or ""):
+                        return False
+                    # New access proven — now flip root off. From here on
+                    # the file says so, whatever happens to the daemon next.
+                    await conn.run(
+                        "sudo sed -i "
+                        "'s/^PermitRootLogin .*/PermitRootLogin no/' "
+                        f"{_SSHD_DROPIN}",
+                        check=True,
+                    )
+                    applied = await conn.run(_SSHD_APPLY_COMMAND, check=False)
+                    if applied.exit_status:
+                        # Root is off in the file, and the hardened login
+                        # is proven: the hardening stands. Only when the
+                        # daemon reads the file again is open to doubt, so
+                        # that is what is said, never that root was kept.
+                        _logger.warning(
+                            "host_hardening: root login disabled on %s, but "
+                            "applying it to the running sshd failed: %s",
+                            host.name, (applied.stderr or "").strip(),
+                        )
+                        self._sys(
+                            "⚠ Root login is disabled in the configuration, "
+                            "but the running SSH daemon could not be "
+                            "restarted: it applies at its next start."
+                        )
+                    return True
+            except (TimeoutError, OSError) as exc:
+                if connected or attempt == _FINALIZE_CONNECT_ATTEMPTS:
+                    error = exc
+                    break
+                delay = _FINALIZE_CONNECT_DELAYS[attempt - 1]
+                _logger.info(
+                    "host_hardening: port %s of %s not reachable yet "
+                    "(attempt %s): %r",
+                    self._new_port, host.name, attempt, exc,
+                )
+                self._sys(
+                    f"… Port {self._new_port} is not reachable yet; trying "
+                    f"again in {delay} s."
+                )
+                await asyncio.sleep(delay)
+            except Exception as exc:
+                error = exc
+                break
+        _logger.warning(
+            "host_hardening: finalize (login as %s on port %s) failed "
+            "for %s: %s",
+            self._hardened_user, self._new_port, host.name, error,
+        )
+        return False

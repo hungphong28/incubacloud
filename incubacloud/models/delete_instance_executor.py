@@ -1,0 +1,577 @@
+import logging
+import shlex
+
+from .abstract_executor import AbstractSSHExecutor, JobRefused
+from .docker_prune_executor import build_cache_prune
+from .host_build_lock import HostBuildLockMixin
+
+_logger = logging.getLogger(__name__)
+
+#: Label of the purge step. The failure classifier looks the step up by
+#: this exact string, so it lives here rather than being repeated.
+PURGE_LABEL = "Purge backups"
+
+#: Exit codes ``scripts/backup_purge.sh`` promises, mapped to the alert
+#: each one raises. The script classifies; this side never parses text,
+#: because duplicity's and boto's wording changes between versions and a
+#: broken matcher would silently downgrade every diagnosis to "unknown".
+PURGE_ALERT_BY_EXIT = {
+    20: (
+        "backup_purge_service_missing",
+        "The panel expects a backup container for %(name)s but the host's "
+        "compose does not declare one. Rebuild the instance, then delete "
+        "it again.",
+    ),
+    21: (
+        "backup_purge_unauthorized",
+        "The storage rejected the credentials while clearing %(name)s's "
+        "backups. Check or regenerate them on the backup destination, "
+        "then delete the instance again.",
+    ),
+    22: (
+        "backup_purge_failed",
+        "Could not clear %(name)s's backups. See the job log for what the "
+        "backup container reported; a container that fails to start is "
+        "the usual cause.",
+    ),
+    # Distinct from 20 on purpose. 20 is a statement about what the
+    # compose declares; 23 says the host could not read it at all, which
+    # is usually transient (the script already retried once) and whose
+    # fix is "try again", not "rebuild". Production 2026-09-19: a read
+    # that died in under 110 ms was reported as 20, and the operator was
+    # sent to rebuild an instance that was about to be destroyed.
+    23: (
+        "backup_purge_compose_unreadable",
+        "The host could not read %(name)s's compose file, so its backups "
+        "were not cleared and the instance was not deleted. The host's own "
+        "error is in the job log. This is usually transient: delete again.",
+    ),
+}
+
+#: The prefix was already empty. Not a failure: the invariant this step
+#: exists to uphold — no objects left behind by a vanished instance —
+#: already holds, so the teardown proceeds. Declared as the step's
+#: ``continue_on`` so it does: forgiving it only in ``parse_results``
+#: came too late, after ``stop_on_failure`` had already cut the teardown
+#: off, and the delete reported instances removed that were still on
+#: the host (2026-09-29: nine stacks left running).
+PURGE_EXIT_ALREADY_EMPTY = 10
+
+#: Label of the archive step, for the same reason as ``PURGE_LABEL``.
+ARCHIVE_LABEL = "Take the archive copy"
+
+#: ``scripts/backup_archive.sh`` exit codes. Coarser than the purge's on
+#: purpose: duplicity sits in the middle there and its exit codes do not
+#: separate a wrong key from an unreadable chain in a way worth
+#: pretending to, so anything unattributable stays unknown rather than
+#: being guessed at.
+ARCHIVE_ALERT_BY_EXIT = {
+    20: (
+        "backup_archive_service_missing",
+        "The panel expects a backup container for %(name)s but the host's "
+        "compose does not declare one, so no archive copy could be taken. "
+        "Rebuild the instance, then archive it again.",
+    ),
+    22: (
+        "backup_archive_failed",
+        "Could not take the archive copy of %(name)s. See the job log for "
+        "what the backup container reported.",
+    ),
+    23: (
+        "backup_archive_compose_unreadable",
+        "The host could not read %(name)s's compose file, so no archive "
+        "copy could be taken. The host's own error is in the job log. This "
+        "is usually transient: archive again.",
+    ),
+}
+
+
+class BackupPrefixRefused(JobRefused):
+    """A delete's purge would empty more than its instance's copies.
+
+    Raised before the first step (``_refuse_shared_prefix``): nothing was
+    deleted, and the instance stays as it was.
+    """
+
+
+class DeleteInstanceExecutor(HostBuildLockMixin, AbstractSSHExecutor):
+    """Stop and remove a doodba instance from the remote host.
+
+    Takes the per-host lock: ``enqueue`` only serialises per instance,
+    so "Recycle all" on a host fired one of these per instance in the same
+    millisecond, and the concurrent ``docker compose`` calls are the
+    likeliest reason one of them saw its compose read fail
+    (2026-09-19). A teardown that has to wait 30 s for its sibling
+    costs nothing; one that fails costs an alert and a manual retry.
+    """
+
+    _job_type = "delete_instance"
+    # The disk shown is read from metrics as soon as the job ends.
+    _refreshes_host_disk = True
+
+    # Whether tearing down the remote copy also ends the instance's
+    # lifecycle. The move cleanups reuse these teardown commands on a
+    # host the instance no longer lives on, so they set this to False:
+    # for them the record must stay untouched.
+    _owns_instance_lifecycle = True
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _inst(self):
+        return self.job.instance_id
+
+    def _keeps_the_record(self):
+        """Whether this run leaves the instance in the panel as a draft."""
+        return bool((self.job.payload or {}).get("keep_in_panel"))
+
+    def _backups_are_ours_to_touch(self, inst):
+        """Whether this run may act on the instance's backup chain.
+
+        Two gates, each guarding a different mistake.
+
+        ``_owns_instance_lifecycle`` — the move cleanups reuse these
+        teardown commands on a host the instance no longer lives on (the
+        abandoned source copy, or a rolled-back half-built target). The
+        instance is alive elsewhere and its backups are *its own*:
+        touching them there would destroy the backups of a running
+        instance.
+
+        ``expected_services()`` — the single source of truth for which
+        containers this instance renders, so we never chase one that was
+        never deployed. Stricter than ``_backup_enabled()`` alone: a
+        *staging* instance resolves a backup destination whenever a
+        global default exists, yet only production renders the
+        container. Gating on the flag alone would make every staging
+        instance impossible to delete. It is also what keeps instances
+        without that service out without a branch naming them — their
+        settings disable the container, so it is absent here for the same reason it is absent
+        on the host.
+        """
+        if not self._owns_instance_lifecycle:
+            return False
+        return "backup" in inst.expected_services()
+
+    def _archive_step(self, inst, inst_dir):
+        """Return the archive step, or nothing when there is none.
+
+        Archiving promises one restorable copy taken *now*, so the delta
+        since the last nightly is not lost. Like the purge it has to
+        happen before the teardown — the container that holds duplicity,
+        the credentials and the passphrase does not survive it — and
+        like the purge it aborts the teardown when it fails: an archive
+        that silently kept nothing is worse than one that refused, since
+        the record would then advertise a copy that is not there.
+        """
+        if not self._backups_are_ours_to_touch(inst):
+            return ()
+        if not self._keeps_the_record():
+            return ()
+        return ((
+            ARCHIVE_LABEL,
+            self.run_script("backup_archive.sh", [inst_dir]),
+            {"stop_on_failure": True},
+        ),)
+
+    def _purge_step(self, inst, inst_dir):
+        """Return the backup-purge step, or nothing when there is none.
+
+        Deleting an instance must not leave its backups behind: nothing
+        would ever prune them (the retention job runs inside the very
+        container this teardown destroys) and, on a managed destination,
+        they keep consuming a paid quota nobody can reclaim from the
+        panel. So the purge runs *first* and, if it fails,
+        ``stop_on_failure`` aborts before the teardown — otherwise the
+        objects would be stranded with nothing left able to reach them.
+        "Already empty" is not a failure, so it is the step's
+        ``continue_on``: the teardown still runs.
+
+        Which instances it applies to is decided by
+        :meth:`_backups_are_ours_to_touch`; on top of that, keeping
+        the record is not a deletion, so those backups still have an
+        instance they belong to and are left alone.
+
+        Bounded to what was stored since the instance was created when an
+        archived instance of the same name keeps its copies in the same
+        prefix (``cloud.instance._backup_purge_since``): those stay.
+        """
+        if not self._purges_backups(inst):
+            return ()
+        args = [inst_dir]
+        since = inst._backup_purge_since(inst.instance_backup_dst)
+        if since:
+            args.append(since)
+        return ((
+            PURGE_LABEL,
+            self.run_script("backup_purge.sh", args),
+            {
+                "stop_on_failure": True,
+                "continue_on": (PURGE_EXIT_ALREADY_EMPTY,),
+            },
+        ),)
+
+    def _purges_backups(self, inst):
+        """Whether this run empties the instance's duplicity prefix (``_purge_step``).
+
+        :param inst: the ``cloud.instance``
+        :rtype: bool
+        """
+        return self._backups_are_ours_to_touch(inst) and not self._keeps_the_record()
+
+    def _purge_prefixes(self, inst):
+        """Every prefix this run empties before the teardown.
+
+        The duplicity chain's, as the panel knows it
+        (``instance_backup_dst``), when ``_purge_step`` runs, and the
+        addons' (``cloud.instance._teardown_purge_prefixes``), only when
+        this run ends the instance's life here, as their steps do.
+
+        :param inst: the ``cloud.instance``, which exists
+        :return: the prefixes
+        :rtype: list
+        """
+        if not self._owns_instance_lifecycle:
+            return []
+        prefixes = []
+        if self._purges_backups(inst) and inst.instance_backup_dst:
+            prefixes.append(inst.instance_backup_dst)
+        prefixes += inst._teardown_purge_prefixes(self._keeps_the_record())
+        return prefixes
+
+    def _refuse_shared_prefix(self, inst):
+        """Refuse a delete whose purge would reach another's copies.
+
+        The delete empties each prefix whole, or only what was stored
+        since the instance was created when an archived instance of the
+        same name holds the same one (``_backup_purge_since``): one that is
+        a destination's path or holds another instance's copies
+        (``cloud.instance._backup_prefix_conflict``), written before the
+        other instance existed or before the check, would take them with
+        it. Fails closed before the first step; ``on_abort`` raises the
+        alert and the instance stays as it was, to be corrected.
+
+        :param inst: the ``cloud.instance``, which exists
+        :raises BackupPrefixRefused: naming the prefix and what it reaches
+        """
+        for prefix in self._purge_prefixes(inst):
+            refusal = inst._backup_prefix_refusal(prefix)
+            if refusal:
+                raise BackupPrefixRefused(refusal)
+
+    def _addon_teardown_steps(self, inst, inst_dir):
+        """Return what addons run before the teardown (see the model hook).
+
+        Only when this run ends the instance's life here: a move's cleanup
+        tears down a copy of an instance that lives on, whose addon state
+        (a continuous archive, say) is still its own.
+        """
+        if not self._owns_instance_lifecycle:
+            return ()
+        return tuple(inst._teardown_pre_steps(inst_dir, self._keeps_the_record()))
+
+    def _step_exit_status(self, results, label):
+        """Return *label*'s exit code, or None if that step did not run."""
+        data = (results or {}).get(label)
+        return data.get("exit_status") if data else None
+
+    def _purge_exit_status(self, results):
+        """Return the purge step's exit code, or None if it did not run."""
+        return self._step_exit_status(results, PURGE_LABEL)
+
+    # ── AbstractSSHExecutor hooks ──────────────────────────────────────────
+
+    async def before_execute(self, transport):
+        """Enter 'deleting' now that the host answered.
+
+        Written on its own cursor so the state is visible to everything
+        else (a second Delete, a deploy) while the teardown runs;
+        ``on_failure`` puts it back to 'deployed' if the teardown fails.
+        Skipped when the instance is already 'deleting', so re-running a
+        job that died mid-teardown is not rejected by the transition map.
+
+        Refused first, the state untouched, when a purge would reach
+        another's copies (``_refuse_shared_prefix``).
+
+        :raises BackupPrefixRefused: before anything ran
+        """
+        inst = self._inst()
+        if not self._owns_instance_lifecycle or not inst:
+            return
+        if inst.exists() and not inst.removal_finalized:
+            self._refuse_shared_prefix(inst)
+        with self._durable_env() as env:
+            fresh = env["cloud.instance"].browse(inst.id)
+            if fresh.exists() and fresh.state == "deployed":
+                fresh._transition("deleting")
+
+    def get_commands(self):
+        inst = self._inst()
+        if not inst.exists() or inst.removal_finalized:
+            # Nothing left to tear down: an earlier attempt already
+            # finished — and either unlinked the record, or marked it
+            # ``removal_finalized`` with the unlink still owed (it runs
+            # after the job commits, and a rollback drops it). This job
+            # is running again because its own transaction lost a
+            # serialization race and queue_job re-queued it — not
+            # because the teardown failed. ``on_success`` commits on its
+            # own cursor, so the remote work survived that rollback;
+            # re-running has to be a no-op or a completed removal
+            # reports as failed and raises an alert for a host that is
+            # already clean.
+            #
+            # An archived instance still exists, is not marked, and
+            # still has its directory on the host, so it goes down the
+            # normal path below.
+            self._sys("Instance already removed from the host; nothing to do.")
+            return []
+        return self._teardown_commands(inst)
+
+    def _teardown_commands(self, inst):
+        """Return the teardown of the instance's copy on this job's host.
+
+        Backups and addon steps first when this run ends the instance's
+        life (``_owns_instance_lifecycle``), then the containers, the log
+        rotation and the directory.
+
+        :param inst: the ``cloud.instance``, which exists
+        :return: the commands, as ``get_commands`` returns them
+        """
+        d = self._inst_dir(inst)
+        return [
+            *self._archive_step(inst, d),
+            *self._purge_step(inst, d),
+            *self._addon_teardown_steps(inst, d),
+            # 1. Shut down containers (the script skips a missing dir)
+            (
+                "Stop and remove containers",
+                self.run_script("compose_op.sh", [d, "down"]),
+            ),
+            # 2. Drop the host's logrotate config for this instance.
+            #    The logs themselves go with the directory below; a
+            #    leftover config would point at a path that no longer
+            #    exists and make logrotate complain nightly forever.
+            (
+                "Remove log rotation config",
+                self.run_script("instance_logs.sh", [
+                    "remove", inst.doodba_project_name,
+                ]),
+            ),
+            # 3. Remove the instance directory (idempotent). Left inline
+            #    on purpose: a lone ``rm -rf`` is not an operation worth
+            #    a versioned script. The path is quoted but for its
+            #    leading ``~/``, written ``"$HOME"/`` so the remote
+            #    shell still resolves the home and nothing else.
+            (
+                "Remove instance directory",
+                "rm -rf " + (
+                    '"$HOME"/' + shlex.quote(d[2:]) if d.startswith("~/")
+                    else shlex.quote(d)
+                ),
+            ),
+            # 4. Empty Docker's build cache and drop the images no
+            #    container uses any more, the instance's own among them,
+            #    as the daily prune would. Never fails the teardown.
+            ("Empty the Docker build cache", build_cache_prune()),
+        ]
+
+    def parse_results(self, results):
+        """Fail-closed like the base, except for "already empty".
+
+        The purge answers 10 when the prefix held nothing. That is not a
+        failure to recover from: the invariant it defends — no objects
+        left over from an instance that no longer exists — is already
+        satisfied, and refusing to continue would make an instance whose
+        bucket someone emptied by hand impossible to delete.
+        """
+        if self._purge_exit_status(results) == PURGE_EXIT_ALREADY_EMPTY:
+            results = {
+                label: data for label, data in results.items()
+                if label != PURGE_LABEL
+            }
+        return super().parse_results(results)
+
+    def _purge_alert_targets(self):
+        """Alert codes this executor owns, for raising and resolving.
+
+        Both families are cleared on any clean run: an instance that
+        failed to archive and is later deleted (or the reverse) should
+        not keep the older complaint lit.
+        """
+        return [
+            code
+            for table in (PURGE_ALERT_BY_EXIT, ARCHIVE_ALERT_BY_EXIT)
+            for code, _msg in table.values()
+        ]
+
+    async def on_success(self, results):
+        inst = self._inst()
+        if not inst:
+            # Record already gone: a re-run after the job's transaction
+            # lost a genuine race. The run that did the work finalised
+            # the record and refreshed the host's labels; doing either
+            # again would queue a second identical playbook (the first is
+            # ``started`` by now, so it cannot be collapsed onto) and log
+            # a removal this run did not perform. Until 1.0.127 this was
+            # every successful delete, not a rare race: the unlink itself
+            # was what made the transaction lose (see
+            # ``_unlink_after_job_commit``).
+            return
+        if inst.removal_finalized:
+            # The first run tore the host down and marked the record, but
+            # its deferred unlink went with the rolled-back transaction.
+            # Arm it again and touch nothing else: the host is clean and
+            # its labels were refreshed by that run.
+            self._unlink_after_job_commit(inst, sudo=True)
+            return
+        # A clean run closes whatever a previous attempt complained
+        # about; leaving them lit would keep an operator chasing a
+        # problem that is already gone. With the host they were raised
+        # with (``_alert_on_purge_failure``): an alert's identity
+        # includes it, and without it none was ever found (11-oct-2026).
+        Alert = self.env["cloud.alert"].sudo()
+        for code in self._purge_alert_targets():
+            Alert.resolve_alert(code, host=self._host(), instance=inst)
+        self._sys(f"✓ Instance '{inst.name}' removed from host.")
+        if self._owns_instance_lifecycle:
+            # What an addon's step could not do and let the delete go on
+            # without: the person reading the log is told here, and the
+            # addon alerts (``cloud.instance._teardown_pre_steps_left``).
+            for left in self._teardown_left(inst, results):
+                self._sys(f"⚠ {left}")
+        host = inst.host_id
+        keep = self._keeps_the_record()
+        # The unlink is the one thing the hook must not do itself: it
+        # would cascade onto this job's row and cost the job its commit.
+        # It runs as the platform, as the archiving does: this delete was
+        # held, when it was asked for, to what waited then, and what was
+        # asked for since waits on an instance being removed
+        # (``cloud.job._check_may_end_waiting``).
+        inst._finalize_removal(keep, unlink=False)
+        if not keep:
+            self._unlink_after_job_commit(inst, sudo=True)
+        if host:
+            host.refresh_observability_labels(reason="instance removed")
+
+    def _teardown_left(self, inst, results):
+        """Ask the addons what their steps left, never at the delete's cost.
+
+        The host is clean by now: an addon's report that fails must not
+        make the delete fail with it (``on_abort`` would put an instance
+        whose stack is gone back to 'deployed'). Asked in a savepoint, so
+        what it wrote before failing goes with it; the failure is logged
+        and written in the job's log.
+
+        :param inst: the deleted ``cloud.instance``
+        :param dict results: what the steps answered
+        :return: one message per thing left behind
+        :rtype: list
+        """
+        try:
+            with inst.env.cr.savepoint():
+                return list(inst._teardown_pre_steps_left(results, self.job))
+        except Exception as exc:  # noqa: BLE001 — logged, never fatal
+            _logger.exception(
+                "delete of %s: reporting what its steps left failed",
+                inst.name,
+            )
+            return [
+                "Could not tell what the delete's steps left behind "
+                f"({type(exc).__name__}: {exc}); see the server log.",
+            ]
+
+    async def on_failure(self, results, errors):
+        """Report the failure, and put the instance back out of 'deleting'.
+
+        Only for a run that owns the instance's lifecycle: a teardown of a
+        copy of an instance that lives on elsewhere — the half-built
+        destination of a rolled-back move — moved nothing, and its record
+        is the live instance's, which must not be marked in error for it.
+        Its ``parse_results`` never fails, but it reaches this hook all
+        the same: cancelled during its teardown, and through ``on_abort``
+        — it gave up because the cutover already completed, or its
+        ``on_success`` raised — while the instance is in 'deleting'.
+
+        :param dict results: what the steps answered
+        :param list errors: why the run failed
+        """
+        for err in errors:
+            self._sys(f"✗ {err}")
+        inst = self._inst()
+        if inst and self._owns_instance_lifecycle:
+            self._alert_on_purge_failure(results, inst)
+            inst.write({"status": "error"})
+            # The teardown failed, so the instance is still on the host:
+            # back to 'deployed' rather than stuck in 'deleting'.
+            if inst.state == "deleting":
+                inst._transition("deployed")
+
+    async def on_abort(self, exc):
+        """Close a run that ended before its steps, by the instance's state.
+
+        ``before_execute`` moves the instance to 'deleting', and only
+        ``on_failure`` puts it back: stopped after that and before the
+        first step — a person cancelled it, the connection dropped — it
+        stayed there for good. A run that ended before ``before_execute``
+        — refused, no connection — left the instance as it was: a live
+        one, ``deployed``, is not marked in error, and the failure is only
+        written to the log (6-nov-2026). A teardown of a copy of an
+        instance that lives on only writes it to the log too
+        (``on_failure``). The state is read on the hook's durable cursor,
+        which sees what ``before_execute`` committed.
+
+        A purge refused (``BackupPrefixRefused``) raises the purge's alert
+        with the reason: the instance stays, and a person has to correct
+        a backup path before it can be deleted.
+
+        :param Exception exc: what stopped the run
+        """
+        error = f"{type(exc).__name__}: {exc}"
+        inst = self._inst()
+        if inst and inst.state == "deleting":
+            await self.on_failure({}, [error])
+        else:
+            self._sys(f"✗ {error}")
+        if inst and isinstance(exc, BackupPrefixRefused):
+            self.env["cloud.alert"].sudo().raise_alert(
+                PURGE_ALERT_BY_EXIT[22][0],
+                f"{exc} The instance '{inst.name}' was not deleted.",
+                level="warning",
+                host=self._host(),
+                instance=inst,
+                job=self.job,
+            )
+
+    def _alert_on_purge_failure(self, results, inst):
+        """Raise the alert that names why the backups could not be cleared.
+
+        A single "delete failed" would send the operator to the job log
+        every time. Each code here has a different fix, so each gets its
+        own message and its own dedup key.
+
+        Classified from the script's exit code alone. Reading duplicity's
+        or boto's wording would look more precise and age badly: the day
+        either changes its phrasing every diagnosis silently becomes the
+        catch-all, and nothing fails to announce it.
+        """
+        code_message = PURGE_ALERT_BY_EXIT.get(
+            self._step_exit_status(results, PURGE_LABEL)
+        ) or ARCHIVE_ALERT_BY_EXIT.get(
+            self._step_exit_status(results, ARCHIVE_LABEL)
+        )
+        if not code_message:
+            # Neither backup step is what failed — the teardown did.
+            return
+        code, template = code_message
+        self.env["cloud.alert"].sudo().raise_alert(
+            code,
+            template % {"name": inst.name},
+            level="warning",
+            host=self._host(),
+            instance=inst,
+            job=self.job,
+        )
+        self._sys(
+            "The instance was NOT deleted: its backups are still in the "
+            "storage, and removing it now would strand them there with "
+            "nothing able to reach them. Fix the cause above and delete "
+            "again."
+        )

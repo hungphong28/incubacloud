@@ -1,0 +1,177 @@
+---
+# Tear a host down: stop the metrics agents and the shared Traefik
+# reverse proxy and remove their directories, then take the panel's own
+# access off the server: its key, and the operator account and sudo
+# grant hardening made for it (files/remove_panel_access.sh says when
+# each one stays). Driven by DeleteHostExecutor, which hands the
+# panel's key and the operator account's name; the executor archives
+# the cloud.host record afterwards.
+#
+# Idempotent: a host whose agents or Traefik were never deployed (or
+# already removed) converges without error, so a half-finished teardown
+# can be re-run safely.
+- name: Tear down a cloud host
+  hosts: all
+  gather_facts: true
+
+  vars:
+    traefik_dir: "{{ ansible_env.HOME }}/traefik"
+    # Where host_observability.yml installs the metrics agents, and root's
+    # database collector with its schedule.
+    ic_obs_dir: "{{ ansible_env.HOME }}/observability"
+    ic_lib_dir: /usr/local/lib/incubacloud
+    ic_pg_cron_file: /etc/cron.d/incubacloud-collect-pg
+    # Where Full Setup installs the guard on the proxy network.
+    ic_shared_guard_dir: /usr/local/lib/incubacloud-shared-guard
+
+  tasks:
+    # The metrics agents go first. Left running, a host the panel no
+    # longer knows keeps pushing with this panel's credential, and the
+    # series the panel deletes for it are recreated by the next scrape —
+    # on a machine that outlives its record (a BYOH server) for ever.
+    - name: Check whether the metrics agents are deployed
+      ansible.builtin.stat:
+        path: "{{ ic_obs_dir }}/docker-compose.yaml"
+      register: ic_agents_compose
+
+    - name: Stop the metrics agents
+      # With their volumes: vmagent's queue, and Fluent Bit's cursors and
+      # buffer, which root owns and the connecting user could not remove.
+      ansible.builtin.command:
+        cmd: docker compose -p incubacloud-observability -f docker-compose.yaml down --volumes
+        chdir: "{{ ic_obs_dir }}"
+      when: ic_agents_compose.stat.exists
+      changed_when: true
+
+    - name: Look for cron
+      # Debian 13 ships without it, and the cron module fails without
+      # crontab even to remove an entry: a server set up before the
+      # agents' install put cron in failed its whole teardown. Without
+      # cron there is no schedule to remove, and the log says so.
+      ansible.builtin.stat:
+        path: /usr/bin/crontab
+      register: ic_crontab
+
+    - name: Remove the disk usage collector
+      when: ic_crontab.stat.exists
+      ansible.builtin.cron:
+        name: "incubacloud instance disk usage"
+        state: absent
+
+    - name: Say there is no schedule to remove
+      when: not ic_crontab.stat.exists
+      ansible.builtin.debug:
+        msg: "cron is not installed: there is no scheduled task to remove."
+
+    # Root's: the user's crontab above does not hold it. Looked for
+    # first, so a host where it never ran needs no sudo here.
+    - name: Look for the database collector
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ ic_pg_cron_file }}"
+        - "{{ ic_lib_dir }}"
+      register: ic_pg_collector_files
+
+    - name: Remove the database collector
+      # A sudo that no longer works must not stop the removal of the
+      # host: what is left is said in the job's log.
+      when: ic_pg_collector_files.results | selectattr('stat.exists') | list | length > 0
+      block:
+        - name: Remove the database collector, its schedule first
+          become: "{{ ansible_user_id != 'root' }}"
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ ic_pg_cron_file }}"
+            - "{{ ic_lib_dir }}"
+      rescue:
+        - name: Say the database collector was left on the server
+          ansible.builtin.debug:
+            msg: >-
+              The database collector could not be removed
+              ({{ (ansible_failed_result.msg | default('') | string)[:300] }}).
+              Remove {{ ic_pg_cron_file }} and {{ ic_lib_dir }} as root on
+              this server.
+
+    - name: Remove the agents' directory
+      # It holds this panel's metrics credential in clear.
+      ansible.builtin.file:
+        path: "{{ ic_obs_dir }}"
+        state: absent
+
+    # Before the proxy goes: Full Setup's guard on its network
+    # (scripts/shared_guard.sh), whose timer would otherwise keep running
+    # every minute on a server the panel no longer knows.
+    - name: Look for the guard on the proxy network
+      ansible.builtin.stat:
+        path: "{{ ic_shared_guard_dir }}/shared_guard.sh"
+      register: ic_shared_guard
+
+    - name: Remove the guard on the proxy network
+      when: ic_shared_guard.stat.exists
+      block:
+        - name: Remove the guard's timer, rules and files
+          become: "{{ ansible_user_id != 'root' }}"
+          ansible.builtin.command:
+            cmd: bash {{ ic_shared_guard_dir }}/shared_guard.sh uninstall
+          changed_when: true
+      rescue:
+        - name: Say the guard was left on the server
+          ansible.builtin.debug:
+            msg: >-
+              The guard on the proxy network could not be removed
+              ({{ (ansible_failed_result.msg | default('') | string)[:300] }}).
+              Run "bash {{ ic_shared_guard_dir }}/shared_guard.sh uninstall"
+              as root on this server.
+
+    - name: Check whether Traefik is deployed
+      ansible.builtin.stat:
+        path: "{{ traefik_dir }}/inverseproxy.yaml"
+      register: ic_traefik_compose
+
+    - name: Stop the Traefik stack
+      ansible.builtin.command:
+        cmd: docker compose -p inverseproxy -f inverseproxy.yaml down
+        chdir: "{{ traefik_dir }}"
+      when: ic_traefik_compose.stat.exists
+      changed_when: true
+
+    - name: Remove the Traefik directory
+      ansible.builtin.file:
+        path: "{{ traefik_dir }}"
+        state: absent
+
+    # Last: it takes away the access this play runs on. Root, the other
+    # accounts and keys, and sshd's configuration are left as they are.
+    - name: Take the panel's access off the server
+      block:
+        - name: Remove the panel's key, operator account and sudo grant
+          become: "{{ ansible_user_id != 'root' }}"
+          vars:
+            # One SSH session runs the whole step, and nothing is left to
+            # clean up afterwards through a login that no longer works.
+            ansible_pipelining: true
+          ansible.builtin.shell:
+            cmd: "{{ lookup('ansible.builtin.file', 'remove_panel_access.sh') }}"
+            executable: /bin/bash
+          environment:
+            IC_PANEL_KEY: "{{ ic_panel_key | default('') }}"
+            IC_CONNECT_USER: "{{ ansible_user_id }}"
+            IC_OPERATOR_USER: "{{ ic_operator_user | default('') }}"
+          register: ic_panel_access
+          changed_when: "'Removed' in ic_panel_access.stdout"
+
+        - name: Say what was done with the panel's access
+          ansible.builtin.debug:
+            msg: "{{ ic_panel_access.stdout_lines }}"
+      rescue:
+        - name: Say the panel's access was left on the server
+          ansible.builtin.debug:
+            msg: >-
+              The panel's access could not be taken off the server
+              ({{ (ansible_failed_result.msg | default('') | string)[:300] }}).
+              As root on this server, remove the panel's key from the
+              authorized_keys of {{ ansible_user_id }} and of root, and
+              /etc/sudoers.d/incubacloud-system.

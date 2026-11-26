@@ -1,0 +1,2305 @@
+"""
+Tier 2 — ORM integration tests for cloud.host.
+Verifies Traefik template defaults, required fields, and the
+``_release_external_resources`` lifecycle hook fired before a host
+is archived or unlinked.
+"""
+
+import asyncio
+import os
+import shutil
+import subprocess
+import tempfile
+from contextlib import contextmanager
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
+
+import asyncssh
+import werkzeug.wrappers
+from asyncssh.misc import _ACMWrapper
+
+from odoo import http
+from odoo.exceptions import AccessError, UserError, ValidationError
+from odoo.tests.common import TransactionCase, new_test_user, tagged
+from odoo.tools import config
+
+from odoo.addons.incubacloud.models.cloud_host import CloudHost
+from odoo.addons.incubacloud.models.host_hardening_executor import (
+    HostHardeningExecutor,
+)
+from odoo.addons.incubacloud.net import real_ip
+
+from ._certs import make_pair
+from .test_backup_backend_sftp_host_key import _empty_client_key_home
+from .test_cloud_job import _run_after_commit
+
+
+class TestCloudHostTraefikDefaults(TransactionCase):
+    def setUp(self):
+        super().setUp()
+        self.Host = self.env["cloud.host"]
+
+    def _create(self, **kw):
+        return self.Host.create(
+            {
+                "name": "Test Host",
+                "ip_address": "10.0.0.1",
+                "user": "ubuntu",
+                "wildcard_domain": "example.com",
+            }
+            | kw
+        )
+
+    def test_create_applies_defaults(self):
+        """Host without traefik fields gets templates."""
+        host = self._create()
+        self.assertTrue(host.traefik_config_yml)
+        self.assertTrue(host.traefik_inverseproxy_yaml)
+        self.assertTrue(host.traefik_yml)
+
+    def test_create_preserves_explicit(self):
+        """Explicit traefik fields are not overwritten."""
+        custom = "# custom config"
+        host = self._create(traefik_config_yml=custom)
+        self.assertEqual(host.traefik_config_yml, custom)
+
+    def test_create_empty_string_gets_defaults(self):
+        """Empty strings from frontend get replaced."""
+        host = self._create(
+            traefik_config_yml="",
+            traefik_inverseproxy_yaml="",
+            traefik_yml="",
+        )
+        self.assertTrue(host.traefik_config_yml)
+        self.assertTrue(host.traefik_inverseproxy_yaml)
+        self.assertTrue(host.traefik_yml)
+
+    def test_defaults_contain_traefik(self):
+        """Templates contain recognizable Traefik config."""
+        host = self._create()
+        self.assertIn("traefik", host.traefik_yml.lower())
+        self.assertIn(
+            "traefik",
+            host.traefik_inverseproxy_yaml.lower(),
+        )
+
+    def test_defaults_acme_storage_is_persistent(self):
+        """ACME storage must point at the mounted ``acme`` volume, not a
+        relative path (which Traefik would write to the container's
+        ephemeral FS, losing certs on every recreate)."""
+        host = self._create()
+        self.assertIn(
+            'storage: "/etc/traefik/acme/acme.json"',
+            host.traefik_yml,
+        )
+        self.assertNotIn('storage: "acme.json"', host.traefik_yml)
+
+
+class TestCloudHostReleaseHook(TransactionCase):
+    """The ``_release_external_resources`` hook must fire on every
+    transition that disables or removes a host so derived modules
+    can release attached external resources without having to
+    override write/unlink themselves."""
+
+    def setUp(self):
+        super().setUp()
+        self.Host = self.env["cloud.host"]
+        self.host = self.Host.create(
+            {
+                "name": "Hook Target",
+                "ip_address": "10.0.0.2",
+                "user": "ubuntu",
+                "wildcard_domain": "example.com",
+            }
+        )
+
+    def test_hook_is_noop_by_default(self):
+        """Default implementation must be a no-op so installs without
+        any extension keep working unchanged."""
+        result = self.host._release_external_resources()
+        self.assertIsNone(result)
+
+    def test_write_active_false_calls_hook(self):
+        """Archiving an active host triggers the hook before super()."""
+        with patch.object(
+            type(self.host),
+            "_release_external_resources",
+            autospec=True,
+        ) as hook:
+            self.host.write({"active": False})
+        hook.assert_called_once()
+        called_with = hook.call_args.args[0]
+        self.assertEqual(called_with, self.host)
+
+    def test_write_active_true_does_not_call_hook(self):
+        """Re-activating a host must not fire the release hook."""
+        self.host.write({"active": False})
+        with patch.object(
+            type(self.host),
+            "_release_external_resources",
+            autospec=True,
+        ) as hook:
+            self.host.write({"active": True})
+        hook.assert_not_called()
+
+    def test_write_other_field_does_not_call_hook(self):
+        """Writing unrelated fields keeps the hook untouched."""
+        with patch.object(
+            type(self.host),
+            "_release_external_resources",
+            autospec=True,
+        ) as hook:
+            self.host.write({"name": "Renamed"})
+        hook.assert_not_called()
+
+    def test_write_active_false_skips_already_inactive(self):
+        """Already-inactive hosts inside the recordset are excluded
+        from the hook call — only the transitioning ones get released."""
+        inactive = self.Host.create(
+            {
+                "name": "Already off",
+                "ip_address": "10.0.0.3",
+                "user": "ubuntu",
+                "wildcard_domain": "example.com",
+                "active": False,
+            }
+        )
+        recordset = self.host | inactive
+        with patch.object(
+            type(self.host),
+            "_release_external_resources",
+            autospec=True,
+        ) as hook:
+            recordset.write({"active": False})
+        hook.assert_called_once()
+        called_with = hook.call_args.args[0]
+        self.assertEqual(called_with, self.host)
+        self.assertNotIn(inactive, called_with)
+
+    def test_unlink_calls_hook(self):
+        """Unlinking a host fires the hook before super().unlink()."""
+        with patch.object(
+            type(self.host),
+            "_release_external_resources",
+            autospec=True,
+        ) as hook:
+            self.host.unlink()
+        hook.assert_called_once()
+
+
+# Note: the ``/cloud/delete_host`` route is a one-line branch on top of
+# the model-level ``write/unlink`` covered above — calling it from a
+# bare TransactionCase requires faking the full ``odoo.http.request``
+# proxy, which is more plumbing than the branch is worth. The
+# end-to-end behaviour is checked by hand; if that ever changes, an
+# ``HttpCase`` test with authentication is the right tool.
+
+
+class TestCloudHostRBACGates(TransactionCase):
+    """Security regression suite: the lifecycle hook reorganisation
+    must not weaken any existing manager-role gate on
+    ``cloud.host.write``, ``cloud.host.unlink`` or the
+    ``/cloud/delete_host`` route. A non-manager who lands a stray
+    call on any of those paths must still get an ``AccessError``."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Some optional addons add NOT NULL columns to res_partner
+        # without server defaults — ``new_test_user`` then trips them
+        # at partner-create. Mirror the workaround used by the wider
+        # security suite so this file stays self-contained.
+        cls.env.cr.execute("""
+            SELECT column_name, data_type
+              FROM information_schema.columns
+             WHERE table_name = 'res_partner'
+               AND is_nullable = 'NO'
+               AND column_default IS NULL
+               AND column_name NOT IN ('id', 'name', 'company_type',
+                                       'type', 'lang', 'active',
+                                       'create_uid', 'write_uid',
+                                       'create_date', 'write_date')
+        """)
+        for col, dtype in cls.env.cr.fetchall():
+            default = "''" if "char" in dtype or "text" in dtype else "'no'"
+            cls.env.cr.execute(
+                f'ALTER TABLE res_partner ALTER COLUMN "{col}" SET DEFAULT {default}'
+            )
+
+    def setUp(self):
+        super().setUp()
+        self.consultant = new_test_user(
+            self.env,
+            login="host_rbac_consultant",
+            groups="base.group_user,incubacloud.group_cloud_consultant",
+        )
+        self.host = self.env["cloud.host"].create(
+            {
+                "name": "Gate Target",
+                "ip_address": "10.0.0.60",
+                "user": "ubuntu",
+                "wildcard_domain": "example.com",
+            }
+        )
+
+    def test_non_manager_cannot_archive(self):
+        with self.assertRaises(AccessError):
+            self.host.with_user(self.consultant).write({"active": False})
+        self.assertTrue(self.host.exists())
+        self.assertTrue(self.host.active)
+
+    def test_non_manager_cannot_unlink(self):
+        with self.assertRaises(AccessError):
+            self.host.with_user(self.consultant).unlink()
+        self.assertTrue(self.host.exists())
+
+    def test_archive_writes_audit_entry(self):
+        """``active`` is in ``_AUDIT_TRACKED_FIELDS`` — archive
+        transitions must keep generating a Config-changed audit entry
+        after the hook reorganisation."""
+        before = self.env["cloud.audit.log"].search_count(
+            [
+                ("host_id", "=", self.host.id),
+                ("action", "=", "Config changed"),
+            ]
+        )
+        self.host.write({"active": False})
+        after = self.env["cloud.audit.log"].search_count(
+            [
+                ("host_id", "=", self.host.id),
+                ("action", "=", "Config changed"),
+            ]
+        )
+        self.assertEqual(after - before, 1)
+
+    def test_unlink_writes_audit_entry(self):
+        """``unlink`` leaves a ``Host deleted`` row in the audit log
+        (``host_id`` is ``ondelete='set null'``, so the entry survives
+        the host going away)."""
+        host_name = self.host.name
+        before = self.env["cloud.audit.log"].search_count(
+            [
+                ("action", "=", "Host deleted"),
+                ("details", "=", host_name),
+            ]
+        )
+        self.host.unlink()
+        after = self.env["cloud.audit.log"].search_count(
+            [
+                ("action", "=", "Host deleted"),
+                ("details", "=", host_name),
+            ]
+        )
+        self.assertEqual(after - before, 1)
+
+
+class TestCloudDeleteHostRoute(TransactionCase):
+    """``/cloud/delete_host`` no-traefik branch must choose between
+    ``unlink`` (truly empty host) and ``archive`` (host with job
+    history) so the ``cloud.job.host_id`` FK doesn't trip when a host
+    accumulates a job before Traefik is deployed.
+
+    Concrete trigger that motivated the branch: on-demand VPS chain
+    (a layer's server provisioning → ``host_hardening`` → ``full_setup``) — the
+    provision job succeeds and lands on ``cloud.job`` but the chain
+    breaks before Traefik is deployed, so ``host.traefik_deployed`` is
+    still False while ``cloud_job_count >= 1``. The old ``unlink``
+    branch then violated the FK and the user got the Odoo "Another
+    model is using the record …" pop-up.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Same NOT NULL workaround the wider security suite uses so the
+        # manager test user can be created without tripping on optional
+        # res_partner columns added by side modules.
+        cls.env.cr.execute("""
+            SELECT column_name, data_type
+              FROM information_schema.columns
+             WHERE table_name = 'res_partner'
+               AND is_nullable = 'NO'
+               AND column_default IS NULL
+               AND column_name NOT IN ('id', 'name', 'company_type',
+                                       'type', 'lang', 'active',
+                                       'create_uid', 'write_uid',
+                                       'create_date', 'write_date')
+        """)
+        for col, dtype in cls.env.cr.fetchall():
+            default = "''" if "char" in dtype or "text" in dtype else "'no'"
+            cls.env.cr.execute(
+                f'ALTER TABLE res_partner ALTER COLUMN "{col}" SET DEFAULT {default}'
+            )
+
+    def setUp(self):
+        super().setUp()
+        self.manager = new_test_user(
+            self.env,
+            login="host_delete_manager",
+            groups="base.group_user,incubacloud.group_cloud_manager",
+        )
+        self.host = self.env["cloud.host"].create(
+            {
+                "name": "Delete Target",
+                "ip_address": "10.0.0.99",
+                "user": "ubuntu",
+                "wildcard_domain": "delete.example.com",
+            }
+        )
+        # Ensure the precondition the no-traefik branch reacts to.
+        # ``traefik_deployed`` defaults to False but we make the
+        # assumption explicit so a future model change can't silently
+        # invalidate the tests.
+        self.assertFalse(self.host.traefik_deployed)
+
+    def _invoke_delete(self, host_id):
+        """Drive ``cloud_delete_host`` against the test cursor.
+
+        The route reads ``odoo.http.request`` for env + httprequest; we
+        patch the module-level proxy with a ``MagicMock`` spec'd
+        against the real ``http.Request`` class so any access outside
+        the API surface fails loudly (per project policy on mocks).
+        """
+        from odoo.addons.incubacloud.controllers import data_load
+        from odoo.addons.incubacloud.controllers._data_load import (
+            _routes_crud,
+        )
+
+        fake_request = MagicMock(spec=http.Request)
+        # Spec'd against the real class so any access outside the
+        # documented API surface fails loudly. The route plus the
+        # RBAC helper only touch ``request.env``; if a future change
+        # starts reading another attribute, this mock raises
+        # ``AttributeError`` and the test points the way.
+        fake_request.env = self.env(user=self.manager)
+        # CrudMixin's ``self._sec()`` and ``request.env`` lookups
+        # resolve via ``odoo.http.request``, the werkzeug LocalProxy.
+        # Patch the proxy globally so the resolution through
+        # ``data_load.request`` and ``_routes_crud.request`` (each its
+        # own module-local import) both land on the fake.
+        ctrl = data_load.CloudDataLoadController()
+        with (
+            patch.object(http, "request", fake_request),
+            patch.object(data_load, "request", fake_request),
+            patch.object(_routes_crud, "request", fake_request),
+        ):
+            return ctrl.cloud_delete_host(host_id)
+
+    def test_empty_host_no_traefik_is_unlinked(self):
+        """Truly-empty host (no jobs, no Traefik) takes the unlink
+        fast path — same behaviour as before the F-branch fix."""
+        host_id = self.host.id
+        result = self._invoke_delete(host_id)
+        self.assertEqual(result, {"ok": True})
+        self.assertFalse(
+            self.env["cloud.host"].browse(host_id).exists(),
+            "Empty host must be unlinked, not archived.",
+        )
+
+    def test_host_with_jobs_is_archived_and_preserves_jobs(self):
+        """Host carrying any ``cloud.job`` row must be archived (not
+        unlinked) so the FK stays valid and the job history survives.
+
+        This is the regression for the on-demand VPS path where
+        a layer's server provisioning succeeded but ``host_hardening`` +
+        ``full_setup`` never ran.
+        """
+        job_type = self.env["cloud.job.type"].sudo().search([], limit=1)
+        self.assertTrue(
+            job_type,
+            "At least one cloud.job.type must be seeded by the module.",
+        )
+        job = (
+            self.env["cloud.job"]
+            .sudo()
+            .create(
+                {
+                    "name": "historic provision",
+                    "host_id": self.host.id,
+                    "job_type_id": job_type.id,
+                }
+            )
+        )
+
+        host_id = self.host.id
+        result = self._invoke_delete(host_id)
+        self.assertEqual(result, {"ok": True})
+
+        # Host survived the call …
+        survivor = self.env["cloud.host"].browse(host_id)
+        self.assertTrue(survivor.exists())
+        # … and is archived (active=False), matching the deployed
+        # branch's semantics so the SPA hides it from the host list.
+        self.assertFalse(survivor.active)
+        # Job history is preserved verbatim — the whole point of the
+        # archive path over the FK-violating unlink path.
+        self.assertTrue(job.exists())
+        self.assertEqual(job.host_id, survivor)
+
+    def _reached(self, **vals):
+        """Make the host one the panel logged in to: a trusted server key
+        and the credentials of its login type.
+
+        :param vals: other values to write
+        """
+        self.host.sudo().write({
+            "known_hosts_key": "10.0.0.99 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake",
+            "login_type": "ssh_key",
+            "key_file": "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n",
+        } | vals)
+
+    def _teardowns(self):
+        """Return the ``delete_host`` jobs queued for the host."""
+        return self.env["cloud.job"].sudo().search([
+            ("host_id", "=", self.host.id),
+            ("job_type_id.code", "=", "delete_host"),
+        ])
+
+    def test_a_server_the_panel_reached_is_torn_down_without_a_proxy(self):
+        """A hardening whose Full Setup failed left the operator account,
+        its sudo grant and the panel's key on the server, and the host was
+        archived with all of it there (16-nov-2026): the teardown runs."""
+        self._reached()
+        self.assertTrue(self.host._teardown_reaches_server())
+        result = self._invoke_delete(self.host.id)
+        teardown = self._teardowns()
+        self.assertEqual(result, {"job_id": teardown.id})
+        self.assertEqual(len(teardown), 1)
+        # Archived by the job, not by the route.
+        self.assertTrue(self.host.active)
+
+    def test_a_server_it_cannot_log_in_to_goes_at_once(self):
+        """A trusted key with no credential, or a password this panel's
+        server has no sshpass for: the playbook could not log in."""
+        from odoo.addons.incubacloud.models import cloud_host
+
+        self._reached(key_file=False)
+        self.assertFalse(self.host._teardown_reaches_server())
+        with patch.object(
+            cloud_host, "_sshpass_available", autospec=True, return_value=True,
+        ):
+            self._reached(login_type="password", password="secret")
+            self.assertTrue(self.host._teardown_reaches_server())
+        with patch.object(
+            cloud_host, "_sshpass_available", autospec=True, return_value=False,
+        ):
+            self.assertFalse(self.host._teardown_reaches_server())
+            host_id = self.host.id
+            self.assertEqual(self._invoke_delete(host_id), {"ok": True})
+        self.assertFalse(self._teardowns())
+        self.assertFalse(self.env["cloud.host"].browse(host_id).exists())
+
+    def test_a_server_never_reached_is_not_torn_down(self):
+        """No trusted key: the panel never logged in there."""
+        self.assertFalse(self.host._teardown_reaches_server())
+        self.host.sudo().write({
+            "login_type": "ssh_key",
+            "key_file": "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n",
+        })
+        self.assertFalse(self.host._teardown_reaches_server())
+
+
+class TestSshReadyDomain(TransactionCase):
+    """``_ssh_ready_domain`` is the shared gate that ``cron_collect_metrics``
+    and the prune cron use to skip hosts whose SSH layer cannot connect yet
+    (no captured host key, missing credentials for the declared login_type).
+    Without this filter the crons would spawn jobs that fail synchronously
+    in ``ssh_connect_kwargs()`` and pollute the operator's log feed."""
+
+    def setUp(self):
+        super().setUp()
+        self.Host = self.env["cloud.host"]
+
+    def _create(self, **kw):
+        # ``password`` is required on cloud.host, so every host has one even
+        # when login_type='ssh_key'. We blank it explicitly per-test for the
+        # password-path cases via SQL since the ORM field is required.
+        return self.Host.create(
+            {
+                "name": kw.pop("name", "SSH Ready Probe"),
+                "ip_address": "10.0.0.42",
+                "user": "ubuntu",
+                "wildcard_domain": "example.com",
+                "password": "pw-default",
+                "known_hosts_key": "ssh-ed25519 AAAA... fake",
+                "login_type": "ssh_key",
+                "key_file": "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n",
+            }
+            | kw
+        )
+
+    def _search_ready(self, *extra_domain):
+        domain = self.Host._ssh_ready_domain()
+        if extra_domain:
+            domain = list(domain) + list(extra_domain)
+        return self.Host.search(domain)
+
+    def test_complete_ssh_key_host_is_ready(self):
+        host = self._create(name="Complete SSH Key")
+        self.assertIn(host, self._search_ready(("name", "=", "Complete SSH Key")))
+
+    def test_complete_password_host_is_ready(self):
+        host = self._create(
+            name="Complete Password", login_type="password", key_file=False
+        )
+        self.assertIn(host, self._search_ready(("name", "=", "Complete Password")))
+
+    def test_missing_known_hosts_key_is_excluded(self):
+        host = self._create(name="Untrusted Host", known_hosts_key=False)
+        self.assertNotIn(host, self._search_ready(("name", "=", "Untrusted Host")))
+
+    def test_ssh_key_host_without_key_file_is_excluded(self):
+        host = self._create(name="SSH Key Missing Key", key_file=False)
+        self.assertNotIn(
+            host,
+            self._search_ready(("name", "=", "SSH Key Missing Key")),
+        )
+
+
+class TestSshReadyCronsAsCronBot(TransactionCase):
+    """The crons that pick the hosts to reach run as the cron bot, which is
+    not a system administrator, and ``_ssh_ready_domain`` looks at the SSH
+    credentials, which only a system administrator reads (1.0.215): the
+    choice is made elevated, and the jobs are queued as before."""
+
+    def setUp(self):
+        super().setUp()
+        self.bot = self.env.ref("incubacloud.user_incubacloud_cron")
+        Host = self.env["cloud.host"]
+        common = {
+            "ip_address": "10.0.0.43",
+            "user": "ubuntu",
+            "wildcard_domain": "example.com",
+            "password": "pw-default",
+            "known_hosts_key": "ssh-ed25519 AAAA... fake",
+            "login_type": "ssh_key",
+            "key_file": "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n",
+        }
+        self.key_host = Host.create(common | {"name": "Cron Bot Key Host"})
+        self.password_host = Host.create(
+            common | {
+                "name": "Cron Bot Password Host",
+                "login_type": "password",
+                "key_file": False,
+            },
+        )
+        self.keyless_host = Host.create(
+            common | {"name": "Cron Bot Keyless Host", "key_file": False},
+        )
+        # What the creation cached must not stand in for the bot's reads.
+        self.env.invalidate_all()
+
+    def _run_cron(self, xmlid, method):
+        """Run a cron's method as the user the cron runs as.
+
+        :param str xmlid: the ``ir.cron`` record
+        :param str method: the ``cloud.host`` method the cron calls
+        :return: the ``enqueue`` mock, called with the job model first
+        """
+        cron = self.env.ref(xmlid)
+        self.assertEqual(cron.user_id, self.bot)
+        with patch.object(
+            type(self.env["cloud.job"]), "enqueue", autospec=True,
+        ) as enqueue:
+            getattr(self.env["cloud.host"].with_user(cron.user_id), method)()
+        return enqueue
+
+    def _queued_host_ids(self, enqueue):
+        """Return the ids of the hosts *enqueue* was called for."""
+        return {call.args[1] for call in enqueue.call_args_list}
+
+    def test_the_bot_does_not_read_the_credentials(self):
+        """The restriction stays: the bot cannot filter by a credential."""
+        with self.assertRaises(AccessError):
+            self.env["cloud.host"].with_user(self.bot).search(
+                [("key_file", "!=", False)],
+            )
+
+    def test_metrics_cron_queues_the_ready_hosts(self):
+        enqueue = self._run_cron(
+            "incubacloud.cron_collect_host_metrics", "cron_collect_metrics",
+        )
+        queued = self._queued_host_ids(enqueue)
+        self.assertIn(self.key_host.id, queued)
+        self.assertIn(self.password_host.id, queued)
+        self.assertNotIn(self.keyless_host.id, queued)
+        # Queued as the bot, not elevated: the job runs as its author.
+        job_env = enqueue.call_args_list[0].args[0].env
+        self.assertEqual(job_env.uid, self.bot.id)
+        self.assertFalse(job_env.su)
+
+    def test_prune_cron_queues_the_ready_hosts(self):
+        (self.key_host | self.password_host | self.keyless_host).write(
+            {"traefik_deployed": True},
+        )
+        enqueue = self._run_cron(
+            "incubacloud.cron_docker_prune", "cron_docker_prune",
+        )
+        queued = self._queued_host_ids(enqueue)
+        self.assertIn(self.key_host.id, queued)
+        self.assertIn(self.password_host.id, queued)
+        self.assertNotIn(self.keyless_host.id, queued)
+        self.assertEqual(
+            enqueue.call_args_list[0].args[0].env.uid, self.bot.id,
+        )
+
+    def test_prune_cron_skips_a_server_full_setup_has_not_set_up(self):
+        """A server added but not set up has no Docker: nothing to prune.
+
+        Its prune failed on the missing ``docker`` every night and raised
+        an alert (18-nov-2026); it is left out until Full Setup ends.
+        """
+        self.key_host.traefik_deployed = True
+        enqueue = self._run_cron(
+            "incubacloud.cron_docker_prune", "cron_docker_prune",
+        )
+        queued = self._queued_host_ids(enqueue)
+        self.assertIn(self.key_host.id, queued)
+        self.assertNotIn(self.password_host.id, queued)
+
+
+class TestSshConnectKwargsTimeouts(TransactionCase):
+    """A dead/unreachable host must fail fast instead of hanging a job
+    forever — ``connect_timeout``/``login_timeout`` bound both phases
+    of ``asyncssh.connect()``."""
+
+    def setUp(self):
+        super().setUp()
+        self.Host = self.env["cloud.host"]
+
+    def _create(self, **kw):
+        return self.Host.create(
+            {
+                "name": "Timeout Probe",
+                "ip_address": "10.0.0.42",
+                "user": "ubuntu",
+                "wildcard_domain": "example.com",
+                "password": "pw-default",
+                "known_hosts_key": "ssh-ed25519 AAAA... fake",
+                "login_type": "password",
+            }
+            | kw
+        )
+
+    def test_connect_kwargs_sets_timeouts(self):
+        kwargs = self._create().ssh_connect_kwargs()
+        self.assertEqual(kwargs["connect_timeout"], 30)
+        self.assertEqual(kwargs["login_timeout"], 30)
+
+    # NOTE: ``ip_address``, ``user`` and ``password`` are required=True on
+    # cloud.host (NOT NULL at the DB level). Their corresponding clauses
+    # in ``_ssh_ready_domain`` (``('ip_address', '!=', False)`` etc.) are
+    # defensive belt-and-suspenders against a future field that drops
+    # required=True or a row inserted out-of-band — there is no way to
+    # construct a recordset that violates these constraints from a test
+    # without raising at create/write/SQL time, so they are not covered
+    # here.
+
+
+class TestBuildPortForwardCmd(TransactionCase):
+    """The ssh -L local port-forward primitive used by the Traefik panel."""
+
+    def _host(self, **kw):
+        return self.env["cloud.host"].create(
+            {
+                "name": "pf-host",
+                "ip_address": "10.0.0.42",
+                "user": "root",
+                "wildcard_domain": "example.com",
+            }
+            | kw
+        )
+
+    def test_builds_a_loopback_forward_on_the_default_port(self):
+        cmd = self._host().build_port_forward_cmd(8080)
+        self.assertEqual(
+            cmd, "ssh -N -L 8080:127.0.0.1:8080 root@10.0.0.42",
+        )
+
+    def test_includes_a_non_default_ssh_port(self):
+        cmd = self._host(port=2222).build_port_forward_cmd(8080)
+        self.assertIn("-p 2222", cmd)
+
+    def test_remote_host_and_port_can_differ(self):
+        cmd = self._host().build_port_forward_cmd(
+            9000, remote_host="10.1.2.3", remote_port=5432,
+        )
+        self.assertIn("-L 9000:10.1.2.3:5432", cmd)
+
+    def test_a_host_without_an_ip_is_refused(self):
+        from odoo.exceptions import UserError
+
+        host = self._host()
+        # required=True at the ORM layer, so blank it out of band.
+        self.env.cr.execute(
+            "UPDATE cloud_host SET ip_address = '' WHERE id = %s", (host.id,),
+        )
+        host.invalidate_recordset(["ip_address"])
+        with self.assertRaises(UserError):
+            host.build_port_forward_cmd(8080)
+
+
+class KnownHostsCase(TransactionCase):
+    """Shared fixture: a trusted host carrying real key material.
+
+    The key is generated rather than faked because one of the tests below
+    hands the stored line to ``ssh-keygen``, which parses the blob.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.key_body = (
+            asyncssh.generate_private_key("ssh-ed25519")
+            .export_public_key("openssh")
+            .decode()
+            .strip()
+        )
+
+    def _host(self, **kw):
+        return self.env["cloud.host"].create(
+            {
+                "name": "kh-host",
+                "ip_address": "10.0.0.7",
+                "user": "ubuntu",
+                "wildcard_domain": "example.com",
+                "password": "pw",
+                "login_type": "password",
+                "known_hosts_key": f"10.0.0.7 {self.key_body}",
+            }
+            | kw
+        )
+
+    def _capture(self, host, server_key=None):
+        """Run ``_capture_known_host_key`` against a stubbed SSH server.
+
+        Only the transport is stubbed: the key handed back is a real
+        asyncssh key object, so the entry and its fingerprint are built
+        by the same code path production uses. Pass *server_key* to make
+        two captures look like two different machines.
+        """
+        server_key = server_key or asyncssh.generate_private_key("ssh-ed25519")
+        conn = MagicMock(spec=asyncssh.SSHClientConnection)
+        conn.get_server_host_key.return_value = server_key
+        # ``asyncssh.connect()`` hands back an _ACMWrapper, so the double is
+        # spec'd against that: a bare MagicMock would also answer to a
+        # protocol asyncssh does not implement.
+        connection = MagicMock(spec=_ACMWrapper)
+        connection.__aenter__.return_value = conn
+        connection.__aexit__.return_value = False
+        with patch.object(asyncssh, "connect", return_value=connection):
+            return host._capture_known_host_key()
+
+    def _audit_details(self, host, action):
+        return self.env["cloud.audit.log"].search(
+            [("host_id", "=", host.id), ("action", "=", action)],
+            order="id desc",
+        ).mapped("details")
+
+
+class TestKnownHostsFingerprint(KnownHostsCase):
+    """The fingerprint is the host's identity in a form a human can
+    compare. It has to match what ``ssh-keygen -lf`` prints, or it is
+    worthless for comparing against anything outside this panel."""
+
+    def test_fingerprint_matches_ssh_keygen(self):
+        """Ground truth: the same key, fingerprinted by OpenSSH's own tool."""
+        self.assertTrue(
+            shutil.which("ssh-keygen"),
+            "ssh-keygen is needed: install openssh-client (the CI does)",
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".pub") as fh:
+            fh.write(self.key_body + "\n")
+            fh.flush()
+            printed = subprocess.run(
+                ["ssh-keygen", "-lf", fh.name],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        expected = next(
+            token for token in printed.split() if token.startswith("SHA256:")
+        )
+        self.assertEqual(self._host().known_hosts_fingerprint, expected)
+
+    def test_fingerprint_reads_the_key_blob_not_the_key_type(self):
+        """The regression this replaces: reading the wrong field yielded
+        something undecodable, so the fingerprint was silently dropped."""
+        host = self._host()
+        self.assertTrue(host.known_hosts_fingerprint.startswith("SHA256:"))
+        self.assertGreater(len(host.known_hosts_fingerprint), len("SHA256:"))
+
+    def test_fingerprint_is_empty_without_a_key(self):
+        self.assertFalse(self._host(known_hosts_key=False).known_hosts_fingerprint)
+
+    def test_fingerprint_ignores_comments_and_blank_lines(self):
+        host = self._host(
+            known_hosts_key=f"# a comment\n\n10.0.0.7 {self.key_body}",
+        )
+        self.assertEqual(
+            host.known_hosts_fingerprint, self._host().known_hosts_fingerprint,
+        )
+
+    def test_fingerprint_of_an_undecodable_entry_is_empty(self):
+        host = self._host(known_hosts_key="10.0.0.7 ssh-rsa not-base64!!")
+        self.assertFalse(host.known_hosts_fingerprint)
+
+    def test_fingerprint_survives_a_relabel(self):
+        """Relabelling must not disturb identity — same machine, same
+        fingerprint, whatever address the key is filed under."""
+        host = self._host(port=22626)
+        before = host.known_hosts_fingerprint
+        host._relabel_known_hosts_entry()
+        self.assertEqual(host.known_hosts_fingerprint, before)
+
+
+class TestKnownHostsLabel(KnownHostsCase):
+    """``known_hosts_key`` feeds two SSH stacks with different lookup
+    rules: asyncssh (executors, terminal) matches a bare ``ip`` entry on
+    any port, while OpenSSH (every Ansible-backed job) files a
+    non-default port under ``[ip]:port`` and reads the bare form as port
+    22 only. A label that drifts from the endpoint therefore keeps
+    working everywhere *except* under OpenSSH — which is how a trusted,
+    reachable host became unreachable for the recurring prune job."""
+
+    def test_prefix_is_bare_on_the_default_port(self):
+        self.assertEqual(
+            self.env["cloud.host"]._known_hosts_prefix("10.0.0.7", 22),
+            "10.0.0.7",
+        )
+
+    def test_prefix_is_bracketed_on_a_rotated_port(self):
+        self.assertEqual(
+            self.env["cloud.host"]._known_hosts_prefix("10.0.0.7", 22626),
+            "[10.0.0.7]:22626",
+        )
+
+    def test_relabel_refiles_a_bare_entry_under_the_rotated_port(self):
+        host = self._host(port=22626)
+        host._relabel_known_hosts_entry()
+        self.assertEqual(
+            host.known_hosts_key, f"[10.0.0.7]:22626 {self.key_body}",
+        )
+
+    def test_relabel_leaves_the_key_material_untouched(self):
+        """Relabelling must never alter trust, only the address the key is
+        filed under — otherwise it could hand a host a key nobody verified
+        for it."""
+        host = self._host(port=22626)
+        host._relabel_known_hosts_entry()
+        self.assertEqual(
+            host.known_hosts_key.split(None, 1)[1], self.key_body,
+        )
+
+    def test_relabel_is_idempotent(self):
+        host = self._host(
+            port=22626, known_hosts_key=f"[10.0.0.7]:22626 {self.key_body}",
+        )
+        host._relabel_known_hosts_entry()
+        host._relabel_known_hosts_entry()
+        self.assertEqual(
+            host.known_hosts_key, f"[10.0.0.7]:22626 {self.key_body}",
+        )
+
+    def test_relabel_restores_the_bare_form_on_the_default_port(self):
+        host = self._host(
+            port=22, known_hosts_key=f"[10.0.0.7]:22626 {self.key_body}",
+        )
+        host._relabel_known_hosts_entry()
+        self.assertEqual(host.known_hosts_key, f"10.0.0.7 {self.key_body}")
+
+    def test_relabel_follows_a_changed_ip(self):
+        host = self._host(port=22626)
+        host.known_hosts_key = f"[10.0.0.99]:22626 {self.key_body}"
+        host._relabel_known_hosts_entry()
+        self.assertEqual(
+            host.known_hosts_key, f"[10.0.0.7]:22626 {self.key_body}",
+        )
+
+    def test_relabel_without_a_stored_key_is_a_noop(self):
+        host = self._host(port=22626, known_hosts_key=False)
+        host._relabel_known_hosts_entry()
+        self.assertFalse(host.known_hosts_key)
+
+    def _openssh_finds(self, entry, lookup):
+        """Return True when ``ssh-keygen`` locates *lookup* in *entry*."""
+        with tempfile.NamedTemporaryFile("w", suffix="_known_hosts") as fh:
+            fh.write(entry + "\n")
+            fh.flush()
+            return subprocess.run(
+                ["ssh-keygen", "-F", lookup, "-f", fh.name],
+                capture_output=True,
+                check=False,
+            ).returncode == 0
+
+    def test_openssh_only_finds_the_entry_once_it_is_relabelled(self):
+        """Ground truth, asked of OpenSSH itself: its lookup rule — not
+        asyncssh's laxer one — is what the Ansible-backed jobs obey, and
+        it is the rule the stored label has to satisfy."""
+        self.assertTrue(
+            shutil.which("ssh-keygen"),
+            "ssh-keygen is needed: install openssh-client (the CI does)",
+        )
+        host = self._host(port=22626)
+        self.assertFalse(
+            self._openssh_finds(host.known_hosts_key, "[10.0.0.7]:22626"),
+            "a bare label must not resolve on a rotated port — if it did, "
+            "the bug this guards against could not happen",
+        )
+        host._relabel_known_hosts_entry()
+        self.assertTrue(
+            self._openssh_finds(host.known_hosts_key, "[10.0.0.7]:22626"),
+        )
+
+    def test_asyncssh_accepts_both_labels_on_the_rotated_port(self):
+        """Pins *why* the stale label went unnoticed for months: the
+        asyncssh-based executors and terminal match either form, so they
+        kept connecting while OpenSSH refused."""
+        host = self._host(port=22626)
+        bare = asyncssh.import_known_hosts(host.known_hosts_key)
+        host._relabel_known_hosts_entry()
+        bracketed = asyncssh.import_known_hosts(host.known_hosts_key)
+        for known_hosts in (bare, bracketed):
+            self.assertTrue(
+                known_hosts.match("10.0.0.7", "10.0.0.7", 22626)[0],
+            )
+
+
+class TestEndpointChangeRevokesTrust(KnownHostsCase):
+    """An endpoint change drops the captured key: it was verified against
+    the old address, so it says nothing about whatever answers at the new
+    one. A host without a key is skipped by every cron and refuses to
+    build SSH kwargs, so the revocation is announced through the alert
+    channels instead of only an audit row nobody reads."""
+
+    def _active_alerts(self, host):
+        return self.env["cloud.alert"].search(
+            [
+                ("code", "=", "host_key_revoked"),
+                ("host_id", "=", host.id),
+                ("state", "=", "active"),
+            ]
+        )
+
+    def test_changing_the_port_revokes_and_alerts(self):
+        host = self._host()
+        host.write({"port": 22626})
+        self.assertFalse(host.known_hosts_key)
+        alert = self._active_alerts(host)
+        self.assertEqual(len(alert), 1)
+        self.assertEqual(alert.level, "critical")
+
+    def test_changing_the_ip_revokes_and_alerts(self):
+        host = self._host()
+        host.write({"ip_address": "10.0.0.8"})
+        self.assertFalse(host.known_hosts_key)
+        self.assertEqual(len(self._active_alerts(host)), 1)
+
+    def test_the_alert_is_deduped_across_repeated_changes(self):
+        host = self._host()
+        host.write({"port": 22626})
+        host.known_hosts_key = f"[10.0.0.7]:22626 {self.key_body}"
+        host.write({"port": 22627})
+        self.assertEqual(len(self._active_alerts(host)), 1)
+
+    def test_a_replacement_key_in_the_same_write_keeps_trust(self):
+        """A manager importing a known-good key for the new endpoint is
+        not a revocation."""
+        host = self._host()
+        host.write(
+            {
+                "port": 22626,
+                "known_hosts_key": f"[10.0.0.7]:22626 {self.key_body}",
+            }
+        )
+        self.assertTrue(host.known_hosts_key)
+        self.assertFalse(self._active_alerts(host))
+
+    def test_an_untrusted_host_has_nothing_to_revoke(self):
+        host = self._host(known_hosts_key=False)
+        host.write({"port": 22626})
+        self.assertFalse(self._active_alerts(host))
+
+    def test_a_non_endpoint_write_keeps_trust(self):
+        host = self._host()
+        host.write({"name": "Renamed"})
+        self.assertTrue(host.known_hosts_key)
+        self.assertFalse(self._active_alerts(host))
+
+    def test_rewriting_the_same_endpoint_is_not_a_change(self):
+        host = self._host()
+        host.write({"ip_address": host.ip_address, "port": host.port})
+        self.assertTrue(host.known_hosts_key)
+        self.assertFalse(self._active_alerts(host))
+
+    def test_recapturing_the_key_resolves_the_alert(self):
+        """Re-running TOFU is the operator action the alert asks for, so
+        it has to close the alert as well as restore the key — otherwise
+        the panel keeps showing a resolved incident forever."""
+        host = self._host()
+        host.write({"port": 22626})
+        self.assertTrue(self._active_alerts(host))
+
+        captured = self._capture(host)
+
+        self.assertTrue(captured["entry"].startswith("[10.0.0.7]:22626 "))
+        self.assertEqual(host.known_hosts_key, captured["entry"])
+        self.assertFalse(self._active_alerts(host))
+
+    def test_revoking_records_the_fingerprint_it_dropped(self):
+        """Without the old fingerprint there is nothing to compare the next
+        capture against, and the machine-identity question is unanswerable."""
+        host = self._host()
+        dropped = host.known_hosts_fingerprint
+        host.write({"port": 22626})
+        self.assertFalse(host.known_hosts_key)
+        self.assertEqual(host.revoked_key_fingerprint, dropped)
+
+    def test_the_alert_names_the_revoked_fingerprint(self):
+        host = self._host()
+        dropped = host.known_hosts_fingerprint
+        host.write({"port": 22626})
+        self.assertIn(dropped, self._active_alerts(host).message)
+
+    def test_the_revocation_audit_row_carries_the_fingerprint(self):
+        host = self._host()
+        dropped = host.known_hosts_fingerprint
+        host.write({"port": 22626})
+        self.assertIn(
+            dropped,
+            self._audit_details(
+                host, "SSH host key invalidated due to endpoint change",
+            ),
+        )
+
+
+class TestRefusedKeyRevokesTrust(KnownHostsCase):
+    """A server that no longer presents the trusted key is refused by
+    asyncssh before any credential is sent — and before #89 that was all:
+    every job and cron on the host failed with ``HostKeyNotVerifiable``
+    and nothing told anyone why. A server restored from an image,
+    reinstalled or replaced comes back with new keys, so the refusal is
+    now handled like an endpoint change: the key is revoked with its
+    fingerprint kept for the next capture to compare, and the alert says
+    what happened and what to do."""
+
+    def setUp(self):
+        super().setUp()
+        # The revocation is written on a cursor of its own, which has to
+        # see this test's host.
+        self.registry_enter_test_mode()
+
+    def _alerts(self, host, code="host_key_revoked"):
+        return self.env["cloud.alert"].search(
+            [
+                ("code", "=", code),
+                ("host_id", "=", host.id),
+                ("state", "=", "active"),
+            ]
+        )
+
+    def _connect(self, host, refuse_on_connect=True):
+        """Open ``get_transport`` against a stubbed SSH server.
+
+        :param host: the ``cloud.host`` to connect to
+        :param refuse_on_connect: True to have the key exchange refuse the
+            stored key; False to connect and have the session's body raise
+            the same error, as a nested connection to another host would
+        :returns: the exception ``get_transport`` raised
+        """
+        refusal = asyncssh.HostKeyNotVerifiable(
+            "Host key is not trusted for host 10.0.0.7",
+        )
+
+        def enter(*_args):
+            if refuse_on_connect:
+                raise refusal
+            return MagicMock(spec=asyncssh.SSHClientConnection)
+
+        connection = MagicMock(spec=_ACMWrapper)
+        connection.__aenter__.side_effect = enter
+        connection.__aexit__.return_value = False
+
+        async def _open():
+            async with host.get_transport():
+                if not refuse_on_connect:
+                    raise refusal
+
+        # Not ``assertRaises``: Odoo's rolls its savepoint back when the
+        # exception comes, and with it what the refusal wrote.
+        caught = None
+        with patch.object(asyncssh, "connect", return_value=connection):
+            try:
+                asyncio.run(_open())
+            except asyncssh.HostKeyNotVerifiable as exc:
+                caught = exc
+        self.assertIsNotNone(caught)
+        host.invalidate_recordset()
+        return caught
+
+    def test_a_refused_key_is_revoked_with_its_fingerprint(self):
+        host = self._host()
+        trusted = host.known_hosts_fingerprint
+        self._connect(host)
+        self.assertFalse(host.known_hosts_key)
+        self.assertEqual(host.revoked_key_fingerprint, trusted)
+
+    def test_a_refused_key_raises_a_critical_alert_saying_why(self):
+        host = self._host()
+        trusted = host.known_hosts_fingerprint
+        self._connect(host)
+        alert = self._alerts(host)
+        self.assertEqual(len(alert), 1)
+        self.assertEqual(alert.level, "critical")
+        self.assertIn(trusted, alert.message)
+        self.assertIn("restored", alert.message)
+        self.assertIn("Trust SSH Key", alert.message)
+
+    def test_the_job_is_told_what_happened_and_what_to_do(self):
+        """Still a ``HostKeyNotVerifiable``, so whatever already catches
+        that (or ``asyncssh.Error``) keeps working; its words are the
+        panel's instead of asyncssh's."""
+        host = self._host()
+        exc = self._connect(host)
+        message = str(exc)
+        self.assertIn("kh-host", message)
+        self.assertIn("restored", message)
+        self.assertIn("Trust SSH Key", message)
+        self.assertNotIn("Host key is not trusted", message)
+
+    def test_the_refusal_is_audited_with_the_fingerprint(self):
+        host = self._host()
+        trusted = host.known_hosts_fingerprint
+        self._connect(host)
+        details = self._audit_details(
+            host, "SSH host key revoked: the server presented another key",
+        )
+        self.assertEqual(details, [trusted])
+
+    def test_a_key_trusted_meanwhile_is_kept(self):
+        """Only the key the refused connection checked is revoked: one a
+        person trusted while it was being opened says nothing wrong."""
+        host = self._host()
+        current = host.known_hosts_key
+        other = asyncssh.generate_private_key("ssh-ed25519")
+        checked = (
+            f"10.0.0.7 {other.export_public_key('openssh').decode().strip()}"
+        )
+        exc = host._revoke_refused_host_key(checked)
+        host.invalidate_recordset()
+        self.assertIsInstance(exc, asyncssh.HostKeyNotVerifiable)
+        self.assertEqual(host.known_hosts_key, current)
+        self.assertFalse(self._alerts(host))
+
+    def test_a_refusal_inside_the_session_is_not_this_hosts(self):
+        """A job that opens a second host's connection inside this one's
+        session (a restore from another server) must not revoke this
+        host's key when the other one is refused."""
+        host = self._host()
+        exc = self._connect(host, refuse_on_connect=False)
+        self.assertTrue(host.known_hosts_key)
+        self.assertFalse(self._alerts(host))
+        self.assertIn("Host key is not trusted", str(exc))
+
+    def test_trusting_again_reports_the_new_machine(self):
+        """The way out: Trust SSH Key closes the revocation and, the key
+        being another one, raises the critical change a person confirms."""
+        host = self._host()
+        trusted = host.known_hosts_fingerprint
+        self._connect(host)
+
+        captured = self._capture(host)
+
+        self.assertTrue(captured["changed"])
+        self.assertEqual(captured["previous_fingerprint"], trusted)
+        self.assertFalse(self._alerts(host))
+        self.assertTrue(self._alerts(host, code="host_key_changed"))
+
+
+class TestKeyIdentityOnRecapture(KnownHostsCase):
+    """Comparing the newly captured key against the one the endpoint change
+    revoked is the only machine-identity check that does not depend on an
+    external channel — and our provider offers none (no console output, no
+    metadata carrying host keys). So the comparison has to be made, recorded
+    and surfaced, not left implicit."""
+
+    def _changed_alerts(self, host):
+        return self.env["cloud.alert"].search(
+            [
+                ("code", "=", "host_key_changed"),
+                ("host_id", "=", host.id),
+                ("state", "=", "active"),
+            ]
+        )
+
+    def _revoke(self, host):
+        """Change the endpoint so the key is revoked, and return its key."""
+        key = asyncssh.generate_private_key("ssh-ed25519")
+        entry = f"10.0.0.7 {key.export_public_key('openssh').decode().strip()}"
+        host.known_hosts_key = entry
+        fingerprint = host.known_hosts_fingerprint
+        host.write({"port": 22626})
+        self.assertEqual(host.revoked_key_fingerprint, fingerprint)
+        return key, fingerprint
+
+    def test_the_same_machine_reports_an_unchanged_key(self):
+        host = self._host()
+        key, fingerprint = self._revoke(host)
+
+        captured = self._capture(host, server_key=key)
+
+        self.assertFalse(captured["changed"])
+        self.assertEqual(captured["fingerprint"], fingerprint)
+        self.assertEqual(captured["previous_fingerprint"], fingerprint)
+        self.assertFalse(self._changed_alerts(host))
+
+    def test_a_different_machine_raises_a_critical_alert(self):
+        host = self._host()
+        _key, old_fingerprint = self._revoke(host)
+
+        captured = self._capture(host)  # a freshly generated, different key
+
+        self.assertTrue(captured["changed"])
+        self.assertNotEqual(captured["fingerprint"], old_fingerprint)
+        alert = self._changed_alerts(host)
+        self.assertEqual(len(alert), 1)
+        self.assertEqual(alert.level, "critical")
+        # Both fingerprints, or the operator cannot tell what changed to what.
+        self.assertIn(old_fingerprint, alert.message)
+        self.assertIn(captured["fingerprint"], alert.message)
+
+    def test_the_new_key_is_still_trusted_after_a_change(self):
+        """The operator asked for a capture, so the key is stored; the alert
+        is what makes the change impossible to miss. Refusing instead would
+        strand every job on a legitimately rebuilt host."""
+        host = self._host()
+        self._revoke(host)
+        captured = self._capture(host)
+        self.assertEqual(host.known_hosts_key, captured["entry"])
+
+    def test_the_comparison_is_consumed_once(self):
+        """A stale fingerprint would make the *next* capture report a verdict
+        about a machine two endpoint changes ago."""
+        host = self._host()
+        key, _fingerprint = self._revoke(host)
+        self._capture(host, server_key=key)
+        self.assertFalse(host.revoked_key_fingerprint)
+
+        second = self._capture(host)
+        self.assertFalse(second["changed"])
+        self.assertFalse(second["previous_fingerprint"])
+
+    def test_a_first_capture_has_nothing_to_compare(self):
+        host = self._host(known_hosts_key=False)
+        captured = self._capture(host)
+        self.assertFalse(captured["changed"])
+        self.assertFalse(captured["previous_fingerprint"])
+        self.assertTrue(captured["fingerprint"].startswith("SHA256:"))
+        self.assertFalse(self._changed_alerts(host))
+
+    def test_each_capture_is_judged_against_the_last_trusted_key(self):
+        """The comparison is always against what was trusted immediately
+        before, so going back to an older key is itself a change — the alert
+        tracks continuity, not a whitelist of keys ever seen."""
+        host = self._host()
+        original, _fingerprint = self._revoke(host)
+        replacement = self._capture(host)["fingerprint"]  # rebuilt machine
+
+        host.write({"port": 22627})
+        back_to_original = self._capture(host, server_key=original)
+
+        self.assertTrue(back_to_original["changed"])
+        self.assertEqual(back_to_original["previous_fingerprint"], replacement)
+
+    def test_a_change_alert_waits_for_a_human_to_dismiss_it(self):
+        """Unlike the revocation alert, this one records that the machine's
+        identity changed once — a past event, not a live condition. A routine
+        re-trust must not retire it unread, or whoever caused the change could
+        erase the warning by triggering one."""
+        host = self._host()
+        self._revoke(host)
+        replacement = asyncssh.generate_private_key("ssh-ed25519")
+        self._capture(host, server_key=replacement)  # different machine → alert
+        self.assertTrue(self._changed_alerts(host))
+
+        # A later capture confirming continuity: the same machine that is
+        # trusted right now, so nothing is wrong any more…
+        host.write({"port": 22628})
+        confirmed = self._capture(host, server_key=replacement)
+        self.assertFalse(confirmed["changed"])
+
+        # …and the earlier identity change is still flagged for a human.
+        self.assertTrue(self._changed_alerts(host))
+
+    def test_the_capture_is_audited_with_its_verdict(self):
+        host = self._host()
+        key, _fingerprint = self._revoke(host)
+        self._capture(host, server_key=key)
+        details = self._audit_details(host, "SSH host key trusted")
+        self.assertTrue(details)
+        self.assertIn("unchanged", details[0])
+
+
+class TestHardeningKeepsTheKeyReachable(KnownHostsCase):
+    """Hardening rotates the SSH port of the *same* machine, so it opts
+    out of the revocation above (re-running TOFU would trade a verified
+    key for a blind capture) and re-files the key instead. Losing that
+    relabel is what left every hardened host unreachable for the
+    Ansible-backed jobs."""
+
+    def _run_on_success(self, host):
+        executor = object.__new__(HostHardeningExecutor)
+        executor.job = MagicMock(spec=type(self.env["cloud.job"]))
+        executor.job.host_id = host
+        executor.env = self.env
+        executor._log_buffer = []
+        # What the playbook exported: nothing here.
+        executor._facts = {}
+        with patch.object(HostHardeningExecutor, "_sys"), patch.object(
+            HostHardeningExecutor, "_resolve_alert",
+        ), patch.object(
+            HostHardeningExecutor,
+            "_open_edge_firewall_port",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            HostHardeningExecutor,
+            "_finalize_disable_root",
+            new=AsyncMock(return_value=True),
+        ):
+            asyncio.run(executor.on_success({}))
+        return executor
+
+    def test_on_success_refiles_the_key_under_the_rotated_port(self):
+        host = self._host(port=22)
+        executor = self._run_on_success(host)
+        self.assertEqual(host.port, executor._new_port)
+        self.assertEqual(
+            host.known_hosts_key,
+            f"[10.0.0.7]:{executor._new_port} {self.key_body}",
+        )
+
+    def test_hardening_does_not_revoke_or_alert(self):
+        host = self._host(port=22)
+        self._run_on_success(host)
+        self.assertTrue(host.known_hosts_key)
+        self.assertFalse(
+            self.env["cloud.alert"].search(
+                [
+                    ("code", "=", "host_key_revoked"),
+                    ("host_id", "=", host.id),
+                ]
+            )
+        )
+
+
+class TestHostDefaultCertificate(TransactionCase):
+    """A host's default certificate is refused where somebody can still
+    see what they pasted: a half pair or a key from another certificate
+    makes Traefik answer every handshake with a throwaway certificate."""
+
+    def setUp(self):
+        super().setUp()
+        self.cert, self.key = make_pair()
+        self.host = self.env["cloud.host"].create({
+            "name": "cert-host",
+            "ip_address": "198.51.100.9",
+            "user": "root",
+            "wildcard_domain": "example.test",
+        })
+
+    def test_a_matching_pair_is_stored(self):
+        self.host.write({
+            "tls_default_cert": self.cert, "tls_default_key": self.key,
+        })
+        self.assertEqual(
+            self.host._effective_tls_default(), (self.cert, self.key),
+        )
+
+    def test_a_half_pair_is_refused(self):
+        with self.assertRaises(ValidationError):
+            self.host.write({"tls_default_cert": self.cert})
+            self.env.flush_all()
+
+    def test_a_key_from_another_certificate_is_refused(self):
+        _cert, other_key = make_pair(issuer="Other CA")
+        with self.assertRaises(ValidationError):
+            self.host.write({
+                "tls_default_cert": self.cert, "tls_default_key": other_key,
+            })
+            self.env.flush_all()
+
+    def test_an_empty_key_on_save_keeps_the_stored_one(self):
+        """The panel never echoes the key, so empty means untouched."""
+        self.host.write({
+            "tls_default_cert": self.cert, "tls_default_key": self.key,
+        })
+        self.host.write({
+            "tls_default_cert": self.cert, "tls_default_key": "",
+        })
+        self.assertEqual(self.host._effective_tls_default()[1], self.key)
+
+    def test_clearing_the_certificate_clears_the_key_too(self):
+        self.host.write({
+            "tls_default_cert": self.cert, "tls_default_key": self.key,
+        })
+        self.host.write({"tls_default_cert": ""})
+        self.assertEqual(self.host._effective_tls_default(), ("", ""))
+
+
+class TestSaveHostCertificateRoute(TestCloudDeleteHostRoute):
+    """The host page loads and saves the default certificate. The key is
+    write-only: the read says whether one is stored, never what it is.
+
+    Reuses the parent's manager user, host and NOT NULL workaround; the
+    loader collects only the tests declared here, not the inherited ones.
+    """
+
+    def _call(self, method, **kwargs):
+        """Drive a CRUD route against the test cursor as the manager."""
+        from odoo.addons.incubacloud.controllers import data_load
+        from odoo.addons.incubacloud.controllers._data_load import (
+            _routes_crud,
+        )
+
+        fake_request = MagicMock(spec=http.Request)
+        fake_request.env = self.env(user=self.manager)
+        ctrl = data_load.CloudDataLoadController()
+        with (
+            patch.object(http, "request", fake_request),
+            patch.object(data_load, "request", fake_request),
+            patch.object(_routes_crud, "request", fake_request),
+        ):
+            return getattr(ctrl, method)(**kwargs)
+
+    def test_save_stores_the_pair(self):
+        cert, key = make_pair()
+        self._call("cloud_save_host", host_id=self.host.id, vals={
+            "tls_default_cert": cert, "tls_default_key": key,
+        })
+        self.assertEqual(self.host._effective_tls_default(), (cert, key))
+
+    def test_save_with_an_empty_key_keeps_the_stored_one(self):
+        cert, key = make_pair()
+        self.host.write({"tls_default_cert": cert, "tls_default_key": key})
+        self._call("cloud_save_host", host_id=self.host.id, vals={
+            "tls_default_cert": cert, "tls_default_key": "",
+        })
+        self.assertEqual(self.host._effective_tls_default()[1], key)
+
+    def test_read_describes_the_certificate_and_never_returns_the_key(self):
+        cert, key = make_pair(["example.test", "*.example.test"])
+        self.host.write({"tls_default_cert": cert, "tls_default_key": key})
+        data = self._call("cloud_get_host", host_id=self.host.id)
+        self.assertEqual(data["tls_default_cert"], cert)
+        self.assertTrue(data["has_tls_default_key"])
+        self.assertEqual(
+            data["tls_default_info"]["hostnames"],
+            ["example.test", "*.example.test"],
+        )
+        self.assertNotIn("tls_default_key", data)
+        self.assertNotIn(key, repr(data))
+
+
+class TestDefaultCertificateKeyStaysInThePanel(TestSaveHostCertificateRoute):
+    """No role of the panel reads a host's default certificate key.
+
+    ``tls_default_key`` is the private key of the certificate the host's
+    proxy serves, and ``cloud.host`` is readable by every role down to a
+    Stakeholder: it is readable by system administrators only, as the SSH
+    credentials are. The panel's own code reads it elevated, so the jobs a
+    Developer queues and the host page keep working.
+
+    Reuses the parent's manager, host and ``_call``; the loader collects
+    only the tests declared here.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.stakeholder = new_test_user(
+            self.env,
+            login="tls_key_stakeholder",
+            groups="base.group_user,incubacloud.group_cloud_user",
+        )
+        self.developer = new_test_user(
+            self.env,
+            login="tls_key_developer",
+            groups="base.group_user,incubacloud.group_cloud_developer",
+        )
+        self.cert, self.key = make_pair()
+        self.host.write({
+            "tls_default_cert": self.cert, "tls_default_key": self.key,
+        })
+
+    def test_no_role_reads_the_key(self):
+        """Not by ``read``, ``search_read``, ``call_kw``, export or search."""
+        from odoo.service.model import call_kw
+
+        (self.stakeholder | self.developer | self.manager).write({
+            "group_ids": [(4, self.env.ref("base.group_allow_export").id)],
+        })
+        ids = self.host.ids
+        for user in (self.stakeholder, self.developer, self.manager):
+            Host = self.env["cloud.host"].with_user(user)
+            with self.subTest(user=user.login):
+                with self.assertRaises(AccessError):
+                    Host.browse(ids).read(["tls_default_key"])
+                with self.assertRaises(AccessError):
+                    Host.search_read([("id", "in", ids)], ["tls_default_key"])
+                with self.assertRaises(AccessError):
+                    call_kw(Host, "read", [ids, ["tls_default_key"]], {})
+                with self.assertRaises(AccessError):
+                    Host.browse(ids).export_data(["tls_default_key"])
+                with self.assertRaises(AccessError):
+                    Host.search([("tls_default_key", "!=", False)])
+                self.assertNotIn("tls_default_key", Host.fields_get())
+
+    def test_a_developer_s_job_still_serves_the_certificate(self):
+        """What full_setup and the deploy read, read elevated."""
+        host = self.host.with_user(self.developer)
+        self.assertEqual(host._effective_tls_default(), (self.cert, self.key))
+        self.assertTrue(host._tls_default_covers("a.example.test"))
+        self.assertTrue(host._shipped_tls_default_yml())
+
+    def test_a_manager_replaces_and_keeps_the_pair(self):
+        """A new pair is checked as one, and an untouched key is kept."""
+        cert, key = make_pair(issuer="Other CA")
+        host = self.host.with_user(self.manager)
+        host.write({"tls_default_cert": cert, "tls_default_key": key})
+        self.env.flush_all()
+        self.assertEqual(self.host._effective_tls_default(), (cert, key))
+        host.write({"tls_default_cert": cert})
+        self.env.flush_all()
+        self.assertEqual(self.host._effective_tls_default()[1], key)
+        with self.assertRaises(ValidationError):
+            host.write({"tls_default_cert": self.cert})
+            self.env.flush_all()
+
+    def test_a_manager_creates_a_host_with_its_pair(self):
+        host = self.env["cloud.host"].with_user(self.manager).create({
+            "name": "tls-key-new-host",
+            "ip_address": "198.51.100.77",
+            "user": "root",
+            "wildcard_domain": "tls-key-new.example.com",
+            "tls_default_cert": self.cert,
+            "tls_default_key": self.key,
+        })
+        self.assertEqual(
+            host.sudo()._effective_tls_default(), (self.cert, self.key),
+        )
+
+    def test_the_host_page_says_whether_a_key_is_stored(self):
+        """Read elevated: a refused read would count as a stored key."""
+        data = self._call("cloud_get_host", host_id=self.host.id)
+        self.assertTrue(data["has_tls_default_key"])
+        self.assertNotIn(self.key, repr(data))
+        self.host.write({"tls_default_cert": ""})
+        data = self._call("cloud_get_host", host_id=self.host.id)
+        self.assertFalse(data["has_tls_default_key"])
+
+
+class TestStoreCertificatesDeclared(TransactionCase):
+    """Whether a host's config.yml loads certificates of its own (RB-12)."""
+
+    def setUp(self):
+        super().setUp()
+        self.host = self.env["cloud.host"].create({
+            "name": "store-host",
+            "ip_address": "198.51.100.10",
+            "user": "root",
+            "wildcard_domain": "example.test",
+        })
+
+    def test_the_shipped_template_declares_none(self):
+        self.assertFalse(self.host._declares_store_certificates())
+
+    def test_a_tls_certificates_list_is_a_declaration(self):
+        self.host.traefik_config_yml = (
+            "tls:\n  certificates:\n"
+            "    - certFile: /etc/certs/a.pem\n      keyFile: /etc/certs/a.key\n"
+        )
+        self.assertTrue(self.host._declares_store_certificates())
+
+    def test_unreadable_yaml_declares_nothing(self):
+        self.host.traefik_config_yml = "tls: [unclosed"
+        self.assertFalse(self.host._declares_store_certificates())
+
+
+class TestHostHardeningRoutes(TestCloudDeleteHostRoute):
+    """``/cloud/preflight_host_hardening`` and ``/cloud/apply_host_hardening``.
+
+    The dialog behind the host's "Apply Hardening" reads the first and
+    queues through the second; both are gated like every host action.
+    Reuses the parent's manager user, host and NOT NULL workaround.
+    """
+
+    def _call(self, method, user=None, remote_addr=None, **kwargs):
+        """Drive a CRUD route against the test cursor as *user* (manager).
+
+        :param str remote_addr: the address the request comes from, as
+            ``real_ip`` leaves it before the route runs; ``None`` for a
+            request that names none
+        """
+        from odoo.addons.incubacloud.controllers import _client_ip, data_load
+        from odoo.addons.incubacloud.controllers._data_load import (
+            _routes_crud,
+        )
+
+        fake_request = MagicMock(spec=http.Request)
+        fake_request.env = self.env(user=user or self.manager)
+        fake_request.httprequest = MagicMock(spec=werkzeug.wrappers.Request)
+        fake_request.httprequest.remote_addr = remote_addr
+        fake_request.httprequest.access_route = (
+            [remote_addr] if remote_addr else []
+        )
+        ctrl = data_load.CloudDataLoadController()
+        with (
+            patch.object(http, "request", fake_request),
+            patch.object(data_load, "request", fake_request),
+            patch.object(_routes_crud, "request", fake_request),
+            patch.object(_client_ip, "request", fake_request),
+        ):
+            return getattr(ctrl, method)(**kwargs)
+
+    def _host_jobs(self):
+        """Return the host's jobs, oldest first."""
+        return self.env["cloud.job"].sudo().search(
+            [("host_id", "=", self.host.id)], order="id",
+        )
+
+    def test_preflight_describes_a_host_never_set_up(self):
+        self.assertFalse(self._host_jobs())
+        data = self._call("cloud_preflight_host_hardening", host_id=self.host.id)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["running_instances"], 0)
+        self.assertEqual(data["prod_running"], 0)
+        self.assertFalse(data["full_setup_done"])
+        self.assertFalse(data["has_hardened_before"])
+        self.assertFalse(data["has_known_hosts_key"])
+        self.assertFalse(data["has_active_job"])
+        self.assertEqual(data["connecting_user"], "ubuntu")
+
+    def test_apply_queues_the_hardening(self):
+        self.assertFalse(self._host_jobs())
+        data = self._call("cloud_apply_host_hardening", host_id=self.host.id)
+        self.assertTrue(data["ok"])
+        jobs = self._host_jobs()
+        self.assertEqual(jobs.ids, data["job_ids"])
+        self.assertEqual(jobs.job_type_id.code, "host_hardening")
+
+    def test_apply_with_full_setup_queues_both_in_order(self):
+        self.assertFalse(self._host_jobs())
+        data = self._call(
+            "cloud_apply_host_hardening",
+            host_id=self.host.id, chain_full_setup=True,
+        )
+        self.assertTrue(data["ok"])
+        jobs = self.env["cloud.job"].sudo().browse(data["job_ids"])
+        self.assertEqual(
+            jobs.mapped("job_type_id.code"), ["host_hardening", "full_setup"],
+        )
+
+    def test_a_chain_asked_for_on_a_busy_host_waits_its_turn(self):
+        busy = self.env["cloud.job"].sudo().browse(
+            self.env["cloud.job"].sudo().enqueue(
+                self.host.id, False, "full_setup",
+            )
+        )
+        self.assertEqual(busy.state, "pending")
+        data = self._call(
+            "cloud_apply_host_hardening",
+            host_id=self.host.id, chain_full_setup=True,
+        )
+        self.assertTrue(data["ok"])
+        chain = self._host_jobs() - busy
+        self.assertEqual(
+            chain.mapped("job_type_id.code"), ["host_hardening", "full_setup"],
+        )
+        self.assertEqual(set(chain.mapped("state")), {"queued"})
+        # Only now: a test cursor cannot open under the route's mocked
+        # request, and the dispatcher's cursor must be one.
+        self.registry_enter_test_mode()
+        busy.queue_job_id.write({"state": "done"})
+        _run_after_commit(self.env)
+        self.assertEqual(chain.mapped("state"), ["pending", "wait_dependencies"])
+
+    def test_preflight_sees_a_hardening_already_queued(self):
+        self._call("cloud_apply_host_hardening", host_id=self.host.id)
+        data = self._call("cloud_preflight_host_hardening", host_id=self.host.id)
+        self.assertTrue(data["has_active_job"])
+
+    def test_both_routes_are_for_whoever_manages_hosts(self):
+        developer = new_test_user(
+            self.env,
+            login="host_hardening_developer",
+            groups="base.group_user,incubacloud.group_cloud_developer",
+        )
+        for method in (
+            "cloud_preflight_host_hardening", "cloud_apply_host_hardening",
+        ):
+            with self.subTest(method=method), self.assertRaises(AccessError):
+                self._call(method, user=developer, host_id=self.host.id)
+        self.assertFalse(self._host_jobs())
+
+    def test_the_host_page_says_whether_it_is_hardened(self):
+        data = self._call("cloud_get_host", host_id=self.host.id)
+        self.assertIs(data["hardened"], False)
+        self.assertEqual(data["hardened_at"], "")
+
+    # ── Who can open SSH after the hardening ───────────────────────────
+    #
+    # The dialog says it, and the asker's own address enters the list only
+    # through its checkbox.
+    # Until 27-oct-2026 a layer filled an empty list with the
+    # asker's address before every hardening, unannounced: an IPv6 a host
+    # reached over IPv4 could not use, and on a production host an address
+    # of the CDN.
+
+    _PERSON = "81.40.12.7"
+    _PERSON6 = "2a01:4f8:c0c:1234::1"
+    _CDN = "104.22.23.52"
+    # A public address: a host on a private network offers private ones.
+    _HOST_IP = "45.10.21.201"
+    _UNCONFIRMED = (
+        "Your address could not be confirmed. Close this dialog and open "
+        "it again."
+    )
+
+    def _ssh(self, allowed="", host_ip=_HOST_IP, proxy_ranges=(),
+             real_ip_trusted=""):
+        """Set the host's SSH list and address, and the proxies believed.
+
+        The panel's own address is left out: a layer installed beside
+        core may know it, and these cases are core's, which
+        knows none (``test_core_knows_no_panel_address``).
+
+        :param str allowed: ``allowed_ssh_ips``
+        :param str host_ip: the host's ``ip_address``
+        :param proxy_ranges: what Settings declares as this panel's
+            proxies, whatever the layer adds; ``None`` keeps the layer's
+            own answer (the field as written)
+        :param str real_ip_trusted: ``x_real_ip_trusted`` in the Odoo
+            configuration
+        """
+        self.host.write({"ip_address": host_ip, "allowed_ssh_ips": allowed})
+        self.startPatcher(patch.object(
+            type(self.env["cloud.host"]), "_hardening_panel_ip",
+            autospec=True, return_value="",
+        ))
+        if proxy_ranges is not None:
+            self.startPatcher(patch.object(
+                type(self.env["cloud.settings"]),
+                "_effective_trusted_proxy_ranges",
+                autospec=True, return_value=list(proxy_ranges),
+            ))
+        self.startPatcher(patch.dict(
+            config.options.maps[0], {real_ip.TRUSTED_OPTION: real_ip_trusted},
+        ))
+
+    def _access(self, remote_addr):
+        """Return what the preflight says about SSH, asked from *remote_addr*."""
+        data = self._call(
+            "cloud_preflight_host_hardening",
+            host_id=self.host.id, remote_addr=remote_addr,
+        )
+        self.assertTrue(data["ok"])
+        return data["ssh_access"]
+
+    def _apply(self, remote_addr, **kwargs):
+        """Ask for the hardening from *remote_addr*."""
+        return self._call(
+            "cloud_apply_host_hardening",
+            host_id=self.host.id, remote_addr=remote_addr, **kwargs,
+        )
+
+    def _stored_list(self):
+        """Return ``allowed_ssh_ips`` as the database holds it."""
+        self.host.invalidate_recordset(["allowed_ssh_ips"])
+        return self.host.allowed_ssh_ips or ""
+
+    def _store_unchecked(self, value):
+        """Write ``allowed_ssh_ips`` as a value stored before the check."""
+        # A write still pending in the cache would land over it.
+        self.env.flush_all()
+        self.env.cr.execute(
+            "UPDATE cloud_host SET allowed_ssh_ips = %s WHERE id = %s",
+            (value, self.host.id),
+        )
+        self.host.invalidate_recordset(["allowed_ssh_ips"])
+
+    def test_core_knows_no_panel_address(self):
+        """Core has no address of its own and no edge in front of SSH."""
+        self.assertEqual(CloudHost._hardening_panel_ip(self.host), "")
+        self.assertIs(CloudHost._ssh_closed_by_foreign_edge(self.host), False)
+
+    def test_c1_an_empty_list_leaves_ssh_open_and_stays_empty(self):
+        self._ssh()
+        access = self._access(self._PERSON)
+        self.assertEqual(access["state"], "open")
+        self.assertEqual(access["person"], "")
+        data = self._apply(self._PERSON)
+        self.assertTrue(data["ok"])
+        self.assertNotIn("allowed_ssh_ips", data)
+        self.assertEqual(self._host_jobs().ids, data["job_ids"])
+        self.assertEqual(self._stored_list(), "")
+
+    def test_c2_a_list_offers_the_asker_s_address(self):
+        self._ssh("45.10.20.0/24")
+        access = self._access(self._PERSON)
+        self.assertEqual(access["state"], "list")
+        self.assertEqual(access["entries"], ["45.10.20.0/24"])
+        self.assertEqual(access["panel_ip"], "")
+        self.assertEqual(access["person"], "offer")
+        self.assertEqual(access["person_ip"], self._PERSON)
+
+    def test_c3_an_address_inside_the_list_is_already_allowed(self):
+        self._ssh("45.10.20.0/24")
+        access = self._access("45.10.20.9")
+        self.assertEqual(access["person"], "allowed")
+        self.assertEqual(access["person_ip"], "45.10.20.9")
+
+    def test_c4_a_proxy_declared_in_settings_is_never_offered(self):
+        self._ssh("45.10.20.0/24", proxy_ranges=None)
+        self.env["cloud.settings"]._get_system().trusted_proxy_ranges = (
+            "104.16.0.0/13"
+        )
+        self.assertEqual(self._access(self._CDN)["person"], "unknown")
+
+    def test_c5_a_proxy_named_by_the_cdn_configuration_is_never_offered(self):
+        self._ssh("45.10.20.0/24", real_ip_trusted="104.16.0.0/13")
+        access = self._access(self._PERSON)
+        self.assertEqual(access["person"], "offer")
+        self.assertEqual(access["person_ip"], self._PERSON)
+        # A request ``real_ip`` did not correct: no CDN header, or a
+        # proxy that is not ours.
+        self.assertEqual(self._access(self._CDN)["person"], "unknown")
+
+    def test_c6_an_address_that_is_not_public_is_not_offered(self):
+        self._ssh("45.10.20.0/24")
+        for remote in ("192.168.1.20", "100.64.3.4", None):
+            with self.subTest(remote=remote):
+                self.assertEqual(self._access(remote)["person"], "unknown")
+
+    def test_c7_another_family_than_the_host_s_is_explained(self):
+        self._ssh("45.10.20.0/24")
+        access = self._access(self._PERSON6)
+        self.assertEqual(access["person"], "family")
+        self.assertEqual(access["person_ip"], self._PERSON6)
+        self.assertEqual(access["person_family"], "IPv6")
+        self.assertEqual(access["host_family"], "IPv4")
+
+    def test_c8_the_catch_all_in_the_list_leaves_ssh_open(self):
+        self._ssh("0.0.0.0/0, 45.10.20.9")
+        access = self._access(self._PERSON)
+        self.assertEqual(access["state"], "open")
+        self.assertEqual(access["person"], "")
+
+    def test_c9_the_ipv6_catch_all_alone_is_a_list(self):
+        self._ssh("::/0")
+        self.assertEqual(self._access(self._PERSON)["state"], "list")
+
+    def test_c10_an_entry_stored_before_the_check_is_shown_as_it_is(self):
+        self._ssh()
+        self._store_unchecked("foo, 45.10.20.0/24")
+        access = self._access("45.10.20.9")
+        self.assertEqual(access["state"], "list")
+        self.assertEqual(access["entries"], ["foo", "45.10.20.0/24"])
+        self.assertEqual(access["person"], "allowed")
+
+    def test_c11_a_host_on_a_lan_takes_an_address_of_the_lan(self):
+        self._ssh("10.0.1.0/24", host_ip="10.0.0.99")
+        access = self._access("10.0.0.20")
+        self.assertEqual(access["person"], "offer")
+        self.assertEqual(access["person_ip"], "10.0.0.20")
+        self.assertEqual(self._access("127.0.0.1")["person"], "unknown")
+
+    def test_c12_the_ticked_address_joins_the_list(self):
+        self._ssh("45.10.20.0/24")
+        data = self._apply(self._PERSON, allow_ip=self._PERSON)
+        self.assertTrue(data["ok"], data)
+        jobs = self._host_jobs()
+        self.assertEqual(jobs.ids, data["job_ids"])
+        self.assertEqual(jobs.job_type_id.code, "host_hardening")
+        self.assertEqual(data["allowed_ssh_ips"], "45.10.20.0/24, 81.40.12.7")
+        self.assertEqual(self._stored_list(), "45.10.20.0/24, 81.40.12.7")
+
+    def test_apply_without_an_address_leaves_the_list_alone(self):
+        """The MCP, and any caller that does not know the checkbox."""
+        self._ssh("45.10.20.0/24")
+        data = self._apply(self._PERSON)
+        self.assertTrue(data["ok"])
+        self.assertNotIn("allowed_ssh_ips", data)
+        self.assertEqual(self._stored_list(), "45.10.20.0/24")
+
+    def test_c13_an_address_the_server_does_not_see_is_refused(self):
+        self._ssh("45.10.20.0/24")
+        data = self._apply("81.40.12.8", allow_ip=self._PERSON)
+        self.assertEqual(data, {"ok": False, "error": self._UNCONFIRMED})
+        self.assertFalse(self._host_jobs())
+        self.assertEqual(self._stored_list(), "45.10.20.0/24")
+
+    def test_c14_no_address_is_added_where_none_is_offered(self):
+        self._ssh()
+        data = self._apply(self._PERSON, allow_ip=self._PERSON)
+        self.assertEqual(data, {"ok": False, "error": self._UNCONFIRMED})
+        self.assertFalse(self._host_jobs())
+        self.assertEqual(self._stored_list(), "")
+
+    def test_c15_a_failed_queueing_keeps_the_list(self):
+        self._ssh("45.10.20.0/24")
+        with patch.object(
+            type(self.env["cloud.job"]), "enqueue", autospec=True,
+            side_effect=RuntimeError("queue down"),
+        ):
+            data = self._apply(self._PERSON, allow_ip=self._PERSON)
+        self.assertIs(data["ok"], False)
+        self.assertIn("Failed to queue the hardening", data["error"])
+        self.assertFalse(self._host_jobs())
+        self.assertEqual(self._stored_list(), "45.10.20.0/24")
+
+    def test_c16_the_chain_with_full_setup_adds_it_too(self):
+        self._ssh("45.10.20.0/24")
+        data = self._apply(
+            self._PERSON, allow_ip=self._PERSON, chain_full_setup=True,
+        )
+        self.assertTrue(data["ok"], data)
+        jobs = self.env["cloud.job"].sudo().browse(data["job_ids"])
+        self.assertEqual(
+            jobs.mapped("job_type_id.code"), ["host_hardening", "full_setup"],
+        )
+        self.assertEqual(self._stored_list(), "45.10.20.0/24, 81.40.12.7")
+
+    def test_c17_an_unchecked_entry_stops_the_addition_and_is_named(self):
+        self._ssh()
+        self._store_unchecked("foo, 45.10.20.0/24")
+        data = self._apply(self._PERSON, allow_ip=self._PERSON)
+        self.assertIs(data["ok"], False)
+        self.assertIn("foo", data["error"])
+        self.assertFalse(self._host_jobs())
+        self.assertEqual(self._stored_list(), "foo, 45.10.20.0/24")
+
+    def test_c18_an_ipv6_address_is_offered_and_kept_compressed(self):
+        self._ssh("45.10.20.0/24", host_ip="2a01:4f8:c0c:1234::10")
+        written_long = "2a01:04f8:0c0c:1234:0000:0000:0000:0001"
+        access = self._access(written_long)
+        self.assertEqual(access["person"], "offer")
+        self.assertEqual(access["person_ip"], self._PERSON6)
+        data = self._apply(written_long, allow_ip=self._PERSON6)
+        self.assertTrue(data["ok"], data)
+        self.assertEqual(
+            self._stored_list(), "45.10.20.0/24, 2a01:4f8:c0c:1234::1",
+        )
+
+    def test_c19_an_ipv4_mapped_address_is_its_ipv4(self):
+        self._ssh("45.10.20.0/24")
+        access = self._access("::ffff:81.40.12.7")
+        self.assertEqual(access["person"], "offer")
+        self.assertEqual(access["person_ip"], self._PERSON)
+
+# post_install: the route test creates a manager, and creating res.users
+# at_install trips over the ``res_partner.autopost_bills`` NOT NULL column
+# (account loads later) — same constraint as test_audit_tracked_mixin.
+@tagged("post_install", "-at_install")
+class TestTrustOnlyTheApprovedKey(KnownHostsCase):
+    """An agent's approval names a key; only that key may be trusted.
+
+    The MCP shows a person the key a server presents before trusting it
+    (``_peek_known_host_key``) and hands the approved fingerprint back to
+    the route (``expected_fingerprint``). A server that answers with
+    another key in between is not trusted, and is never sent the host's
+    credentials.
+    """
+
+    HOST_LOGGER = "odoo.addons.incubacloud.models.cloud_host"
+
+    @contextmanager
+    def _server(self, server_key):
+        """Stub a server that presents *server_key*, logged in or not.
+
+        ``asyncssh.get_server_host_key`` is the key exchange alone, with no
+        credential sent; ``asyncssh.connect`` is the full login. Yields the
+        two doubles, ``(scan, connect)``, so a test can tell which ran.
+
+        :param server_key: an asyncssh private key; its public half is
+            what the stubbed server presents
+        """
+        conn = MagicMock(spec=asyncssh.SSHClientConnection)
+        conn.get_server_host_key.return_value = server_key
+        connection = MagicMock(spec=_ACMWrapper)
+        connection.__aenter__.return_value = conn
+        connection.__aexit__.return_value = False
+        with (
+            patch.object(
+                asyncssh,
+                "get_server_host_key",
+                autospec=True,
+                return_value=server_key,
+            ) as scan,
+            patch.object(asyncssh, "connect", return_value=connection) as connect,
+        ):
+            yield scan, connect
+
+    def test_a_peek_names_the_presented_key_without_logging_in(self):
+        """A peek names the key presented now, sends no credential, stores nothing."""
+        host = self._host()
+        trusted = host.known_hosts_key
+        presented = asyncssh.generate_private_key("ssh-ed25519")
+        with self._server(presented) as (scan, connect):
+            peek = host._peek_known_host_key()
+        self.assertEqual(peek["fingerprint"], presented.get_fingerprint("sha256"))
+        self.assertNotEqual(peek["fingerprint"], peek["trusted_fingerprint"])
+        self.assertEqual(peek["trusted_fingerprint"], host.known_hosts_fingerprint)
+        self.assertEqual(peek["revoked_fingerprint"], "")
+        self.assertEqual(host.known_hosts_key, trusted)
+        scan.assert_called_once_with(host.ip_address, host.port, options=ANY)
+        connect.assert_not_called()
+
+    def test_a_peek_loads_no_client_key_and_keeps_asyncssh_order(self):
+        """A peek reads no client key or agent, and asks for no key types.
+
+        An unreadable ``~/.ssh/id_rsa`` (the empty one a Doodba project
+        ships) does not stop it; the key types stay asyncssh's, the order
+        the hosts' trusted keys were read in, not the one the SFTP
+        destinations read in for duplicity's paramiko.
+        """
+        host = self._host()
+        presented = asyncssh.generate_private_key("ssh-ed25519")
+        with tempfile.TemporaryDirectory() as home:
+            _empty_client_key_home(home)
+            with patch.dict(os.environ, {"HOME": home}):
+                # What the reading met before: the empty key stops asyncssh.
+                with self.assertRaises(asyncssh.KeyImportError):
+                    asyncssh.SSHClientConnectionOptions()
+                with self._server(presented) as (scan, _connect):
+                    peek = host._peek_known_host_key()
+        self.assertEqual(peek["fingerprint"], presented.get_fingerprint("sha256"))
+        options = scan.call_args.kwargs["options"]
+        self.assertIsNone(options.kwargs["client_keys"])
+        self.assertIsNone(options.kwargs["agent_path"])
+        self.assertNotIn("server_host_key_algs", scan.call_args.kwargs)
+        self.assertNotIn("server_host_key_algs", options.kwargs)
+
+    def test_the_approved_key_is_trusted_and_the_login_accepts_only_it(self):
+        """The approved key is stored; the login it took accepted that key only."""
+        host = self._host()
+        with self._server(asyncssh.generate_private_key("ssh-ed25519")) as (
+            _scan,
+            connect,
+        ):
+            approved = host._peek_known_host_key()["fingerprint"]
+            captured = host._capture_known_host_key(expected_fingerprint=approved)
+        self.assertEqual(captured["fingerprint"], approved)
+        self.assertEqual(host.known_hosts_fingerprint, approved)
+        # asyncssh checks the key during the key exchange, before the
+        # credentials go out: the login knows the approved key only.
+        pinned = connect.call_args.kwargs["known_hosts"]
+        host_keys = pinned.match(host.ip_address, "", host.port)[0]
+        self.assertEqual(
+            [key.get_fingerprint("sha256") for key in host_keys], [approved]
+        )
+
+    def test_another_key_is_refused_before_any_credential_is_sent(self):
+        """Another key is refused before the credentials leave; nothing changes."""
+        host = self._host()
+        trusted = host.known_hosts_key
+        approved = asyncssh.generate_private_key("ssh-ed25519").get_fingerprint(
+            "sha256"
+        )
+        with (
+            self._server(asyncssh.generate_private_key("ssh-ed25519")) as (
+                _scan,
+                connect,
+            ),
+            self.assertLogs(self.HOST_LOGGER, level="WARNING"),
+            self.assertRaises(UserError),
+        ):
+            host._capture_known_host_key(expected_fingerprint=approved)
+        connect.assert_not_called()
+        self.assertEqual(host.known_hosts_key, trusted)
+
+    def test_a_key_swapped_before_the_login_is_refused_and_audited(self):
+        """A key swapped between the comparison and the login is refused and
+        audited like any other: the login fails its key exchange."""
+        from odoo.addons.incubacloud.controllers import data_load
+        from odoo.addons.incubacloud.controllers._data_load import _routes_crud
+
+        manager = new_test_user(
+            self.env, login="trust-swapped-manager",
+            groups="base.group_user,incubacloud.group_cloud_manager",
+        )
+        host = self._host()
+        trusted = host.known_hosts_key
+        approved = asyncssh.generate_private_key("ssh-ed25519")
+        swapped = asyncssh.generate_private_key("ssh-ed25519")
+        fake_request = MagicMock(spec=http.Request)
+        fake_request.env = self.env(user=manager)
+        ctrl = data_load.CloudDataLoadController()
+        with (
+            self._server(approved) as (scan, connect),
+            patch.object(http, "request", fake_request),
+            patch.object(data_load, "request", fake_request),
+            patch.object(_routes_crud, "request", fake_request),
+            self.assertLogs(self.HOST_LOGGER, level="WARNING"),
+        ):
+            scan.side_effect = [approved, swapped]
+            connect.side_effect = asyncssh.HostKeyNotVerifiable("Host key not trusted")
+            result = ctrl.cloud_trust_host_key(
+                host.id, expected_fingerprint=approved.get_fingerprint("sha256"),
+            )
+        self.assertFalse(result["ok"])
+        self.assertIn(swapped.get_fingerprint("sha256"), result["error"])
+        self.assertEqual(host.known_hosts_key, trusted)
+        details = self._audit_details(host, "SSH host key refused")
+        self.assertEqual(len(details), 1)
+        self.assertIn(swapped.get_fingerprint("sha256"), details[0])
+
+    def test_a_login_refused_with_the_approved_key_back_does_not_name_it_twice(self):
+        """A login refused while a second look shows the approved key again
+        says the approved key was not presented, not that it replaced itself."""
+        host = self._host()
+        approved = asyncssh.generate_private_key("ssh-ed25519")
+        fingerprint = approved.get_fingerprint("sha256")
+        with (
+            self._server(approved) as (scan, connect),
+            self.assertLogs(self.HOST_LOGGER, level="WARNING") as logged,
+            self.assertRaises(UserError) as caught,
+        ):
+            scan.side_effect = [approved, approved]
+            connect.side_effect = asyncssh.HostKeyNotVerifiable("Host key not trusted")
+            host._capture_known_host_key(expected_fingerprint=fingerprint)
+        message = str(caught.exception)
+        self.assertEqual(message.count(fingerprint), 1)
+        self.assertNotIn("now presents", message)
+        self.assertEqual("".join(logged.output).count(fingerprint), 1)
+
+    def test_an_empty_approval_trusts_nothing(self):
+        """An empty fingerprint approves nothing: no login, nothing stored."""
+        host = self._host()
+        trusted = host.known_hosts_key
+        with (
+            self._server(asyncssh.generate_private_key("ssh-ed25519")) as (
+                _scan,
+                connect,
+            ),
+            self.assertLogs(self.HOST_LOGGER, level="WARNING"),
+            self.assertRaises(UserError),
+        ):
+            host._capture_known_host_key(expected_fingerprint="")
+        connect.assert_not_called()
+        self.assertEqual(host.known_hosts_key, trusted)
+
+    def test_the_route_answers_logs_and_audits_the_refusal(self):
+        """The route answers the refusal; it is logged and audited."""
+        from odoo.addons.incubacloud.controllers import data_load
+        from odoo.addons.incubacloud.controllers._data_load import _routes_crud
+
+        manager = new_test_user(
+            self.env, login="trust-approved-manager",
+            groups="base.group_user,incubacloud.group_cloud_manager",
+        )
+        host = self._host()
+        fake_request = MagicMock(spec=http.Request)
+        fake_request.env = self.env(user=manager)
+        ctrl = data_load.CloudDataLoadController()
+        with (
+            self._server(asyncssh.generate_private_key("ssh-ed25519")),
+            patch.object(http, "request", fake_request),
+            patch.object(data_load, "request", fake_request),
+            patch.object(_routes_crud, "request", fake_request),
+            self.assertLogs(self.HOST_LOGGER, level="WARNING") as logs,
+        ):
+            result = ctrl.cloud_trust_host_key(
+                host.id, expected_fingerprint="SHA256:not-the-presented-one",
+            )
+        self.assertFalse(result["ok"])
+        self.assertIn("SHA256:not-the-presented-one", result["error"])
+        self.assertIn("SHA256:not-the-presented-one", logs.output[0])
+        details = self._audit_details(host, "SSH host key refused")
+        self.assertEqual(len(details), 1)
+        self.assertIn("SHA256:not-the-presented-one", details[0])
+
+
+class TestPasswordLoginNeedsSshpass(TestSaveHostCertificateRoute):
+    """Without ``sshpass`` on the panel's server, hosts log in with a key.
+
+    Ansible (setup, hardening, probes) authenticates to a password host
+    through ``sshpass``; a panel without it, Odoo.sh among them, cannot
+    work such a host. The model refuses to create one or to switch a host
+    to a password, whatever the caller (form, API, MCP), and the host
+    form is told so it offers the key only. A host that already logs in
+    with a password is left as it is. The detector is mocked: the
+    outcome must not depend on the machine running the tests.
+    """
+
+    def _sshpass(self, available):
+        """Make the panel's server have ``sshpass`` or not, for this test.
+
+        :param bool available: what the detector answers
+        :return: the mocked detector, whose answer a test may change
+        """
+        from odoo.addons.incubacloud.models import cloud_host
+
+        detector = patch.object(
+            cloud_host, "_sshpass_available", autospec=True,
+            return_value=available,
+        )
+        mocked = detector.start()
+        self.addCleanup(detector.stop)
+        return mocked
+
+    def _create(self, **vals):
+        return self.env["cloud.host"].create({
+            "name": "Password host",
+            "ip_address": "10.0.0.98",
+            "user": "root",
+            "wildcard_domain": "pw.example.com",
+        } | vals)
+
+    def test_create_with_a_password_is_refused_without_sshpass(self):
+        self._sshpass(False)
+        with self.assertRaisesRegex(ValidationError, "sshpass"):
+            self._create(login_type="password", password="secret-pw")
+
+    def test_create_with_a_key_works_without_sshpass(self):
+        self._sshpass(False)
+        self.assertEqual(self._create(login_type="ssh_key").login_type, "ssh_key")
+
+    def test_create_with_a_password_works_with_sshpass(self):
+        self._sshpass(True)
+        host = self._create(login_type="password", password="secret-pw")
+        self.assertEqual(host.login_type, "password")
+
+    def test_switching_to_a_password_is_refused_without_sshpass(self):
+        self._sshpass(False)
+        with self.assertRaisesRegex(ValidationError, "sshpass"):
+            self.host.write({"login_type": "password", "password": "pw"})
+        self.assertEqual(self.host.login_type, "ssh_key")
+
+    def test_an_existing_password_host_keeps_working(self):
+        """Saved again from the form (which sends its login type) or edited."""
+        self.host.login_type = "password"
+        self._sshpass(False)
+        self.host.write({"login_type": "password", "port": 2222})
+        self.assertEqual(self.host.port, 2222)
+
+    def test_the_create_route_refuses_it_too(self):
+        self._sshpass(False)
+        with self.assertRaisesRegex(ValidationError, "sshpass"):
+            self._call("cloud_create_host", vals={
+                "name": "Route host", "ip_address": "10.0.0.97",
+                "user": "root", "login_type": "password",
+                "password": "secret-pw",
+            })
+
+    def test_the_form_is_told_whether_passwords_are_available(self):
+        detector = self._sshpass(False)
+        for available in (False, True):
+            detector.return_value = available
+            self.assertIs(
+                self._call("cloud_host_defaults")["password_login_available"],
+                available,
+            )
+            self.assertIs(
+                self._call("cloud_get_host", host_id=self.host.id)[
+                    "password_login_available"
+                ],
+                available,
+            )

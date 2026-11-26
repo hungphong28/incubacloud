@@ -1,0 +1,142 @@
+// ─── SearchSelect ─────────────────────────────────────────────────────────────
+// Generic searchable single-select, restyled onto the rl design tokens.
+// The dropdown is position:fixed (coords injected from _placeDropdown)
+// so it escapes any overflow:hidden ancestor (e.g. a modal body / repo card).
+
+.ic-search-select {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+
+    // ── Input row ─────────────────────────────────────────────────────────
+
+    &__input-wrap {
+        position: relative;
+        display: flex;
+        align-items: center;
+    }
+
+    &__input {
+        flex: 1;
+        min-width: 0;
+        padding: 6px 28px 6px 10px; // right room for chevron/spinner
+        background: var(--rl-surf);
+        border: 1px solid var(--rl-line2);
+        border-radius: var(--rl-rsm);
+        color: var(--rl-fg);
+        font-family: var(--rl-fm);
+        font-size: 12px;
+        transition: border-color 0.15s, box-shadow 0.15s;
+
+        &::placeholder { color: var(--rl-faint); }
+
+        &:focus {
+            outline: none;
+            border-color: var(--rl-green);
+            box-shadow: 0 0 0 3px var(--rl-green-soft);
+        }
+
+        &:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+    }
+
+    &__chevron,
+    &__spinner {
+        position: absolute;
+        right: 8px;
+        pointer-events: none;
+        color: var(--rl-faint);
+        font-size: 11px;
+    }
+
+    &__spinner {
+        // fa-spin already provides the animation
+        top: 50%;
+        transform: translateY(-50%);
+    }
+
+    &--open &__input {
+        border-color: var(--rl-green);
+        box-shadow: 0 0 0 3px var(--rl-green-soft);
+        border-bottom-left-radius: 0;
+        border-bottom-right-radius: 0;
+    }
+
+    // Opened upwards (no room below): the list meets the input's top edge.
+    &--up &__input {
+        border-radius: 0 0 var(--rl-rsm) var(--rl-rsm);
+    }
+
+    &--up &__dropdown {
+        border-top: 1px solid var(--rl-green);
+        border-bottom: none;
+        border-radius: var(--rl-rsm) var(--rl-rsm) 0 0;
+        box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.45);
+    }
+
+    // ── Dropdown ──────────────────────────────────────────────────────────
+    // position:fixed + inline coords (see _placeDropdown in the .js).
+
+    &__dropdown {
+        position: fixed; // fallback; overridden by inline style from JS
+        background: var(--rl-surf2);
+        border: 1px solid var(--rl-green);
+        border-top: none;
+        border-bottom-left-radius: var(--rl-rsm);
+        border-bottom-right-radius: var(--rl-rsm);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+        z-index: 9999;
+        max-height: 220px;
+        overflow-y: auto;
+
+        scrollbar-width: thin;
+        scrollbar-color: var(--rl-line2) transparent;
+
+        &::-webkit-scrollbar { width: 6px; }
+        &::-webkit-scrollbar-track { background: transparent; }
+        &::-webkit-scrollbar-thumb {
+            background: var(--rl-line2);
+            border-radius: 3px;
+
+            &:hover { background: var(--rl-faint); }
+        }
+    }
+
+    // ── Options ───────────────────────────────────────────────────────────
+
+    &__option {
+        padding: 7px 12px;
+        font-family: var(--rl-fm);
+        font-size: 12px;
+        color: var(--rl-fg);
+        cursor: pointer;
+
+        &:hover { background: var(--rl-surf3); }
+
+        &--selected {
+            color: var(--rl-green);
+            font-weight: 600;
+        }
+
+        &--empty {
+            color: var(--rl-muted);
+            font-style: italic;
+        }
+
+        &--create {
+            color: var(--rl-green);
+            font-weight: 500;
+        }
+
+        &--hint {
+            color: var(--rl-muted);
+            cursor: default;
+            font-size: 11.5px;
+            padding: 8px 12px;
+
+            &:hover { background: none; }
+        }
+    }
+}

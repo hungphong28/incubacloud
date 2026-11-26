@@ -1,0 +1,872 @@
+import json
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+
+from psycopg2 import errors as pg_errors
+
+from odoo import _, api, fields, models
+from odoo.exceptions import UserError, ValidationError
+
+from ..github.client import GitHubAppClient
+from ._concurrency import is_concurrency_error
+from ._repo_requirements import _normalize_url, is_safe_git_ref
+from .cloud_gitlab_mr_note import PR_PREVIEW_NOTE_FAILED_CODE
+from .cloud_repo_mixin import repo_url_key
+from .res_users_ext import as_platform
+
+_logger = logging.getLogger(__name__)
+
+# Alert raised when the GitHub App installation is removed or suspended.
+# Module-level so the webhook handler and any future health check dedup
+# on the same code.
+GITHUB_APP_REVOKED_CODE = 'github_app_revoked'
+
+# Alert raised when deliveries stop arriving while an App is configured.
+# An edge allowlist that has fallen behind the provider's published
+# source ranges fails by dropping requests before they reach us, so the
+# absence of traffic is the only signal that reaches this process.
+GITHUB_WEBHOOK_SILENT_CODE = 'github_webhook_silent'
+
+# Alert raised on the production instance when a pull request asked for a
+# preview and none could be created. The pull request gets a comment too,
+# because that is where whoever opened it is looking.
+PR_PREVIEW_FAILED_CODE = 'pr_preview_failed'
+
+# Alert raised on a production when a pull request that would preview it
+# came through an installation of the panel's App other than the one the
+# panel acts on: no preview is created. Keyed by that installation's id,
+# resolved when it is chosen (``cloud.github.app``) or by hand.
+PR_OTHER_INSTALLATION_CODE = 'github_pr_other_installation'
+
+
+class CloudGitHubEvent(models.Model):
+    """Log of received GitHub App webhook events.
+
+    Events are persisted by the webhook controller immediately after HMAC
+    validation.  Push events are processed to trigger auto-rebuilds.
+    """
+
+    _name = "cloud.github.event"
+    _inherit = "cloud.repo.event.mixin"
+    _description = "GitHub Webhook Event"
+    _order = "create_date desc"
+
+    event_type = fields.Char(
+        string="Event Type",
+        readonly=True,
+        help="Value of the X-GitHub-Event header (e.g. push, pull_request).",
+    )
+    action = fields.Char(
+        string="Action",
+        readonly=True,
+        help="The 'action' field from the webhook payload (e.g. opened, closed).",
+    )
+    delivery_id = fields.Char(
+        string="Delivery ID",
+        readonly=True,
+        index=True,
+        help="Value of the X-GitHub-Delivery header — unique per delivery.",
+    )
+    payload = fields.Text(
+        string="Payload",
+        readonly=True,
+        help="Raw JSON payload received from GitHub.",
+    )
+    processed = fields.Boolean(
+        string="Processed",
+        default=False,
+        help="Set to True once business logic has handled this event.",
+    )
+    error = fields.Text(
+        string="Processing Error",
+        readonly=True,
+        help="Error message if processing failed.",
+    )
+
+    def init(self):
+        """Enforce anti-replay via a partial unique index on delivery_id.
+
+        GitHub guarantees the X-GitHub-Delivery UUID is unique per delivery,
+        so a duplicate means the same request was received twice — either a
+        GitHub retry after a transient 5xx or, more concerning, a captured
+        request being replayed by an attacker who cannot forge the HMAC but
+        can resend a valid one. Either way we want the second insert to fail
+        at the DB layer so the controller can swallow it without re-firing
+        the push / pull_request handlers.
+
+        Partial ``WHERE delivery_id != ''`` is the escape hatch for any
+        legacy rows persisted before this constraint was added (tests and
+        ad-hoc rows in older DBs). The webhook controller now rejects
+        empty delivery headers with 400, so no new empty rows can land.
+
+        The DELETE step is a one-shot dedupe keeping the oldest row
+        (smallest id). It's idempotent: on subsequent upgrades there are
+        no duplicates left, so the DELETE is a no-op.
+        """
+        cr = self.env.cr
+        cr.execute(
+            """
+            DELETE FROM cloud_github_event a
+            USING cloud_github_event b
+            WHERE a.delivery_id = b.delivery_id
+              AND a.delivery_id IS NOT NULL
+              AND a.delivery_id != ''
+              AND a.id > b.id
+            """
+        )
+        cr.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                cloud_github_event_delivery_id_uidx
+            ON cloud_github_event (delivery_id)
+            WHERE delivery_id IS NOT NULL AND delivery_id != ''
+            """
+        )
+
+    #: A delivery GitHub made this recently may still be on its way
+    #: through the edge and the controller; it is not missing yet.
+    _DELIVERY_GRACE = timedelta(minutes=10)
+
+    @api.model
+    def _cron_check_delivery_silence(self):
+        """Alert when GitHub tried to deliver and nothing arrived here.
+
+        Only meaningful once an App exists: without one the platform is
+        not expecting deliveries, and the webhook secret lookup returns
+        before hashing anything. The check therefore stays quiet on an
+        install that never wired GitHub up.
+
+        Silence alone cannot tell a broken edge from a quiet repository,
+        so when nothing has been recorded for an hour the check reads
+        the App's delivery log at GitHub and compares it, by delivery id,
+        with the events recorded in the window: an attempt old enough to
+        have landed that has no row here was dropped, whatever GitHub
+        was answered. A window with no attempts is a quiet week and
+        raises nothing. A log GitHub cannot serve decides nothing this
+        hour: raising would blame the edge for GitHub's outage, and
+        resolving would clear a real alert nobody re-checked.
+
+        :return: the raised alert, or an empty recordset when quiet
+        """
+        Alert = self.env['cloud.alert'].sudo()
+        settings = self.env['cloud.settings'].sudo()._get()
+        hours = settings.github_webhook_silence_hours
+        configured = self.env['cloud.github.app'].sudo().search_count([])
+        if hours <= 0 or not configured:
+            Alert.resolve_alert(GITHUB_WEBHOOK_SILENT_CODE)
+            return Alert.browse()
+        now = fields.Datetime.now()
+        cutoff = now - timedelta(hours=hours)
+        recent = self.sudo().search_fetch(
+            [('create_date', '>=', cutoff)], ['delivery_id', 'create_date'],
+        )
+        if any(e.create_date >= now - timedelta(hours=1) for e in recent):
+            # Traffic this hour is proof enough; GitHub is not asked.
+            Alert.resolve_alert(GITHUB_WEBHOOK_SILENT_CODE)
+            return Alert.browse()
+        try:
+            deliveries = self._hook_deliveries()
+        except Exception as exc:  # noqa: BLE001 - logged, decides nothing
+            _logger.warning("GitHub hook deliveries unreadable: %s", exc)
+            return Alert.browse()
+        # A ``ping`` carries no push. GitHub sends it as it creates the
+        # App, while the callback that stores the secret to verify it is
+        # still on its way: 70 ms before the secret was saved on aitrax,
+        # answered 401 and reported for two days as pushes that never
+        # arrived (15-oct-2026).
+        attempted = [
+            d for d in deliveries
+            if d.get('event') != 'ping'
+            and cutoff <= (self._delivered_at(d) or cutoff - timedelta(seconds=1))
+            <= now - self._DELIVERY_GRACE
+        ]
+        received = {e.delivery_id for e in recent if e.delivery_id}
+        missing = [d for d in attempted if d.get('guid') not in received]
+        if not missing:
+            Alert.resolve_alert(GITHUB_WEBHOOK_SILENT_CODE)
+            return Alert.browse()
+        newest = max(missing, key=self._delivered_at)
+        return Alert.raise_alert(
+            GITHUB_WEBHOOK_SILENT_CODE,
+            _("GitHub attempted %(attempted)s webhook deliveries in the last "
+              "%(hours)s hours and %(missing)s of %(attempted)s never reached "
+              "this panel (last attempt %(when)s, GitHub saw: %(status)s). "
+              "Repository pushes are not triggering rebuilds. Check the "
+              "App's webhook URL and any source-address allowlist in front "
+              "of /cloud/github/webhook.",
+              attempted=len(attempted), missing=len(missing), hours=hours,
+              when=fields.Datetime.to_string(self._delivered_at(newest)),
+              status=newest.get('status') or newest.get('status_code') or '?'),
+            level='warning',
+        )
+
+    @api.model
+    def _hook_deliveries(self):
+        """Return the App's latest delivery attempts as GitHub lists them.
+
+        :return: list of delivery dicts, newest first
+        :raises: whatever the GitHub client raises when the log cannot
+            be read; the caller treats that as "blind this hour"
+        """
+        creds = self.env['cloud.github.credential.service'].get_credentials()
+        return GitHubAppClient(creds).list_hook_deliveries()
+
+    @staticmethod
+    def _delivered_at(delivery):
+        """Return a delivery's ``delivered_at`` as a naive UTC datetime.
+
+        :param dict delivery: one entry of GitHub's delivery log
+        :return: ``datetime`` or None when the entry carries no usable time
+        """
+        raw = delivery.get('delivered_at') or ''
+        try:
+            parsed = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+
+    def _purge_old(self):
+        """Two-stage retention run from the daily cron.
+
+        Stage 1 (``github_event_truncate_days``): replace the raw
+        payload of processed events older than N days with a compact
+        JSON stub that keeps only the fields used by downstream audit
+        — event type, ref, head sha, action, pusher login, and the
+        original payload size. This keeps the audit trail but releases
+        ~99% of the row size for big monorepo pushes.
+
+        Stage 2 (``github_event_retention_days``): delete processed
+        events older than N days outright. Unprocessed rows
+        (``processed=False`` or ``error`` set) are never auto-deleted
+        so an operator can still investigate failures after a month.
+
+        ``0`` disables the stage — explicit opt-out rather than a
+        silent "disabled by default".
+        """
+        settings = self.env['cloud.settings'].sudo()._get()
+        trunc_days = settings.github_event_truncate_days or 0
+        del_days = settings.github_event_retention_days or 0
+        now = fields.Datetime.now()
+
+        if trunc_days > 0:
+            cutoff = now - timedelta(days=trunc_days)
+            candidates = self.sudo().search([
+                ('processed', '=', True),
+                ('create_date', '<', cutoff),
+                ('payload', '!=', False),
+                ('payload', '!=', ''),
+                # Skip already-truncated rows: their payload is the
+                # compact stub and re-stubbing would be a no-op at best
+                # and miscount a 'truncated' every run at worst.
+                ('payload', 'not ilike', '"_truncated":true'),
+            ])
+            truncated = 0
+            for ev in candidates:
+                stub = ev._payload_stub()
+                if stub is not None and stub != ev.payload:
+                    ev.payload = stub
+                    truncated += 1
+            if truncated:
+                _logger.info(
+                    "cloud.github.event: truncated %d payload(s) "
+                    "older than %d days", truncated, trunc_days,
+                )
+
+        if del_days > 0:
+            cutoff = now - timedelta(days=del_days)
+            old = self.sudo().search([
+                ('processed', '=', True),
+                ('create_date', '<', cutoff),
+            ])
+            count = len(old)
+            if count:
+                old.unlink()
+                _logger.info(
+                    "cloud.github.event: purged %d row(s) "
+                    "older than %d days", count, del_days,
+                )
+
+    def _payload_stub(self):
+        """Return a compact JSON replacement preserving audit info.
+
+        The stub keeps: event_type, ref, head sha, action, pusher
+        login, and the original payload byte size. A truncated flag
+        marks the row so future re-processing attempts know the full
+        payload is no longer available.
+        """
+        self.ensure_one()
+        try:
+            data = json.loads(self.payload or '{}')
+        except (ValueError, TypeError):
+            data = {}
+        stub = {
+            '_truncated': True,
+            '_original_size': len(self.payload or ''),
+            'event_type': self.event_type or '',
+            'action': self.action or '',
+            'ref': data.get('ref', ''),
+            'after': data.get('after', '')[:40],
+            'pusher': (data.get('pusher') or {}).get('name', ''),
+            'repository': (
+                (data.get('repository') or {}).get('full_name', '')
+            ),
+        }
+        return json.dumps(stub, separators=(',', ':'))
+
+    def _dispatch(self, payload):
+        """Route a freshly-persisted webhook event to its handler.
+
+        Every path must leave the event ``processed=True``. Both stages of
+        ``_purge_old`` filter on that flag, so a row left False is exempt
+        from a retention policy that reads as covering it — payload and
+        all, forever. The individual handlers set the flag themselves; the
+        fallthrough covers the event types the App manifest subscribes to
+        but which we take no action on (``create``, ``delete``, …).
+
+        :param dict payload: the decoded webhook body
+        """
+        self.ensure_one()
+        # Belt and braces with the webhook controller, which already
+        # elevates: dispatching is what enqueues the fleet rebuilds, so
+        # any *other* caller — a replay tool, a shell reprocessing a
+        # stuck event — must not end up as their author either.
+        self = as_platform(self)
+        if self.event_type == 'installation':
+            self._process_installation_lifecycle(payload)
+        elif self.event_type == 'push':
+            self._process_push_event()
+        elif self.event_type == 'pull_request':
+            self._process_pull_request_event()
+        else:
+            self.write({'processed': True})
+
+    def _process_installation_lifecycle(self, payload):
+        """Handle an ``installation`` webhook and mark the event processed.
+
+        ``created`` auto-detects the installation id (the original reason
+        this event type was subscribed), when the installation is on the
+        account that owns the App (``_process_installation_event``).
+
+        ``deleted`` and ``suspend`` are the ones that used to pass
+        unnoticed: from that moment every GitHub API call 401s, the client
+        invalidates its token cache and returns empty-handed, and
+        auto-rebuild plus PR previews simply stop happening with nothing
+        anywhere in the panel to explain why. Raise a critical alert so the
+        silence becomes visible. ``unsuspend`` clears it, as does a fresh
+        ``created`` after a reinstall: ``deleted`` forgets the installation
+        id so that the reinstall's is the one taken, by the webhook on the
+        App owner's account or by a manager's Check installation.
+
+        Only the panel's own installation counts. The App is public, so a
+        stranger may install, suspend or delete it on their account, and
+        that must neither raise the panel's alert nor clear a real one.
+
+        :param dict payload: the decoded webhook body
+        """
+        self.ensure_one()
+        action = self.action or payload.get('action', '')
+        App = self.env['cloud.github.app'].sudo()
+        Alert = self.env['cloud.alert'].sudo()
+        if action == 'created':
+            App._process_installation_event(payload)
+        if not App._is_own_installation(payload):
+            _logger.info(
+                "GitHub App installation %s %s is not this panel's: ignored.",
+                payload.get('installation', {}).get('id'), action,
+            )
+        elif action == 'created':
+            Alert.resolve_alert(GITHUB_APP_REVOKED_CODE)
+        elif action in ('deleted', 'suspend'):
+            if action == 'deleted':
+                App.search([], limit=1).write({'installation_id': False})
+            Alert.raise_alert(
+                GITHUB_APP_REVOKED_CODE,
+                _(
+                    "The GitHub App installation was %(action)s. Auto-rebuild "
+                    "on push and PR preview environments are disabled until "
+                    "it is reinstalled.",
+                    action=action,
+                ),
+                level='critical',
+            )
+            _logger.warning(
+                "GitHub App installation %s — auto-rebuild is now inert.",
+                action,
+            )
+        elif action == 'unsuspend':
+            Alert.resolve_alert(GITHUB_APP_REVOKED_CODE)
+        self.write({'processed': True})
+
+    def _process_push_event(self):
+        """Process a push webhook — trigger auto-rebuild for matching instances."""
+        self.ensure_one()
+        payload = json.loads(self.payload or '{}')
+
+        # Ignore branch deletions and tag pushes
+        if payload.get('deleted'):
+            self.write({'processed': True})
+            return
+
+        ref = payload.get('ref', '')
+        branch = ref.removeprefix('refs/heads/')
+        if not branch or branch == ref:
+            # Not a branch push (e.g. tag)
+            self.write({'processed': True})
+            return
+        # Defense in depth: refuse to enqueue auto-rebuilds for refs
+        # whose name would not pass the @api.constrains on
+        # cloud.instance.repo.branch. The constraint already blocks
+        # writes downstream, but rejecting here avoids ValidationError
+        # noise in logs and makes the rejection visible in the
+        # processed=True branch.
+        if not is_safe_git_ref(branch):
+            _logger.warning(
+                "GitHub push: rejected unsafe branch name %r", branch,
+            )
+            self.write({'processed': True})
+            return
+
+        repo_data = payload.get('repository', {})
+        clone_url = repo_data.get('clone_url', '')
+        repo_norm = _normalize_url(clone_url)
+        if not repo_norm:
+            self.write({'processed': True})
+            return
+
+        # Push context for job payload
+        pusher = payload.get('pusher', {}).get('name', '')
+        head_sha = payload.get('after', '')[:7]
+        head_msg = payload.get('head_commit', {}).get('message', '').split('\n')[0][:80]
+        repo_short = repo_data.get('full_name', repo_norm.split('github.com/')[-1])
+
+        # Find instance repos matching repo+branch, not frozen
+        matched = self.env['cloud.instance.repo'].search([
+            ('branch', '=', branch),
+            ('commit_sha', 'in', (False, '')),
+        ]).filtered(
+            lambda r: _normalize_url(r.url) == repo_norm
+        )
+
+        push_info = {
+            'push_repo': repo_short,
+            'push_branch': branch,
+            'push_sha': head_sha,
+            'push_message': head_msg,
+            'push_by': pusher,
+            'push_provider': 'github',
+        }
+
+        triggered = self._rebuild_for_push(matched, push_info)
+        self.write({'processed': True})
+        if triggered:
+            _logger.info(
+                "Auto-rebuild triggered for: %s (push %s@%s)",
+                ', '.join(triggered), repo_norm.split('/')[-1], branch,
+            )
+
+    def _process_pull_request_event(self):
+        """Process a pull_request webhook — create/rebuild/destroy PR preview instances."""
+        self.ensure_one()
+        payload   = json.loads(self.payload or '{}')
+        action    = payload.get('action')
+        pr        = payload.get('pull_request', {})
+        pr_number = pr.get('number')
+        head_ref  = pr.get('head', {}).get('ref')
+        # The base is the repository the pull request is opened on, where
+        # the installation lives; the head is where its branch comes from.
+        # A deleted fork leaves the head's repository empty.
+        base_url  = ((pr.get('base') or {}).get('repo') or {}).get('clone_url')
+        head_url  = ((pr.get('head') or {}).get('repo') or {}).get('clone_url')
+        repo_full = payload.get('repository', {}).get('full_name', '')
+        repo_norm = _normalize_url(base_url or '')
+        from_fork = (
+            repo_url_key(self.env, head_url) != repo_url_key(self.env, base_url)
+        )
+
+        if not (pr_number and head_ref and repo_norm):
+            self.write({'processed': True})
+            return
+        if not self._is_own_pull_request(payload):
+            if action in ('opened', 'reopened'):
+                self._report_other_installation(
+                    payload, base_url, from_fork, repo_full, pr_number,
+                )
+            self.write({'processed': True})
+            return
+        # Same defense-in-depth rejection as in _process_push_event:
+        # the head_ref will flow into cloud.instance.repo.branch via
+        # repo.write(), so a hostile ref name (e.g. ``main --upload-pack=evil``)
+        # would later be rejected by the constraint. Bail out cleanly here.
+        if not is_safe_git_ref(head_ref):
+            _logger.warning(
+                "GitHub PR: rejected unsafe head_ref %r (PR #%s)",
+                head_ref, pr_number,
+            )
+            self.write({'processed': True})
+            return
+
+        if action in ('opened', 'reopened'):
+            for prod in self._pr_preview_sources(base_url, from_fork):
+                if not self._pr_preview_allowed(prod):
+                    continue
+                # A closed one still being deleted does not count: closed
+                # and reopened at once, the pull request gets a new preview.
+                if self._pr_previews(repo_full, pr_number, prod.project_id).filtered(
+                    lambda i: i.pr_state != 'closed',
+                ):
+                    continue
+                try:
+                    # Savepoint: a clone that fails half-way (record
+                    # created, chain refused) must leave nothing behind.
+                    # A leftover row would make every later "reopened"
+                    # find the preview as already existing, and the
+                    # comment below would be lying.
+                    with self.env.cr.savepoint():
+                        prod.clone_to_staging(
+                            self._free_preview_name(
+                                prod.project_id, f'pr-{pr_number}',
+                            ),
+                            pr_number=pr_number,
+                            pr_repo=repo_full,
+                            pr_head_branch=head_ref,
+                            pr_installation_id=str(
+                                (payload.get('installation') or {}).get('id') or ''
+                            ),
+                        )
+                except (UserError, ValidationError) as exc:
+                    # Written for a user to read, so it can be shown.
+                    _logger.warning(
+                        "PR preview refused for PR #%s (%s): %s",
+                        pr_number, repo_full, exc,
+                    )
+                    self._report_pr_preview_failure(
+                        prod, repo_full, pr_number, str(exc),
+                    )
+                except pg_errors.UniqueViolation:
+                    if self._open_preview_committed(
+                        False, repo_full, pr_number, prod.project_id,
+                    ):
+                        # The same pull request delivered twice at once:
+                        # the other delivery cloned it.
+                        _logger.info(
+                            "PR preview for PR #%s (%s) created by a concurrent delivery",
+                            pr_number, repo_full,
+                        )
+                        continue
+                    ref = uuid.uuid4().hex[:8]
+                    _logger.exception(
+                        "Failed to create PR preview for PR #%s (ref: %s)",
+                        pr_number, ref,
+                    )
+                    self._report_pr_preview_failure(
+                        prod, repo_full, pr_number,
+                        f'An internal error occurred (ref: {ref}).',
+                    )
+                except Exception:
+                    ref = uuid.uuid4().hex[:8]
+                    _logger.exception(
+                        "Failed to create PR preview for PR #%s (ref: %s)",
+                        pr_number, ref,
+                    )
+                    self._report_pr_preview_failure(
+                        prod, repo_full, pr_number,
+                        f'An internal error occurred (ref: {ref}).',
+                    )
+                else:
+                    _logger.info(
+                        "PR preview instance created for PR #%s (%s) → project %s",
+                        pr_number, repo_full, prod.project_id.name,
+                    )
+                    self.env['cloud.alert'].sudo().resolve_alert(
+                        PR_PREVIEW_FAILED_CODE, instance=prod,
+                    )
+
+        elif action == 'synchronize':
+            # New commit pushed to the PR branch → rebuild existing preview
+            # instances, whether or not they follow pushes (auto_rebuild).
+            # The rebuild names the commit as its push's does: whichever
+            # of the two GitHub delivers first queues it, and the other
+            # becomes the same rebuild (_queue_push_rebuild).
+            push_info = {
+                'push_repo': repo_full,
+                'push_branch': head_ref,
+                'push_sha': (pr.get('head', {}).get('sha') or '')[:7],
+                'push_message': '',
+                'push_by': (payload.get('sender') or {}).get('login', ''),
+                'push_provider': 'github',
+            }
+            for inst in self._pr_previews(repo_full, pr_number):
+                # Skip closed ones being deleted, archived instances and
+                # those on a deactivated/deleted host — rebuilding them
+                # would only fail against a dead server.
+                if inst.pr_state == 'closed' or not (inst.active and inst.deployed
+                        and inst.host_id and inst.host_id.active):
+                    continue
+                job_type = self._rebuild_job_type(inst)
+                if not job_type:
+                    continue
+                # A savepoint per preview: a rebuild that cannot be queued
+                # leaves the others and the event's own writes. A lost race
+                # is raised, for Odoo to run the request again from a fresh
+                # snapshot: set aside, the transaction would be aborted and
+                # the delivery lost.
+                try:
+                    with self.env.cr.savepoint():
+                        for repo in inst.repo_ids:
+                            if (_normalize_url(repo.url) == repo_norm
+                                    and repo.branch != head_ref):
+                                repo.write({'branch': head_ref, 'commit_sha': False})
+                        queued = self._queue_push_rebuild(inst, job_type, push_info)
+                except Exception as exc:
+                    if is_concurrency_error(exc):
+                        raise
+                    _logger.exception(
+                        "Failed to enqueue PR rebuild for %s", inst.name,
+                    )
+                    continue
+                if queued:
+                    _logger.info(
+                        "PR preview rebuild triggered for %s (PR #%s)",
+                        inst.name, pr_number,
+                    )
+
+        elif action == 'closed':
+            # PR merged or closed → destroy preview instances
+            instances = self._pr_previews(repo_full, pr_number)
+            self._resolve_pr_comment_alerts(repo_full, pr_number)
+            for inst in instances:
+                inst_name = inst.name
+                if inst.pr_comment_id:
+                    inst._delete_pr_comment()
+                # Closed outside the delete's savepoint: a preview whose
+                # delete could not be queued is still known to be closed,
+                # and its restore deletes it instead of announcing it.
+                inst.sudo().write({'pr_state': 'closed'})
+                try:
+                    # One still in 'deploying' was unlinked here, which
+                    # its job refused: the event failed and the preview
+                    # lived on. Its delete now waits for that job.
+                    with self.env.cr.savepoint():
+                        inst._remove_closed_preview()
+                except Exception as exc:
+                    if is_concurrency_error(exc):
+                        raise
+                    _logger.exception(
+                        "Failed to delete PR instance %s", inst_name,
+                    )
+                    continue
+                _logger.info(
+                    "PR preview instance %s queued for deletion (PR #%s closed)",
+                    inst_name, pr_number,
+                )
+
+        self.write({'processed': True})
+
+    def _pr_previews(self, repo_full, pr_number, project=None):
+        """Return the previews of a pull request, of one project or all.
+
+        A GitLab merge request's preview may carry the same repository
+        name and number: never a pull request's.
+
+        :param str repo_full: the repository as ``<account>/<name>``
+        :param int pr_number: the pull request's number
+        :param project: the ``cloud.project`` to keep to, or None
+        :rtype: cloud.instance
+        """
+        domain = [
+            ('pr_provider_id', '=', False),
+            ('pr_number', '=', pr_number),
+            ('pr_repo', '=', repo_full),
+        ]
+        if project is not None:
+            domain.append(('project_id', '=', project.id))
+        return self.env['cloud.instance'].search(domain)
+
+    def _is_own_pull_request(self, payload):
+        """Return whether a ``pull_request`` event is the panel's to act on.
+
+        The App is public: every account that installs it sends its events
+        here, signed with the same secret, so a valid signature says that
+        GitHub sent the event, not that it is about one of the panel's
+        repositories. Only the panel's own installation counts.
+
+        :param dict payload: the decoded webhook body
+        :return: ``True`` when it names the panel's installation
+        """
+        if self.env['cloud.github.app'].sudo()._is_own_installation(payload):
+            return True
+        _logger.info(
+            "GitHub PR #%s on %s comes from installation %s, not this "
+            "panel's: ignored.",
+            (payload.get('pull_request') or {}).get('number'),
+            (payload.get('repository') or {}).get('full_name'),
+            (payload.get('installation') or {}).get('id'),
+        )
+        return False
+
+    def _report_other_installation(self, payload, repo_url, from_fork,
+                                   repo_full, pr_number):
+        """Say on each production a pull request would preview that none comes.
+
+        The pull request came through an installation of the panel's App
+        on another account, which the panel does not act on
+        (``_is_own_pull_request``). Only when a production of the panel
+        follows its repository (``_pr_preview_sources``): an account the
+        panel knows nothing of makes no noise. One ``warning`` per
+        production and installation, keyed by the installation's id;
+        choosing that installation under Settings → GitHub resolves it
+        (``cloud.github.app.write``), as does a person.
+
+        :param dict payload: the decoded webhook body
+        :param str repo_url: the clone URL of the base repository
+        :param bool from_fork: whether the head comes from another repository
+        :param str repo_full: the repository as ``<account>/<name>``
+        :param int pr_number: the pull request's number
+        """
+        installation = str((payload.get('installation') or {}).get('id') or '')
+        if not installation:
+            return
+        account = (repo_full or '').split('/', 1)[0]
+        Alert = self.env['cloud.alert'].sudo()
+        for prod in self._pr_preview_sources(repo_url, from_fork):
+            if not self._pr_preview_allowed(prod):
+                continue
+            Alert.raise_alert(
+                PR_OTHER_INSTALLATION_CODE,
+                _(
+                    "Pull request #%(number)s on %(repo)s came through the "
+                    "panel's GitHub App installed on the account %(account)s, "
+                    "which is not the installation this panel acts on: no "
+                    "preview of %(instance)s is created for it. The panel "
+                    "acts on the pull requests of one installation, the one "
+                    "under Settings → GitHub.",
+                    number=pr_number, repo=repo_full, account=account,
+                    instance=prod.name,
+                ),
+                level='warning',
+                instance=prod,
+                key=installation,
+            )
+
+    def _resolve_pr_comment_alerts(self, repo_full, pr_number):
+        """Resolve the alerts about a closed pull request's comment.
+
+        Wherever they went (``cloud.instance._report_pr_comment_failure``:
+        the production, else the preview), by their key: a closed pull
+        request has no comment to write.
+
+        :param str repo_full: the repository as ``<account>/<name>``
+        :param int pr_number: the pull request's number
+        """
+        Alert = self.env['cloud.alert'].sudo()
+        key = f"github_pr:{repo_full}:{pr_number}"
+        for alert in Alert.search([
+            ('code', '=', PR_PREVIEW_NOTE_FAILED_CODE),
+            ('state', '=', 'active'),
+            ('dedup_key', '=', key),
+        ]):
+            Alert.resolve_alert(
+                PR_PREVIEW_NOTE_FAILED_CODE,
+                host=alert.host_id or None,
+                instance=alert.instance_id or None,
+                key=key,
+            )
+
+    def _pr_preview_sources(self, repo_url, from_fork):
+        """Return the production instances a pull request may preview.
+
+        Those whose own repository lines follow the repository the pull
+        request is opened on, unpinned, deployed, in a project with
+        previews switched on. The instance's lines decide, not its
+        project's: a project's lines are only the template its instances
+        start from, and an instance often follows repositories they do
+        not list. Both URLs are compared in their canonical form. None for
+        a pull request from a fork: a preview carries a copy of
+        production's data, and a fork's branch is code written by someone
+        without access to the repository.
+
+        :param str repo_url: the clone URL of the base repository
+        :param bool from_fork: whether the head comes from another repository
+        :return: ``cloud.instance`` recordset
+        """
+        if from_fork:
+            _logger.info(
+                "GitHub PR on %s comes from a fork: no preview.", repo_url,
+            )
+            return self.env['cloud.instance']
+        key = repo_url_key(self.env, repo_url)
+        return self.env['cloud.instance.repo'].search([
+            ('url', 'ilike', key.rsplit('/', 1)[-1]),
+            ('commit_sha', 'in', (False, '')),
+            ('instance_id.environment', '=', 'production'),
+            ('instance_id.deployed', '=', True),
+            ('instance_id.project_id.pr_reviews_enabled', '=', True),
+        ]).filtered(
+            lambda r: repo_url_key(self.env, r.url) == key
+        ).mapped('instance_id')
+
+    def _report_pr_preview_failure(self, prod, pr_repo, pr_number, reason):
+        """Say where people are looking that a preview was not created.
+
+        Two places: the pull request itself, for whoever opened it, and
+        an alert on the production instance, for whoever runs the panel.
+        Until this existed the only trace was a log line, so a pull
+        request that produced nothing looked like a feature that did
+        not work.
+
+        :param prod: the production ``cloud.instance`` that was to be
+            cloned
+        :param str pr_repo: ``owner/name`` of the repository
+        :param int pr_number: the pull request number
+        :param str reason: text safe to publish — a ``UserError``
+            message, or a generic line carrying a log reference
+        """
+        reason = ' '.join((reason or '').split())
+        self.env['cloud.alert'].sudo().raise_alert(
+            PR_PREVIEW_FAILED_CODE,
+            _(
+                "Pull request #%(number)s on %(repo)s asked for a preview "
+                "of %(instance)s and none could be created: %(reason)s",
+                number=pr_number, repo=pr_repo, instance=prod.name,
+                reason=reason,
+            ),
+            level='warning',
+            instance=prod,
+        )
+        self._comment_on_pull_request(pr_repo, pr_number, (
+            '⚠️ **IncubaCloud Preview** — could not be created\n\n'
+            '| | |\n|---|---|\n'
+            f'| **Project** | `{prod.project_id.name}` |\n'
+            f'| **Reason** | {reason} |\n\n'
+            '_Close and reopen the pull request to try again._'
+        ))
+
+    def _comment_on_pull_request(self, pr_repo, pr_number, body):
+        """Post a one-off comment on a pull request. Best effort.
+
+        The comment a preview instance keeps updated lives on the
+        instance (``_post_or_update_pr_comment``); this one is for the
+        case where no instance came to exist. Never raises: failing to
+        comment must not undo the webhook's own bookkeeping.
+
+        :param str pr_repo: ``owner/name`` of the repository
+        :param int pr_number: the pull request number
+        :param str body: Markdown body of the comment
+        """
+        if '/' not in (pr_repo or ''):
+            return
+        owner, repo = pr_repo.split('/', 1)
+        try:
+            creds = self.env[
+                'cloud.github.credential.service'
+            ].get_credentials()
+            GitHubAppClient(creds).post_issue_comment(
+                owner, repo, pr_number, body,
+            )
+        except Exception:
+            _logger.exception(
+                "Could not comment on PR #%s of %s", pr_number, pr_repo,
+            )

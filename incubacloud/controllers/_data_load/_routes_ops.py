@@ -1,0 +1,2175 @@
+"""Operational endpoints: deploy/rebuild, backups, delete project/instance,
+browse/import host directory, container log streaming, captured mail.
+
+Mixed into ``CloudDataLoadController`` in ``data_load.py``.
+"""
+
+import asyncio
+import json
+import logging
+import pathlib
+import re
+import shlex
+import time
+from contextlib import suppress
+from operator import itemgetter
+
+import asyncssh
+import yaml
+
+from odoo import _, http
+from odoo.exceptions import AccessError, UserError, ValidationError
+from odoo.http import request
+
+from ...models._repo_requirements import canonical_repo_url, resolve_repo_ref
+from ...models.cloud_instance_slow_routes import parse_slow_routes
+from ...models.cloud_repo_mixin import _url_host
+from .._rate_limit import Rule, rate_gate_json
+from .._safe_error import safe_error_response
+from ..async_utils import run_async
+from ._helpers import (
+    _is_safe_remote_path,
+    _job_response,
+    _quote_remote_path,
+    copier_series,
+    import_series_refusal,
+    is_safe_log_archive,
+    log_archive_list_command,
+    log_archive_search_command,
+    odoo_log_live_command,
+    odoo_log_read_command,
+)
+from ._mailbox import (
+    is_safe_mail_id,
+    mailbox_clear_command,
+    mailbox_list_command,
+    mailbox_message_command,
+)
+
+_logger = logging.getLogger(__name__)
+
+#: The module's versioned host scripts.
+_SCRIPTS_DIR = pathlib.Path(__file__).resolve().parents[2] / "scripts"
+
+#: Seconds an on-demand reading of a host may take, the SSH connection
+#: and login included: the worker that serves it waits, and so does the
+#: person who pressed the button.
+_READ_TIMEOUT = 20
+
+#: Boards one user may ask for in a minute, an instance's, a server's and
+#: the fleet's together. A board refreshes itself every 45 s and a person
+#: changing the range or zooming asks a few times a minute; each board is
+#: six to fourteen queries to the central, so this bounds what one user,
+#: or one script with a session, costs it (10-nov-2026; shared by the
+#: server and fleet boards since 12-nov-2026, and by an instance's
+#: summary by the hour, five queries, since 15-nov-2026).
+_BOARD_READS_PER_MIN = 20
+
+#: The user and token of an https remote (``https://oauth2:<token>@host/…``),
+#: dropped before the URL is stored.
+_USERINFO_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]*@")
+
+
+class OpsMixin:
+    """Deploy, rebuild, backups, delete, host import, container logs."""
+
+    # ────────────────────────────────────────────────────────────────────────
+
+    @http.route(["/cloud/deploy_instance"], type="jsonrpc", auth="user")
+    def cloud_deploy_instance(self, instance_id):
+        self._sec()._check_can_deploy()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        if not instance.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        try:
+            job_id = instance.deploy()
+        except Exception as exc:
+            return safe_error_response(exc, _("Failed to deploy instance"))
+        return _job_response(request.env, job_id)
+
+    @http.route(["/cloud/rebuild_instance"], type="jsonrpc", auth="user")
+    def cloud_rebuild_instance(self, instance_id):
+        self._sec()._check_can_deploy()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        if not instance.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        if not instance.host_id:
+            return {"ok": False, "error": _("Instance has no host configured")}
+        try:
+            job_id = request.env["cloud.job"].enqueue(
+                instance.host_id.id,
+                instance_id,
+                "rebuild_instance",
+            )
+        except Exception as exc:
+            return safe_error_response(exc, _("Failed to rebuild instance"))
+        return _job_response(request.env, job_id)
+
+    # ── Backup management ──────────────────────────────────────────────────
+
+    def _serialize_backups(self, instance_id, offset=0, limit=None):
+        """Return a page of backup records for an instance as a dict.
+
+        ``total`` is the unpaginated count so the SPA can drive a paginator.
+        """
+        Backup = request.env["cloud.instance.backup"].sudo()
+        domain = [("instance_id", "=", instance_id)]
+        total = Backup.search_count(domain)
+        backups = Backup.search(
+            domain,
+            order="backup_time desc",
+            offset=offset,
+            limit=limit,
+        )
+        return {
+            "total": total,
+            "backups": [
+                {
+                    "id": b.id,
+                    "type": b.backup_type,
+                    "time": b.backup_time.isoformat() if b.backup_time else "",
+                    "volumes": b.volumes,
+                    "is_primary": b.is_primary,
+                    "chain_start": (
+                        b.chain_start.isoformat() if b.chain_start else None
+                    ),
+                    "attachment_id": b.attachment_id.id if b.attachment_id else None,
+                    # ``size`` is now stored on the row uniformly:
+                    # non-prod populates it from the attachment at create
+                    # time, prod populates it from a boto3 listing in the
+                    # ``backup_list`` job. Falls back to attachment.file_size
+                    # for legacy rows whose attachment has not been pruned.
+                    "size": (
+                        b.size or (b.attachment_id.file_size if b.attachment_id else 0)
+                    ),
+                    "with_filestore": b.with_filestore,
+                    "contents": self._backup_contents_label(b),
+                }
+                for b in backups
+            ],
+        }
+
+    @staticmethod
+    def _backup_contents_label(backup):
+        """Human label of what's inside the ZIP/chain.
+
+        Non-prod attachment + ``with_filestore`` → ``"DB + filestore"``
+        Non-prod attachment + no filestore       → ``"DB only"``
+        Prod (no attachment)                     → ``"S3 chain"``
+        """
+        if backup.attachment_id:
+            return _("DB + filestore") if backup.with_filestore else _("DB only")
+        return _("S3 chain")
+
+    @http.route(["/cloud/list_backups"], type="jsonrpc", auth="user")
+    def cloud_list_backups(self, instance_id, refresh=False, offset=0, limit=None):
+        """List backups from cloud.instance.backup records.
+
+        refresh=True enqueues a backup_list job (production: SSH scan,
+        non-production: no-op that reports existing records).
+        """
+        self._sec()._check_can_manage_backups()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        if not instance.exists():
+            return {"ok": False, "error": _("Instance not found")}
+
+        if refresh:
+            if not instance.host_id:
+                return {"ok": False, "error": _("No host configured")}
+            job_id = instance.list_backups()
+            return {"ok": True, "job_id": job_id}
+
+        return {
+            "ok": True,
+            "state": "done",
+            "result": self._serialize_backups(instance_id, offset=offset, limit=limit),
+        }
+
+    @http.route(["/cloud/get_backup_result"], type="jsonrpc", auth="user")
+    def cloud_get_backup_result(self, job_id, offset=0, limit=None):
+        """Poll a backup_list job; return persisted records when done."""
+        self._sec()._check_can_manage_backups()
+        job = request.env["cloud.job"].browse(job_id)
+        if not job.exists():
+            return {"ok": False, "error": _("Job not found")}
+        state = "blocked" if job.blocked_alert_id else job.state
+        # Waiting in the instance's queue is waiting, like a dispatched
+        # job that has not started: the tab keeps polling, no error.
+        if state in ("queued", "pending", "enqueued", "started", "wait_dependencies"):
+            return {"ok": True, "state": state, "result": None}
+        if state == "done":
+            inst_id = job.instance_id.id if job.instance_id else None
+            return {
+                "ok": True,
+                "state": "done",
+                "result": self._serialize_backups(inst_id, offset=offset, limit=limit)
+                if inst_id
+                else {},
+            }
+        return {
+            "ok": False,
+            "state": state,
+            "error": job._get_last_system_message() or _("Job failed."),
+        }
+
+    @http.route(["/cloud/create_backup"], type="jsonrpc", auth="user")
+    def cloud_create_backup(self, instance_id, with_filestore=True):
+        """Enqueue a backup_create job.
+
+        ``with_filestore`` (bool) is meaningful for non-production
+        instances: it flips ``click-odoo-backupdb --filestore`` /
+        ``--no-filestore``. Production ignores it (duplicity controls
+        shape). Coerced to bool at the boundary so any truthy JSON-RPC
+        input (including strings) collapses safely before reaching
+        the executor.
+        """
+        self._sec()._check_can_manage_backups()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        if not instance.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        if not instance.host_id:
+            return {"ok": False, "error": _("Instance has no host configured")}
+        if not instance.deployed:
+            return {"ok": False, "error": _("Instance is not deployed")}
+        job_id = instance.create_backup(with_filestore=bool(with_filestore))
+        return {"ok": True, "job_id": job_id}
+
+    @http.route(["/cloud/clone_to_staging"], type="jsonrpc", auth="user")
+    def cloud_clone_to_staging(self, instance_id, staging_name):
+        self._sec()._check_can_clone_to_staging()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        if not instance.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        if instance.environment != "production":
+            return {"ok": False, "error": _("Only production instances")}
+        if not instance.deployed:
+            return {"ok": False, "error": _("Instance not deployed")}
+        if not staging_name or not staging_name.strip():
+            return {"ok": False, "error": _("Name is required")}
+        result = instance.clone_to_staging(staging_name.strip())
+        return {"ok": True, **result}
+
+    @http.route(["/cloud/refresh_from_production"], type="jsonrpc", auth="user")
+    def cloud_refresh_from_production(
+        self, instance_id, source_instance_id, source="backup",
+        neutralize=True,
+    ):
+        """Replace a staging's data with a copy of its production's.
+
+        Gated on the same capability as cloning: moving production data
+        into a staging instance.
+        """
+        self._sec()._check_can_clone_to_staging()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        if not instance.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        try:
+            return instance.refresh_from_production(
+                source_instance_id,
+                source=source,
+                neutralize=bool(neutralize),
+            )
+        except UserError as exc:
+            return {"ok": False, "error": str(exc)}
+
+
+    def _metrics_instance(self, instance_id):
+        """Return the instance a Metrics reading is about, or None.
+
+        The gate of every reading of the Metrics tab: the Developer role
+        (``_check_can_view_metrics``, which raises) and the record rules
+        on the instance. An instance the caller cannot read is answered
+        as one that does not exist.
+
+        :param int instance_id: the instance asked about.
+        :rtype: cloud.instance | None
+        """
+        self._sec()._check_can_view_metrics()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        try:
+            if not instance.exists():
+                return None
+            instance.check_access("read")
+        except AccessError:
+            return None
+        return instance
+
+    def _read_with_script(self, host, name, args, timeout=_READ_TIMEOUT):
+        """Run a versioned script of ``scripts/`` on a host, on demand.
+
+        A reading somebody asks for is no job, so nothing uploads the
+        script beforehand: its text travels on stdin into a private
+        temporary file (``mktemp``, 0600) that is removed when it ends,
+        and the script runs with its own standard input, so a command
+        in it cannot swallow the rest of it. Its arguments are quoted;
+        a remote path starting with ``~/`` keeps the home expansion.
+
+        :param host: the ``cloud.host`` to run it on.
+        :param str name: the script's name under ``scripts/``.
+        :param args: its arguments, in order.
+        :param int timeout: seconds the whole reading may take, the
+            connection and the login included; a worker of the panel
+            waits on it.
+        :returns: ``(stdout, stderr, exit status)``.
+        :raises asyncio.TimeoutError: when the host does not answer in
+            time (the built-in ``TimeoutError`` from Python 3.11).
+        """
+        script = (_SCRIPTS_DIR / name).read_text()
+        # The connection and the login share the reading's own deadline
+        # instead of the 30 s each that jobs get from the host.
+        connect = host.ssh_connect_kwargs() | {
+            "connect_timeout": timeout, "login_timeout": timeout,
+        }
+        quoted = " ".join(
+            _quote_remote_path(a) if str(a).startswith("~") else shlex.quote(str(a))
+            for a in args
+        )
+        command = (
+            'f="$(mktemp)" && trap \'rm -f "$f"\' EXIT && cat > "$f" && '
+            f'bash "$f" {quoted} </dev/null'
+        )
+
+        async def _run():
+            async with asyncssh.connect(**connect) as conn:
+                result = await conn.run(command, input=script, check=False)
+                return result.stdout or "", result.stderr or "", result.exit_status
+
+        return run_async(asyncio.wait_for(_run(), timeout))
+
+    @http.route(["/cloud/instance/access_log"], type="jsonrpc", auth="user")
+    def cloud_instance_access_log(self, instance_id, tail=None):
+        """Return this instance's recent requests from the proxy log.
+
+        The question this answers is "who is hitting this instance right
+        now, with what, and how is it responding" — which the metrics
+        cannot answer, because they carry neither client IP nor path.
+
+        Read live over SSH and not stored: these lines contain the IP
+        addresses of somebody else's end users, so the fewer copies exist
+        the better. Gated on the same role as the metrics view, and on
+        the record rules of the instance.
+        """
+        instance = self._metrics_instance(instance_id)
+        if not instance:
+            return {"ok": False, "error": _("Instance not found")}
+        try:
+            host = instance._require_access_log_host()
+            command = instance._access_log_command(tail=tail)
+        except UserError as exc:
+            return {"ok": False, "error": str(exc)}
+        try:
+            stdout, stderr = self._ssh_run(host, command)
+        except Exception as exc:  # noqa: BLE001 — surfaced, not swallowed
+            _logger.warning(
+                "[access-log] could not read the proxy log on host %s: %s",
+                host.name, exc,
+            )
+            return safe_error_response(exc, _("Could not read the proxy log"))
+        rows = instance._parse_access_log(stdout or stderr or "")
+        return {
+            "ok": True,
+            "entries": rows,
+            "summary": instance._access_log_summary(rows),
+        }
+
+    @http.route(["/cloud/instance/resource_series"], type="jsonrpc",
+                auth="user")
+    def cloud_instance_resource_series(self, instance_id, range_key="1h",
+                                       start=None, end=None):
+        """Return the board of this instance's Metrics tab, diagnosed.
+
+        Every panel of ``metrics_charts.PANELS["instance"]`` read from
+        the central with this panel's own credential, and the plain-words
+        diagnosis of its last 15 minutes. The browser names a range or,
+        when it zooms, a window inside the last week; the PromQL is built
+        on the server (``cloud.instance._metrics_board``).
+
+        ``timing.total_ms`` is the whole route as the server saw it,
+        ``timing.central_ms`` the panels' queries run in parallel.
+
+        :param int instance_id: the instance to chart.
+        :param str range_key: ``1h``, ``6h``, ``24h`` or ``7d``.
+        :param start: zoom window start, unix seconds.
+        :param end: zoom window end, unix seconds.
+        """
+        began = time.monotonic()
+        instance = self._metrics_instance(instance_id)
+        if not instance:
+            return {"ok": False, "error": _("Instance not found")}
+        return self._board_answer(
+            began, lambda: instance._metrics_board(range_key, start, end),
+        )
+
+    @http.route(["/cloud/instance/metrics_summary"], type="jsonrpc",
+                auth="user")
+    def cloud_instance_metrics_summary(self, instance_id, hours=24, end=None):
+        """Return this instance's metrics by the hour, with their peaks.
+
+        What an agent reads instead of the charts (``read_metrics`` of the
+        MCP): ``cloud.instance._metrics_summary``. Gated as the Metrics
+        tab, and counted in the same reads a minute as its boards.
+
+        :param int instance_id: the instance to summarise.
+        :param int hours: the window up to now, 1 to 168.
+        :param str end: where the window ends, ISO 8601, as an earlier
+            answer gave it; now when omitted.
+        """
+        began = time.monotonic()
+        instance = self._metrics_instance(instance_id)
+        if not instance:
+            return {"ok": False, "error": _("Instance not found")}
+        return self._board_answer(
+            began, lambda: instance._metrics_summary(hours, end),
+        )
+
+    def _board_answer(self, began, read):
+        """Read a board within the caller's budget and time the whole route.
+
+        :param float began: ``time.monotonic()`` when the route started.
+        :param read: a callable returning the board (``_metrics_board``
+            of a record, or of the fleet).
+        :returns: the board with ``timing.total_ms``; the rate gate's
+            answer when the caller asked too often; ``{"ok": False,
+            "error"}`` on a window that is not valid.
+        :rtype: dict
+        """
+        limited = rate_gate_json(Rule(
+            f"metrics_board_user:{request.env.uid}",
+            _("Too many chart reads recently. Try again in a minute."),
+            max_per_window=_BOARD_READS_PER_MIN,
+            log_tag=f"metrics board user={request.env.uid}",
+        ))
+        if limited:
+            return limited
+        try:
+            result = read()
+        except UserError as exc:
+            return {"ok": False, "error": str(exc)}
+        if result.get("ok"):
+            result["timing"]["total_ms"] = round(
+                (time.monotonic() - began) * 1000, 1,
+            )
+        return result
+
+    @http.route(["/cloud/host/resource_series"], type="jsonrpc", auth="user")
+    def cloud_host_resource_series(self, host_id, range_key="1h",
+                                   start=None, end=None):
+        """Return the board of a server's Metrics tab, diagnosed.
+
+        Every panel of ``metrics_charts.PANELS["host"]`` read from the
+        central with this panel's own credential, the "who uses it"
+        table and the plain-words diagnosis of its last 15 minutes
+        (``cloud.host._metrics_board``). Gated as the instance's board:
+        the Developer role and the record rules on the host; a host the
+        caller cannot read is answered as one that does not exist.
+
+        :param int host_id: the server to chart.
+        :param str range_key: ``1h``, ``6h``, ``24h`` or ``7d``.
+        :param start: zoom window start, unix seconds.
+        :param end: zoom window end, unix seconds.
+        """
+        began = time.monotonic()
+        self._sec()._check_can_view_metrics()
+        host = request.env["cloud.host"].browse(host_id)
+        try:
+            if not host.exists():
+                return {"ok": False, "error": _("Host not found")}
+            host.check_access("read")
+        except AccessError:
+            return {"ok": False, "error": _("Host not found")}
+        return self._board_answer(
+            began, lambda: host._metrics_board(range_key, start, end),
+        )
+
+    def _security_host(self, host_id):
+        """Return the server a Security view asks about, or None.
+
+        Gated as the server's board: the Developer role (which raises)
+        and the record rules on the host. A host the caller cannot read,
+        and an archived one, is answered as one that does not exist.
+
+        :param int host_id: the server asked about.
+        :rtype: cloud.host | None
+        """
+        self._sec()._check_can_view_metrics()
+        if isinstance(host_id, bool) or not isinstance(host_id, int):
+            return None
+        host = request.env["cloud.host"].browse(host_id)
+        try:
+            if not host.exists() or not host.active:
+                return None
+            host.check_access("read")
+        except AccessError:
+            return None
+        return host
+
+    @staticmethod
+    def _security_instance_param(host, instance_id):
+        """Check the instance filter of a Security view: an id of this server.
+
+        :param host: the ``cloud.host`` asked about.
+        :param instance_id: what the browser sent: None or an int.
+        :returns: ``(id or None, error or None)``; the error when it is
+            not an instance of this server the caller can read.
+        :rtype: tuple
+        """
+        if instance_id in (None, False, 0):
+            return None, None
+        if isinstance(instance_id, bool) or not isinstance(instance_id, int) or instance_id < 0:
+            return None, _("Instance not found")
+        found = request.env["cloud.instance"].search_count([
+            ("id", "=", instance_id), ("host_id", "=", host.id),
+        ])
+        return (instance_id, None) if found else (None, _("Instance not found"))
+
+    @http.route(["/cloud/host/security_board"], type="jsonrpc", auth="user")
+    def cloud_host_security_board(self, host_id, range_key="1h", start=None,
+                                  end=None, instance_id=None):
+        """Return a server's Security view (plan #84, C6, decision D4).
+
+        The charts, the defence, the HTTP of its instances and the web
+        logins' figures for the Developer role and above; the tables
+        with addresses, users and commands only for whoever manages
+        servers, decided here: without that group the answer has no
+        ``tables`` at all (``cloud.host._security_board``). The browser
+        sends ids and a range, never LogQL. Same per-user limit as the
+        other boards.
+
+        :param int host_id: the server.
+        :param str range_key: ``1h``, ``6h``, ``24h`` or ``7d``.
+        :param start: zoom window start, unix seconds.
+        :param end: zoom window end, unix seconds.
+        :param instance_id: the web-login tables of one instance of this
+            server, over 7 days.
+        """
+        began = time.monotonic()
+        host = self._security_host(host_id)
+        if not host:
+            return {"ok": False, "error": _("Host not found")}
+        instance_id, refused = self._security_instance_param(host, instance_id)
+        if refused:
+            return {"ok": False, "error": refused}
+        detail = self._sec()._has_cloud_group("group_cloud_manager")
+        return self._board_answer(began, lambda: host._security_board(
+            range_key, start, end, instance_id=instance_id, detail=detail,
+        ))
+
+    @http.route(["/cloud/host/access"], type="jsonrpc", auth="user")
+    def cloud_host_access(self, host_id):
+        """Return a server's Access tab: how the panel signs in, and who did.
+
+        For whoever manages servers, as the Security view's tables: the
+        account, the address and the sign-ins are theirs to see
+        (``cloud.host._access_summary``).
+
+        :param int host_id: the server.
+        """
+        self._sec()._check_can_manage_hosts()
+        host = self._security_host(host_id)
+        if not host:
+            return {"ok": False, "error": _("Host not found")}
+        return {"ok": True, **host._access_summary()}
+
+    @http.route(["/cloud/host/security_lines"], type="jsonrpc", auth="user")
+    def cloud_host_security_lines(self, host_id, source="all", range_key="24h",
+                                  instance_id=None):
+        """Return a server's last security lines of one kind, raw ("see lines").
+
+        Only for whoever manages servers (D4): the lines carry the users
+        an attacker tried, the commands given to sudo and the addresses
+        of the instances' visitors. A closed kind and an id, never
+        LogQL; at most 200 lines.
+
+        :param int host_id: the server.
+        :param str source: ``sshd``, ``sudo``, ``fail2ban``, ``auditd``,
+            ``weblogin`` or ``all``.
+        :param str range_key: how far back, at most 7 days.
+        :param instance_id: with ``weblogin``, one instance of this server.
+        """
+        self._sec()._check_can_manage_hosts()
+        host = self._security_host(host_id)
+        if not host:
+            return {"ok": False, "error": _("Host not found")}
+        instance_id, refused = self._security_instance_param(host, instance_id)
+        if refused:
+            return {"ok": False, "error": refused}
+        limited = rate_gate_json(self._log_read_rule(
+            "security_lines",
+            _("Too many log reads recently. Try again in a minute."),
+        ))
+        if limited:
+            return limited
+        return host._security_lines(source, range_key, instance_id=instance_id)
+
+    @http.route(["/cloud/host/known_key_add"], type="jsonrpc", auth="user")
+    def cloud_host_known_key_add(self, host_id, key="", name="", networks=""):
+        """Add a known SSH key to a server, from its Security view.
+
+        Whoever manages servers, with write access to the server; a
+        session's alone (``auth="user"``: no API key reaches it), and no
+        tool of the MCP calls it. What was pasted is read into its
+        fingerprint before anything is written and never repeated in an
+        answer (``cloud.host._security_known_key_add``).
+
+        :param int host_id: the server.
+        :param str key: the public key line, ``ssh-keygen -lf``'s line or
+            the fingerprint.
+        :param str name: who or what holds it.
+        :param str networks: the addresses it may sign in from, or empty.
+        :returns: ``{"ok": True, "known_keys"}`` or ``{"ok": False, "error"}``.
+        """
+        self._sec()._check_can_manage_hosts()
+        host = self._security_host(host_id)
+        if not host:
+            return {"ok": False, "error": _("Host not found")}
+        if not all(isinstance(value, str) for value in (key, name, networks or "")):
+            return {"ok": False, "error": _("That is not a public key or a SHA256 fingerprint.")}
+        try:
+            host._security_known_key_add(key, name, networks or "")
+        except (UserError, ValidationError) as exc:
+            return {"ok": False, "error": exc.args[0] if exc.args else str(exc)}
+        return {"ok": True, "known_keys": host._security_known_keys_answer(True)}
+
+    @http.route(["/cloud/host/known_key_remove"], type="jsonrpc", auth="user")
+    def cloud_host_known_key_remove(self, host_id, key_id):
+        """Remove a known SSH key of a server: its sign-ins alert again.
+
+        As :meth:`cloud_host_known_key_add`. The key stays listed as
+        removed, with who removed it and when.
+
+        :param int host_id: the server.
+        :param int key_id: the known key.
+        :returns: ``{"ok": True, "known_keys"}`` or ``{"ok": False, "error"}``.
+        """
+        self._sec()._check_can_manage_hosts()
+        host = self._security_host(host_id)
+        if not host:
+            return {"ok": False, "error": _("Host not found")}
+        if isinstance(key_id, bool) or not isinstance(key_id, int):
+            return {"ok": False, "error": _("That key is not a known key of this server.")}
+        try:
+            host._security_known_key_remove(key_id)
+        except UserError as exc:
+            return {"ok": False, "error": exc.args[0] if exc.args else str(exc)}
+        return {"ok": True, "known_keys": host._security_known_keys_answer(True)}
+
+    @http.route(["/cloud/fleet/resource_series"], type="jsonrpc", auth="user")
+    def cloud_fleet_resource_series(self, range_key="1h", start=None, end=None):
+        """Return the fleet's board of Monitoring.
+
+        This panel's own servers, read with its account credential:
+        no panel draws another account's, the one that deployed the
+        central included (``cloud.host._fleet_metrics_board``). The
+        browser names only a range or a window.
+
+        :param str range_key: ``1h``, ``6h``, ``24h`` or ``7d``.
+        :param start: zoom window start, unix seconds.
+        :param end: zoom window end, unix seconds.
+        """
+        began = time.monotonic()
+        self._sec()._check_can_view_metrics()
+        return self._board_answer(
+            began,
+            lambda: request.env["cloud.host"]._fleet_metrics_board(
+                range_key, start, end,
+            ),
+        )
+
+    @http.route(["/cloud/instance/db_activity"], type="jsonrpc", auth="user")
+    def cloud_instance_db_activity(self, instance_id):
+        """Return what this instance's database is doing right now.
+
+        Its sessions with what they wait on and who blocks whom, the
+        totals of the "Queries now" line and the tables with most dead
+        rows (``scripts/read_pg_activity.sh``). Read on demand and never
+        stored: the text of a query can carry personal data.
+
+        :param int instance_id: the instance to read.
+        """
+        instance = self._metrics_instance(instance_id)
+        if not instance:
+            return {"ok": False, "error": _("Instance not found")}
+        limited = rate_gate_json(self._log_read_rule(
+            "db_activity",
+            _("Too many database reads recently. Try again in a minute."),
+        ))
+        if limited:
+            return limited
+        try:
+            host = instance._require_deployed_host()
+            stdout, stderr, status = self._read_with_script(
+                host, "read_pg_activity.sh",
+                [instance.get_remote_dir(), instance.postgres_dbname or "prod"],
+            )
+            if status:
+                _logger.warning(
+                    "[db-activity] instance %s: exit %s: %s",
+                    instance.id, status, (stderr or "")[-500:],
+                )
+                raise UserError(_(
+                    "The database of this instance could not be read. Is it "
+                    "running?"
+                ))
+            reading = instance._parse_db_activity(stdout)
+        except UserError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — surfaced, not swallowed
+            _logger.warning(
+                "[db-activity] instance %s: %s", instance.id, exc,
+            )
+            return safe_error_response(
+                exc, _("Could not read the database of this instance"),
+            )
+        return {"ok": True, "read_at": instance._now_iso(), **reading}
+
+    @http.route(["/cloud/instance/slow_routes"], type="jsonrpc", auth="user")
+    def cloud_instance_slow_routes(self, instance_id, minutes=15):
+        """Return where this instance's time went in the last minutes.
+
+        Its slowest routes with their SQL and Python share, its scheduled
+        actions with their duration, the workers killed by a time limit
+        with the start of their trace and those recycled for memory,
+        added up from its Odoo log (``scripts/read_odoo_log.sh``).
+
+        :param int instance_id: the instance to read.
+        :param int minutes: 15 or 60.
+        """
+        instance = self._metrics_instance(instance_id)
+        if not instance:
+            return {"ok": False, "error": _("Instance not found")}
+        limited = rate_gate_json(self._log_read_rule("slow_routes"))
+        if limited:
+            return limited
+        try:
+            host = instance._require_deployed_host()
+            cutoff, minutes = instance._slow_routes_args(minutes)
+            stdout, stderr, status = self._read_with_script(
+                host, "read_odoo_log.sh",
+                [instance.get_remote_dir(), cutoff, minutes],
+            )
+            if status:
+                _logger.warning(
+                    "[slow-routes] instance %s: exit %s: %s",
+                    instance.id, status, (stderr or "")[-500:],
+                )
+                raise UserError(_("The log of this instance could not be read."))
+        except UserError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — surfaced, not swallowed
+            _logger.warning("[slow-routes] instance %s: %s", instance.id, exc)
+            return safe_error_response(
+                exc, _("Could not read the log of this instance"),
+            )
+        return {
+            "ok": True,
+            "read_at": instance._now_iso(),
+            "minutes": minutes,
+            **parse_slow_routes(stdout, minutes),
+        }
+
+    @http.route(["/cloud/move_instance"], type="jsonrpc", auth="user")
+    def cloud_move_instance(self, instance_id, target_host_id):
+        """Move a deployed instance to another host (manager-only)."""
+        self._sec()._check_can_manage_hosts()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        if not instance.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        target = request.env["cloud.host"].browse(target_host_id)
+        if not target.exists():
+            return {"ok": False, "error": _("Target host not found")}
+        try:
+            return instance.move_to_host(target)
+        except UserError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @http.route(["/cloud/rollback_move"], type="jsonrpc", auth="user")
+    def cloud_rollback_move(self, instance_id):
+        """Roll back a move that failed before cutover (manager-only)."""
+        self._sec()._check_can_manage_hosts()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        if not instance.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        try:
+            return instance.rollback_move()
+        except UserError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @http.route(["/cloud/clean_frozen_copy"], type="jsonrpc", auth="user")
+    def cloud_clean_frozen_copy(self, instance_id):
+        """Remove the copy the last move froze on the old host (manager-only)."""
+        self._sec()._check_can_manage_hosts()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        if not instance.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        try:
+            return instance.action_clean_frozen_copy()
+        except UserError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @http.route(["/cloud/download_backup"], type="jsonrpc", auth="user")
+    def cloud_download_backup(self, instance_id, time, download_type="dump"):
+        """Download a backup. Prod: enqueue job. Non-prod: return attachment URL."""
+        self._sec()._check_can_manage_backups()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        if not instance.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        if not instance.host_id:
+            return {"ok": False, "error": _("Instance has no host configured")}
+        job_id = instance.download_backup(
+            {
+                "time": time,
+                "download_type": download_type,
+            }
+        )
+        return {"ok": True, "job_id": job_id}
+
+    @http.route(
+        ["/cloud/download_backup_neutralized"],
+        type="jsonrpc",
+        auth="user",
+    )
+    def cloud_download_backup_neutralized(
+        self,
+        instance_id,
+        time="live",
+        with_filestore=False,
+    ):
+        """Download a neutralized backup.
+
+        Prod: ``time`` is a duplicity timestamp (or 'latest') — the S3
+        backup is restored into a throwaway DB that is neutralized and
+        re-dumped.
+
+        Non-prod: ``time='live'`` — the current DB is dumped on the fly,
+        neutralized into a throwaway DB and re-dumped.
+        """
+        self._sec()._check_can_manage_backups()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        if not instance.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        if not instance.host_id:
+            return {"ok": False, "error": _("Instance has no host configured")}
+        if not instance.deployed:
+            return {"ok": False, "error": _("Instance is not deployed")}
+        job_id = instance.download_backup_neutralized(
+            {
+                "time": time,
+                "with_filestore": bool(with_filestore),
+            }
+        )
+        return {"ok": True, "job_id": job_id}
+
+    @http.route(["/cloud/restore_backup"], type="jsonrpc", auth="user")
+    def cloud_restore_backup(self, instance_id, time):
+        """Restore a production instance from a duplicity backup."""
+        self._sec()._check_can_manage_backups()
+        instance = request.env["cloud.instance"].browse(instance_id)
+        if not instance.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        if instance.environment != "production":
+            return {
+                "ok": False,
+                "error": _("Backup restore only supported for production."),
+            }
+        if not instance.host_id:
+            return {"ok": False, "error": _("Instance has no host configured")}
+        job_id = instance.restore_backup({"time": time})
+        return {"ok": True, "job_id": job_id}
+
+    @http.route(["/cloud/delete_project"], type="jsonrpc", auth="user")
+    def cloud_delete_project(self, project_id):
+        self._sec()._check_can_delete_project()
+        project = request.env["cloud.project"].browse(project_id)
+        if not project.exists():
+            return {"ok": False, "error": _("Project not found")}
+        count = len(project.instance_ids)
+        if count:
+            return {
+                "ok": False,
+                "error": _(
+                    "This project has %(count)s instance(s). "
+                    "Delete all instances before deleting the project."
+                )
+                % {"count": count},
+            }
+        project.unlink()
+        return {"ok": True}
+
+    @http.route(["/cloud/delete_instance"], type="jsonrpc", auth="user")
+    def cloud_delete_instance(self, instance_id):
+        # The role floor is checked BEFORE ``exists()`` on purpose.
+        # ``exists()`` runs raw SQL — no ACL, no record rule — so
+        # answering "Instance not found" to a caller who may not delete
+        # anything turns this route into an id -> exists oracle over
+        # every instance on the platform, reachable by any authenticated
+        # user including a portal customer. Every sibling delete route
+        # gates first; this one did not.
+        #
+        # ``_check_can_delete_instance`` still runs below and is the one
+        # that decides: it needs the record to tell production (manager)
+        # from the rest (consultant), so only the floor of that decision
+        # can be checked this early.
+        self._sec()._check_cloud_group("group_cloud_consultant")
+        inst = request.env["cloud.instance"].browse(instance_id)
+        if not inst.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        self._sec()._check_can_delete_instance(inst)
+        # No refusal for jobs on the instance: what waits in its queue
+        # is cancelled by the unlink, and a record a job owns right now
+        # ('deploying', 'deleting') is refused by the unlink itself.
+        inst.unlink()
+        return {"ok": True}
+
+    # ── Host instance import (file browser + import) ─────────────────────────
+
+    def _ssh_run(self, host, command):
+        """Run a single SSH command on a host synchronously."""
+
+        async def _run():
+            async with asyncssh.connect(
+                **host.ssh_connect_kwargs(),
+            ) as conn:
+                result = await conn.run(command, check=False)
+                return result.stdout or "", result.stderr or ""
+
+        return run_async(_run())
+
+    def _ssh_run_multi(self, host, commands):
+        """Run multiple SSH commands on a host in one connection."""
+
+        async def _run():
+            results = []
+            async with asyncssh.connect(
+                **host.ssh_connect_kwargs(),
+            ) as conn:
+                for cmd in commands:
+                    result = await conn.run(cmd, check=False)
+                    results.append(
+                        (result.stdout or "", result.stderr or ""),
+                    )
+            return results
+
+        return run_async(_run())
+
+    @http.route(["/cloud/browse_host_dir"], type="jsonrpc", auth="user")
+    def cloud_browse_host_dir(self, host_id, path="~"):
+        """Browse directories on a remote host via SSH.
+
+        Returns directory listing with doodba instance detection.
+        """
+        self._sec()._check_can_manage_hosts()
+        host = request.env["cloud.host"].browse(host_id)
+        if not host.exists():
+            return {"ok": False, "error": _("Host not found")}
+
+        # Reject any path that could break out of the intended 'cd <path>'
+        # call. Defense-in-depth: we also shlex-quote below, but rejecting
+        # bad input early makes the attack surface trivially auditable.
+        if not _is_safe_remote_path(path):
+            return {
+                "ok": False,
+                "error": _(
+                    "Invalid path. Use letters, digits, dots, hyphens and "
+                    "underscores in each segment. Shell metacharacters, "
+                    "spaces and '..' are not allowed."
+                ),
+            }
+
+        # Resolve ~ and get listing
+        try:
+            stdout, _stderr = self._ssh_run(
+                host,
+                (
+                    f"cd {_quote_remote_path(path)} 2>/dev/null"
+                    f' && pwd && echo "---" && ls -1pA 2>/dev/null'
+                ),
+            )
+        except Exception:
+            _logger.exception("SSH browse failed for host %s", host_id)
+            return {
+                "ok": False,
+                "error": _("An internal error occurred. Check server logs."),
+            }
+
+        lines = stdout.strip().splitlines()
+        if not lines or "---" not in lines:
+            return {"ok": False, "error": _("Could not list directory")}
+
+        sep_idx = lines.index("---")
+        current_path = lines[0].strip()
+        entries_raw = lines[sep_idx + 1 :]
+
+        # Identify directories (ls -p appends / to dirs)
+        dirs = []
+        for entry in entries_raw:
+            entry = entry.strip()
+            if entry.endswith("/"):
+                name = entry.rstrip("/")
+                if name not in (".", ".."):
+                    dirs.append(name)
+
+        # Check which dirs are doodba instances
+        # (must have BOTH .copier-answers.yml AND docker-compose.yml)
+        # current_path comes from `pwd` output (already resolved, no ~)
+        # and d comes from `ls -1pA` output. We still shlex-quote both as
+        # defense-in-depth against exotic filenames on the remote host.
+        if dirs:
+            cp_q = shlex.quote(current_path)
+            checks = " ".join(
+                f"([ -f {cp_q}/{shlex.quote(d)}/.copier-answers.yml ] "
+                f"&& [ -f {cp_q}/{shlex.quote(d)}/docker-compose.yml ] "
+                f"&& echo DOODBA:{shlex.quote(d)}) || true"
+                for d in dirs[:50]
+            )
+            try:
+                check_stdout, _stderr = self._ssh_run(host, checks)
+            except Exception:
+                check_stdout = ""
+            doodba_dirs = set()
+            for line in check_stdout.splitlines():
+                if line.startswith("DOODBA:"):
+                    doodba_dirs.add(line[7:].strip())
+        else:
+            doodba_dirs = set()
+
+        # Check if current directory is a doodba instance
+        is_current_doodba = False
+        copier_info = {}
+        with suppress(Exception):
+            cp_q = shlex.quote(current_path)
+            stdout_check, _stderr = self._ssh_run(
+                host,
+                (
+                    f"[ -f {cp_q}/.copier-answers.yml ] && "
+                    f"[ -f {cp_q}/docker-compose.yml ] && "
+                    f'cat {cp_q}/.copier-answers.yml || echo ""'
+                ),
+            )
+            if stdout_check.strip() and "odoo_version" in stdout_check:
+                is_current_doodba = True
+                data = yaml.safe_load(stdout_check) or {}
+                copier_info = {
+                    "project_name": data.get("project_name", ""),
+                    "odoo_version": str(data.get("odoo_version", "")),
+                }
+
+        # Check already imported instances
+        imported_paths = set(
+            request.env["cloud.instance"]
+            .search(
+                [
+                    ("host_id", "=", host_id),
+                    ("custom_remote_dir", "!=", False),
+                ]
+            )
+            .mapped("custom_remote_dir")
+        )
+
+        parent_path = "/".join(current_path.rstrip("/").split("/")[:-1]) or "/"
+
+        entries = []
+        for d in sorted(dirs):
+            full_path = f"{current_path}/{d}"
+            entries.append(
+                {
+                    "name": d,
+                    "is_dir": True,
+                    "is_doodba": d in doodba_dirs,
+                    "already_imported": full_path in imported_paths,
+                }
+            )
+
+        return {
+            "ok": True,
+            "current_path": current_path,
+            "parent_path": parent_path,
+            "is_doodba": is_current_doodba,
+            "copier_info": copier_info,
+            "already_imported": current_path in imported_paths,
+            "entries": entries,
+        }
+
+    @http.route(["/cloud/import_host_instance"], type="jsonrpc", auth="user")
+    def cloud_import_host_instance(self, host_id, path):
+        """Import a running doodba instance from a host directory.
+
+        Reads all config files via SSH, creates project + instance. An
+        instance of a series the user may not choose, or whose series
+        neither its answers nor its project name, is refused before
+        anything is created (``import_series_refusal``), as is one whose
+        domains another instance holds. The project, its repository lines
+        and the instance are created together or not at all.
+        """
+        # Manager-gated like browse_host_dir: importing reads the host's
+        # ``.docker/*.env`` secrets over SSH and materialises them as
+        # records, so it is a host-level operation, not a plain instance
+        # create. (Today the developer-only field ACLs on the host
+        # credentials already block a lower role, but the gate must match
+        # the sensitivity in its own right.)
+        self._sec()._check_can_manage_hosts()
+        host = request.env["cloud.host"].browse(host_id)
+        if not host.exists():
+            return {"ok": False, "error": _("Host not found")}
+
+        if not _is_safe_remote_path(path):
+            return {
+                "ok": False,
+                "error": _(
+                    "Invalid path. Use letters, digits, dots, hyphens and "
+                    "underscores in each segment. Shell metacharacters, "
+                    "spaces and '..' are not allowed."
+                ),
+            }
+
+        # Check not already imported
+        existing = request.env["cloud.instance"].search(
+            [
+                ("host_id", "=", host_id),
+                ("custom_remote_dir", "=", path),
+            ],
+            limit=1,
+        )
+        if existing:
+            return {
+                "ok": False,
+                "error": _("This instance is already imported."),
+            }
+
+        # All shell interpolations of `path` go through _quote_remote_path,
+        # which shlex-quotes the value (and preserves ~/ home expansion).
+        # Combined with the _is_safe_remote_path check above this is a
+        # double defense against command injection.
+        qp = _quote_remote_path(path)
+
+        # Read all config files in one SSH connection
+        files_to_read = [
+            f"{qp}/.copier-answers.yml",
+            f"{qp}/odoo/custom/src/repos.yaml",
+            f"{qp}/odoo/custom/src/addons.yaml",
+            f"{qp}/odoo/custom/dependencies/pip.txt",
+            f"{qp}/odoo/custom/dependencies/apt.txt",
+            f"{qp}/.docker/odoo.env",
+            f"{qp}/.docker/db-access.env",
+            f"{qp}/.docker/smtp.env",
+            f"{qp}/.docker/backup.env",
+            f"{qp}/docker-compose.override.yml",
+        ]
+        # Read all files + check symlink + docker compose ps
+        commands = [f'cat {f} 2>/dev/null || echo ""' for f in files_to_read] + [
+            # conf.d: concatenate all .conf files
+            f'cat {qp}/odoo/custom/conf.d/*.conf 2>/dev/null || echo ""',
+            # docker-compose.yml symlink target
+            f'readlink -f {qp}/docker-compose.yml 2>/dev/null || echo ""',
+            # Container status
+            f"cd {qp} && docker compose ps --format "
+            f"'{{{{.Service}}}}\\t{{{{.State}}}}' 2>/dev/null || echo ''",
+        ]
+
+        try:
+            results = self._ssh_run_multi(host, commands)
+        except Exception:
+            _logger.exception(
+                "SSH import failed for host %s path %s",
+                host_id,
+                path,
+            )
+            return {
+                "ok": False,
+                "error": _("An internal error occurred. Check server logs."),
+            }
+
+        # Unpack results
+        (
+            copier_raw,
+            repos_raw,
+            addons_raw,
+            pip_raw,
+            apt_raw,
+            odoo_env_raw,
+            db_env_raw,
+            smtp_env_raw,
+            backup_env_raw,
+            override_raw,
+        ) = [r[0] for r in results[:10]]
+        conf_raw = results[10][0]
+        compose_link = results[11][0].strip()
+        compose_ps = results[12][0].strip()
+
+        # Parse .copier-answers.yml
+        copier = {}
+        unreadable_series = ""
+        if copier_raw.strip():
+            with suppress(Exception):
+                data = yaml.safe_load(copier_raw) or {}
+                domains = []
+                for d in data.get("domains_prod", []) or []:
+                    if isinstance(d, dict):
+                        for h in d.get("hosts", []):
+                            domains.append(
+                                {
+                                    "hostname": h,
+                                    "redirect_to": d.get("redirect_to", ""),
+                                }
+                            )
+                # A series this panel does not know is still the series,
+                # for the import to say it does not offer it; one that
+                # reads as none is told, not dropped with the rest.
+                odoo_version, unreadable_series = copier_series(
+                    data.get("odoo_version", ""),
+                )
+                copier = {
+                    "odoo_version": odoo_version,
+                    "project_author": data.get("project_author", ""),
+                    "project_license": data.get("project_license", ""),
+                    "project_name": data.get("project_name", ""),
+                    "postgres_version": str(
+                        data.get("postgres_version", ""),
+                    ),
+                    "postgres_dbname": data.get("postgres_dbname", "prod"),
+                    "postgres_username": data.get(
+                        "postgres_username",
+                        "odoo",
+                    ),
+                    "odoo_proxy": data.get("odoo_proxy", "traefik"),
+                    "smtp_relay_host": data.get("smtp_relay_host", ""),
+                    "smtp_relay_port": data.get("smtp_relay_port", 587),
+                    "smtp_relay_user": data.get("smtp_relay_user", ""),
+                    "domains": domains,
+                    # Backup fields
+                    "backup_dst": data.get("backup_dst", ""),
+                    "backup_email_from": data.get(
+                        "backup_email_from",
+                        "",
+                    ),
+                    "backup_email_to": data.get("backup_email_to", ""),
+                    "backup_image_version": data.get(
+                        "backup_image_version",
+                        "latest",
+                    ),
+                    "backup_tz": data.get("backup_tz", "UTC"),
+                    "backup_deletion": data.get(
+                        "backup_deletion",
+                        False,
+                    ),
+                    "backup_smtp_report_success": data.get(
+                        "backup_smtp_report_success",
+                        True,
+                    ),
+                }
+
+        # Parse .env files for secrets
+        def _parse_env(content):
+            env = {}
+            for line in (content or "").splitlines():
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, _, v = line.partition("=")
+                    env[k.strip()] = v.strip().strip('"').strip("'")
+            return env
+
+        odoo_env = _parse_env(odoo_env_raw)
+        db_env = _parse_env(db_env_raw)
+        smtp_env = _parse_env(smtp_env_raw)
+        backup_env = _parse_env(backup_env_raw)
+
+        # Parse repos.yaml + addons.yaml (reuse helpers from import_project).
+        # A remote is stored canonical, of GitHub or of a configured Git
+        # provider, without the user and token a host's file may carry
+        # (git@gitlab.com:x/y.git once became https://github.com/x/y.git).
+        # A remote of a host with no provider is left out and named in
+        # the answer, rather than failing the whole import;
+        # a malformed github.com one
+        # is left for the line's check to refuse.
+        odoo_version = copier.get("odoo_version", "")
+        repos_data = []
+        skipped_repos = []
+        # What the answer tells the person besides: values of the host's
+        # files the panel left out.
+        warnings = []
+        if repos_raw.strip():
+            try:
+                repos_yaml = yaml.safe_load(repos_raw) or {}
+                addons_yaml = yaml.safe_load(addons_raw) if addons_raw.strip() else {}
+                addons_map = {}
+                for alias, addons in (addons_yaml or {}).items():
+                    if isinstance(addons, list):
+                        addons_map[alias] = (
+                            "" if "*" in addons else ",".join(str(a) for a in addons)
+                        )
+                    elif addons == "*":
+                        addons_map[alias] = ""
+                    else:
+                        addons_map[alias] = str(addons) if addons else ""
+
+                for alias, cfg in repos_yaml.items():
+                    if alias in ("./odoo", "odoo"):
+                        continue
+                    if not isinstance(cfg, dict):
+                        continue
+                    remotes = cfg.get("remotes", {})
+                    repo_url = next(iter(remotes.values()), "") if remotes else ""
+                    repo_url = _USERINFO_RE.sub(r"\1", str(repo_url or "").strip())
+                    ref = resolve_repo_ref(request.env, repo_url)
+                    host = _url_host(repo_url)
+                    if ref:
+                        repo_url = ref.canonical
+                    elif host and host not in ("github.com", "www.github.com"):
+                        skipped_repos.append(_(
+                            "%(alias)s: there is no Git provider for %(host)s. "
+                            "Add it under Settings → Git providers and import "
+                            "again.",
+                            alias=alias, host=host,
+                        ))
+                        continue
+                    else:
+                        repo_url = canonical_repo_url(repo_url)
+                    target = cfg.get("target", "")
+                    branch_val = ""
+                    if target:
+                        parts = target.split()
+                        branch_val = parts[-1] if len(parts) >= 2 else parts[0]
+                    if not branch_val:
+                        merges = cfg.get("merges", [])
+                        if merges and isinstance(merges[0], str):
+                            parts = merges[0].split()
+                            branch_val = parts[-1] if len(parts) >= 2 else parts[0]
+                    if "$ODOO_VERSION" in branch_val and odoo_version:
+                        branch_val = branch_val.replace(
+                            "$ODOO_VERSION",
+                            odoo_version,
+                        )
+                    repos_data.append(
+                        {
+                            "url": repo_url,
+                            "branch": branch_val or "main",
+                            "addons": addons_map.get(alias, ""),
+                        }
+                    )
+            except Exception:
+                _logger.exception("Failed to parse repos.yaml")
+
+        # Parse docker-compose.override.yml for resource limits
+        resource_limits = {}
+        if override_raw.strip():
+            with suppress(Exception):
+                override = yaml.safe_load(override_raw) or {}
+                services = override.get("services", {})
+                for svc, key in (
+                    ("odoo", "odoo"),
+                    ("db", "db"),
+                    ("backup", "backup"),
+                    ("smtp", "smtp"),
+                ):
+                    svc_cfg = services.get(svc, {})
+                    if svc_cfg.get("mem_limit"):
+                        resource_limits[f"{key}_memory_limit"] = svc_cfg["mem_limit"]
+                    if svc_cfg.get("cpus"):
+                        resource_limits[f"{key}_cpus"] = float(
+                            svc_cfg["cpus"],
+                        )
+
+        # Determine environment from symlink
+        environment = "production"
+        if compose_link and "test.yaml" in compose_link:
+            environment = "staging"
+
+        # Determine running status
+        is_running = False
+        if compose_ps:
+            for line in compose_ps.splitlines():
+                if "odoo" in line.lower() and "running" in line.lower():
+                    is_running = True
+                    break
+
+        # ── Create project (or reuse existing) ────────────────────────
+        project_name = copier.get("project_name") or path.rstrip("/").split("/")[-1]
+        project = request.env["cloud.project"].search(
+            [
+                ("name", "=", project_name),
+            ],
+            limit=1,
+        )
+        # Into a project, an instance whose answers name no series takes
+        # the project's; a new project takes none but the answers'. A series
+        # the answers spell in a way that reads as none is not replaced by
+        # the project's either: it is said.
+        if unreadable_series:
+            undetected = request.env._(
+                "The series of .copier-answers.yml is not understood: %s.",
+                unreadable_series,
+            )
+            series = ""
+        else:
+            undetected = request.env._(
+                "Could not tell which Odoo series this instance runs: its "
+                ".copier-answers.yml names none."
+            )
+            series = odoo_version or project.odoo_version
+        refusal = import_series_refusal(request.env, series, undetected)
+        if refusal:
+            return {"ok": False, "error": refusal}
+
+        # A domain another instance holds stops the import here, before it
+        # creates the project and its lines: the answer is a refusal, and
+        # the request's transaction would keep what was created.
+        hostnames = [
+            (d.get("hostname") or "").strip()
+            for d in copier.get("domains") or []
+            if (d.get("hostname") or "").strip()
+        ]
+        if hostnames:
+            conflicts = set(
+                request.env["cloud.instance.domain"]
+                .search([("hostname", "in", hostnames)])
+                .mapped("hostname")
+            )
+            if conflicts:
+                return {
+                    "ok": False,
+                    "error": _(
+                        "The following domains are already "
+                        "assigned to another instance: %s. "
+                        "Remove them from the existing instance "
+                        "first, then retry the import.",
+                        ", ".join(sorted(conflicts)),
+                    ),
+                }
+
+        # ── Create instance (and, in a new project, the project) ──────
+        inst_vals = {
+            "name": path.rstrip("/").split("/")[-1],
+            "host_id": host_id,
+            "environment": environment,
+            "custom_remote_dir": path,
+            "custom_backup_dst": copier.get("backup_dst", ""),
+            # Importing an instance that already runs on the host is the
+            # one legal way into 'deployed' without a deploy job.
+            "state": "deployed",
+            "running": is_running,
+            "status": "ok" if is_running else "error",
+        }
+        if odoo_version:
+            inst_vals["odoo_version"] = odoo_version
+        if conf_raw.strip():
+            inst_vals["odoo_conf"] = conf_raw.strip()
+        if pip_raw.strip():
+            inst_vals["pip_dependencies"] = pip_raw.strip()
+        if apt_raw.strip():
+            inst_vals["apt_dependencies"] = apt_raw.strip()
+
+        # Copier-derived fields
+        if copier:
+            for k in (
+                "postgres_version",
+                "postgres_dbname",
+                "postgres_username",
+                "odoo_proxy",
+                "smtp_relay_host",
+                "smtp_relay_user",
+            ):
+                if copier.get(k):
+                    inst_vals[k] = copier[k]
+            if copier.get("smtp_relay_port"):
+                inst_vals["smtp_relay_port"] = int(copier["smtp_relay_port"])
+            if hostnames:
+                inst_vals["domain_ids"] = [
+                    (
+                        0,
+                        0,
+                        {
+                            "hostname": d["hostname"].strip(),
+                            "redirect_to": d.get("redirect_to", ""),
+                        },
+                    )
+                    for d in copier["domains"]
+                    if (d.get("hostname") or "").strip()
+                ]
+
+        # Secrets from .env files
+        if odoo_env.get("ADMIN_PASSWORD"):
+            inst_vals["odoo_admin_password"] = odoo_env["ADMIN_PASSWORD"]
+        if db_env.get("PASSWORD"):
+            inst_vals["postgres_password"] = db_env["PASSWORD"]
+        if smtp_env.get("RELAY_PASSWORD"):
+            inst_vals["smtp_relay_password"] = smtp_env["RELAY_PASSWORD"]
+
+        # Resource limits
+        inst_vals.update(resource_limits)
+
+        # The project, its lines and the instance are made or none is: an
+        # answer of ``ok: False`` is committed with the request, and a
+        # project without its instance would be left behind. A line the
+        # check refuses still raises, as it did, and rolls the savepoint
+        # back as it leaves.
+        with request.env.cr.savepoint() as savepoint:
+            if not project:
+                proj_vals = {"name": project_name}
+                if odoo_version:
+                    proj_vals["odoo_version"] = odoo_version
+                if copier.get("project_author"):
+                    proj_vals["project_author"] = copier["project_author"]
+                if copier.get("project_license"):
+                    proj_vals["project_license"] = copier["project_license"]
+                if pip_raw.strip():
+                    proj_vals["pip_dependencies"] = pip_raw.strip()
+                if apt_raw.strip():
+                    proj_vals["apt_dependencies"] = apt_raw.strip()
+                project = request.env["cloud.project"].create(proj_vals)
+
+                # Create project repos
+                Repo = request.env["cloud.project.repo"].with_context(
+                    skip_apply_requirements=True,
+                )
+                for seq, r in enumerate(repos_data, start=10):
+                    if r.get("url"):
+                        Repo.create(
+                            {
+                                "project_id": project.id,
+                                "sequence": seq,
+                                "url": r["url"],
+                                "branch": r.get("branch", "main"),
+                                "addons": r.get("addons", ""),
+                            }
+                        )
+            inst_vals["project_id"] = project.id
+            try:
+                instance = self._import_create_instance(inst_vals, warnings)
+            except ValidationError as exc:
+                # A value of the host's files the panel does not accept:
+                # its check says which, and nothing is created.
+                savepoint.close()
+                return {"ok": False, "error": exc.args[0]}
+            except Exception:
+                _logger.exception("Failed to create instance during import")
+                savepoint.close()
+                return {
+                    "ok": False,
+                    "error": _("An internal error occurred. Check server logs."),
+                }
+
+        # Handle backup backend from backup.env + copier backup fields
+        if backup_env.get("AWS_ACCESS_KEY_ID"):
+            try:
+                self._import_backup_backend(instance, copier, backup_env)
+            except ValidationError as exc:
+                # Held to the destination's checks like one saved in the
+                # panel: the instance is imported without it, and told.
+                warnings.append(_(
+                    "The backup destination was not imported: %s Add it "
+                    "on the instance before its next rebuild.",
+                    exc.args[0],
+                ))
+            except Exception:
+                _logger.exception(
+                    "Could not create backup backend for import",
+                )
+
+        return {
+            "ok": True,
+            "project_id": project.id,
+            "instance_id": instance.id,
+            "project_name": project.name,
+            "instance_name": instance.name,
+            "is_running": is_running,
+            "skipped_repos": skipped_repos,
+            "warnings": warnings,
+        }
+
+    def _import_create_instance(self, vals, warnings):
+        """Create the imported instance, without its backup path if that is refused.
+
+        The path comes from the host's ``.copier-answers.yml``
+        (``backup_dst``): one outside the grammar of the panel's
+        destinations, or overlapping another instance's
+        (``cloud.instance._check_custom_backup_dst_shape``), is left out
+        rather than failing the import, and the reason goes to
+        *warnings*. Any other value refused raises as it did.
+
+        :param dict vals: the instance's values
+        :param list warnings: what the answer tells the person; appended to
+        :return: the instance
+        :raises ValidationError: for a value refused other than the path
+        """
+        Instance = request.env["cloud.instance"]
+        path = vals.get("custom_backup_dst")
+        if not path:
+            return Instance.create(vals)
+        try:
+            with request.env.cr.savepoint():
+                return Instance.create(vals)
+        except ValidationError as exc:
+            reason = exc.args[0]
+        instance = Instance.create(vals | {"custom_backup_dst": False})
+        warnings.append(_(
+            "The backup path %(path)s was not imported: %(reason)s Set the "
+            "instance's backup path or its backup destination before its "
+            "next rebuild, or it backs up elsewhere.",
+            path=path, reason=reason,
+        ))
+        return instance
+
+    def _import_backup_backend(self, instance, copier, backup_env):
+        """Give the imported instance the backup destination its host's files name.
+
+        Found by name or created from ``backup.env`` and the copier
+        answers, inside a savepoint: a value the destination's checks
+        refuse leaves no row behind.
+
+        :param instance: the imported ``cloud.instance``
+        :param dict copier: the copier answers read
+        :param dict backup_env: ``backup.env`` read
+        :raises ValidationError: for a value a destination may not hold
+        """
+        with request.env.cr.savepoint():
+            # Parse backup_dst: "boto3+s3://bucket/path" → bucket, path
+            s3_bucket = ""
+            s3_path = ""
+            backup_dst = copier.get("backup_dst", "")
+            if "://" in backup_dst:
+                dst_path = backup_dst.split("://", 1)[1]
+                parts = dst_path.split("/", 1)
+                s3_bucket = parts[0]
+                s3_path = parts[1] if len(parts) > 1 else ""
+
+            backend_name = f"S3 {copier.get('project_name') or 'import'}"
+            backend = request.env["cloud.backup.backend"].search(
+                [
+                    ("name", "=", backend_name),
+                ],
+                limit=1,
+            )
+            if not backend:
+                backend = request.env["cloud.backup.backend"].create(
+                    {
+                        "name": backend_name,
+                        "s3_bucket": s3_bucket,
+                        "s3_path": s3_path,
+                        "s3_access_key_id": backup_env.get(
+                            "AWS_ACCESS_KEY_ID",
+                            "",
+                        ),
+                        "s3_secret_access_key": backup_env.get(
+                            "AWS_SECRET_ACCESS_KEY",
+                            "",
+                        ),
+                        "s3_endpoint_url": backup_env.get(
+                            "AWS_ENDPOINT_URL",
+                            "",
+                        ),
+                        "s3_region": backup_env.get("AWS_DEFAULT_REGION", ""),
+                        "passphrase": backup_env.get("PASSPHRASE", ""),
+                        "email_from": copier.get(
+                            "backup_email_from",
+                            "",
+                        ),
+                        "email_to": copier.get("backup_email_to", ""),
+                        "backup_image_version": copier.get(
+                            "backup_image_version",
+                            "latest",
+                        ),
+                        "backup_tz": copier.get("backup_tz", "UTC"),
+                        # An explicit backup_deletion=True in the copier
+                        # answers is unambiguous (cron is on). False/absent
+                        # is ambiguous — we don't know whether the bucket
+                        # has a lifecycle policy — so it's left undeclared
+                        # for the operator to confirm (see P15 #9a).
+                        "retention_owner": (
+                            "cron"
+                            if copier.get("backup_deletion", False)
+                            else "lifecycle"
+                        ),
+                        "retention_owner_declared": bool(
+                            copier.get("backup_deletion", False),
+                        ),
+                        "smtp_report_success": copier.get(
+                            "backup_smtp_report_success",
+                            True,
+                        ),
+                    }
+                )
+            instance.backup_backend_id = backend.id
+
+    # ── Container log streaming ────────────────────────────────────────────────
+
+    @http.route(["/cloud/fetch_container_logs"], type="jsonrpc", auth="user")
+    def cloud_fetch_container_logs(self, instance_id, service, lines=200):
+        """SSH into the instance host and return recent Docker Compose logs.
+
+        Gated by ``can_view_logs`` (developer+) to match the HTML log
+        viewer at /cloud/instance/<id>/logs. Internal users without
+        cloud permissions must not be able to bypass the UI gate by
+        calling this RPC directly.
+        """
+        self._sec()._check_can_view_logs()
+        limited = rate_gate_json(self._log_read_rule("tail"))
+        if limited:
+            return limited
+
+        # No `.sudo()`: developers already see every instance via
+        # `rule_instance_all` (Project Manager+ domain `[(1,'=',1)]`,
+        # implied by `group_cloud_developer`). Reading through the
+        # caller's env keeps record-rule audit visible for this RPC.
+        inst = request.env["cloud.instance"].browse(instance_id)
+        if not inst.exists() or not inst.host_id:
+            return {"ok": False, "error": _("Instance not found")}
+
+        host = inst.host_id
+        inst_dir = inst.get_remote_dir()
+        yaml_file = "prod.yaml" if inst.environment == "production" else "test.yaml"
+        tail = max(1, min(int(lines), 2000))
+        # sanitize service name to prevent injection (alphanumeric, dash, underscore)
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", service):
+            return {"ok": False, "error": _("Invalid service name")}
+
+        if service == "odoo":
+            # Odoo's log lives on the host now; the container's output
+            # is only the fallback for an instance not rebuilt yet.
+            command = odoo_log_live_command(inst_dir, yaml_file, tail)
+        else:
+            command = (
+                f"cd {inst_dir} && docker compose -f {yaml_file} "
+                f"logs --no-color --tail={tail} {service} 2>&1"
+            )
+
+        async def _run():
+            async with asyncssh.connect(**host.ssh_connect_kwargs()) as conn:
+                result = await conn.run(command, check=False)
+                return result.stdout or result.stderr or ""
+
+        try:
+            output = run_async(_run())
+            return {"ok": True, "lines": [l for l in output.splitlines() if l]}
+        except Exception:
+            _logger.exception(
+                "Error fetching container logs for instance %s", instance_id
+            )
+            return {
+                "ok": False,
+                "error": _("An internal error occurred. Check server logs."),
+            }
+
+    def _log_read_rule(self, kind, message=None):
+        """Per-user, per-endpoint cap for a plain read of an instance's logs.
+
+        One bucket per endpoint family rather than one shared bucket:
+        the viewer opens by calling the listing and the tail at the
+        same instant, and a single bucket makes those two upserts race
+        for the same row on every open — Postgres answers that with a
+        serialization failure, Odoo retries the request, and the user
+        sees nothing but the server log fills with it. Same cap for
+        all of them, since they are the same kind of act: the Metrics
+        tab's readings on demand of the log and of the database too.
+
+        :param str kind: endpoint family (``tail``, ``list``, ``day``,
+            ``slow_routes``, ``db_activity``)
+        :param str message: what the refusal says, when it is not a read
+            of the log.
+        """
+        return Rule(
+            f"logs_{kind}_user:{request.env.uid}",
+            message or _("Too many log reads recently. Try again in a minute."),
+            cap_key="rate_limit_logs_per_min",
+            log_tag=f"logs {kind} user={request.env.uid}",
+        )
+
+    def _log_settings(self):
+        """Settings that bound what a log read may cost the host."""
+        return request.env["cloud.settings"].sudo()._get_system()
+
+    @http.route(["/cloud/instance_log_archives"], type="jsonrpc", auth="user")
+    def cloud_instance_log_archives(self, instance_id):
+        """List the Odoo log files the host keeps for this instance.
+
+        Newest first, the live file at the top. An instance that has
+        not been rebuilt since file logging shipped simply has none —
+        reported as an empty list plus ``archived=False`` so the viewer
+        can say so instead of looking broken.
+        """
+        self._sec()._check_can_view_logs()
+        limited = rate_gate_json(self._log_read_rule("list"))
+        if limited:
+            return limited
+        inst = request.env["cloud.instance"].browse(instance_id)
+        if not inst.exists() or not inst.host_id:
+            return {"ok": False, "error": _("Instance not found")}
+        try:
+            stdout, _stderr = self._ssh_run(
+                inst.host_id, log_archive_list_command(inst.get_remote_dir()),
+            )
+        except Exception:
+            _logger.exception(
+                "Error listing log archives for instance %s", instance_id,
+            )
+            return {
+                "ok": False,
+                "error": _("An internal error occurred. Check server logs."),
+            }
+        live, dated = None, []
+        for line in stdout.splitlines():
+            name, _sep, rest = line.strip().partition("|")
+            size, _sep2, mtime = rest.partition("|")
+            if not is_safe_log_archive(name):
+                continue
+            entry = {
+                "name": name,
+                "size": int(size) if size.isdigit() else 0,
+                "mtime": int(mtime) if mtime.isdigit() else 0,
+                "compressed": name.endswith(".gz"),
+            }
+            if name == "odoo.log":
+                live = entry
+            else:
+                dated.append(entry)
+        dated.sort(key=itemgetter("name"), reverse=True)
+        return {
+            "ok": True,
+            "archived": bool(live or dated),
+            "archives": ([live] if live else []) + dated,
+        }
+
+    @http.route(["/cloud/fetch_log_archive"], type="jsonrpc", auth="user")
+    def cloud_fetch_log_archive(self, instance_id, name, lines=500, search=""):
+        """Return the tail of one archived Odoo log, optionally filtered.
+
+        The filter runs on the host: a day of logs is megabytes, and
+        the answer to "what happened on Tuesday" is usually a handful
+        of lines.
+        """
+        self._sec()._check_can_view_logs()
+        limited = rate_gate_json(self._log_read_rule("day"))
+        if limited:
+            return limited
+        inst = request.env["cloud.instance"].browse(instance_id)
+        if not inst.exists() or not inst.host_id:
+            return {"ok": False, "error": _("Instance not found")}
+        if not is_safe_log_archive(name):
+            return {"ok": False, "error": _("Unknown log file")}
+        tail = max(1, min(int(lines or 500), 5000))
+        try:
+            stdout, _stderr = self._ssh_run(
+                inst.host_id,
+                odoo_log_read_command(
+                    inst.get_remote_dir(), name, tail, (search or "").strip(),
+                ),
+            )
+        except Exception:
+            _logger.exception(
+                "Error reading log archive %s for instance %s",
+                name, instance_id,
+            )
+            return {
+                "ok": False,
+                "error": _("An internal error occurred. Check server logs."),
+            }
+        return {"ok": True, "lines": [ln for ln in stdout.splitlines() if ln]}
+
+    @http.route(["/cloud/search_log_archives"], type="jsonrpc", auth="user")
+    def cloud_search_log_archives(self, instance_id, term, max_files=60):
+        """Return the archived days whose log mentions *term*.
+
+        The day picker answers "show me the 17th"; this answers "which
+        day was it", which is the question an operator actually has
+        once the archive is two months deep.
+        """
+        self._sec()._check_can_view_logs()
+        limited = rate_gate_json(Rule(
+            f"log_search_user:{request.env.uid}",
+            _("Too many log searches recently. Try again in a minute."),
+            cap_key="rate_limit_log_search_per_min",
+            log_tag=f"log_search user={request.env.uid}",
+        ))
+        if limited:
+            return limited
+        inst = request.env["cloud.instance"].browse(instance_id)
+        if not inst.exists() or not inst.host_id:
+            return {"ok": False, "error": _("Instance not found")}
+        term = (term or "").strip()
+        if len(term) < 2:
+            # A one-character sweep matches every day and costs a full
+            # decompression of the archive to say nothing useful.
+            return {
+                "ok": False,
+                "error": _("Type at least two characters to search."),
+            }
+        settings = self._log_settings()
+        # Audited before the sweep runs: the row is the record that the
+        # search was asked for, and a search that dies on the host is
+        # exactly the one worth having a trace of.
+        request.env["cloud.audit.log"].sudo().create({
+            "action": "Searched instance logs",
+            "instance_id": inst.id,
+            "details": f"term: {term[:120]}",
+        })
+        try:
+            stdout, _stderr = self._ssh_run(
+                inst.host_id,
+                log_archive_search_command(
+                    inst.get_remote_dir(), term,
+                    max_files=max(1, min(
+                        int(max_files or 0) or settings.log_search_max_files,
+                        settings.log_search_max_files,
+                    )),
+                    timeout_s=settings.log_search_timeout_s,
+                ),
+            )
+        except Exception:
+            _logger.exception(
+                "Error searching log archives for instance %s", instance_id,
+            )
+            return {
+                "ok": False,
+                "error": _("An internal error occurred. Check server logs."),
+            }
+        matches = []
+        for line in stdout.splitlines():
+            name, _sep, count = line.strip().partition("|")
+            if not is_safe_log_archive(name):
+                continue
+            matches.append({
+                "name": name,
+                "count": int(count) if count.isdigit() else 0,
+            })
+        return {
+            "ok": True,
+            "matches": matches,
+            # False when the sweep was cut short by its own timeout, so
+            # the viewer can say "no match *so far*" instead of "none".
+            "complete": "IC_DONE" in stdout,
+        }
+
+    # ── Captured mail on staging (the "Mails" tab) ────────────────────────
+
+    #: Compose file whose stack holds the mail catcher. Production has
+    #: no catcher at all, so there is only ever one answer here.
+    _MAILBOX_YAML = "test.yaml"
+
+    def _mailbox_instance(self, instance_id):
+        """Return the staging whose mailbox may be read, or an error dict.
+
+        Four conditions, each refused with its own sentence rather than
+        a single "not available": an operator whose Mails tab is empty
+        needs to know whether the instance is the wrong kind, not
+        deployed, or merely stopped.
+
+        :param instance_id: id coming from the browser
+        :return: a ``cloud.instance`` recordset, or a dict to return
+        """
+        inst = request.env["cloud.instance"].browse(instance_id)
+        if not inst.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        if inst.environment == "production":
+            return {"ok": False, "error": _(
+                "Production sends real email; there is no catcher to read.",
+            )}
+        # A missing host is judged here rather than alongside "not found":
+        # an instance with no host has no stack, which is the same thing
+        # as not being deployed and reads very differently from the
+        # record having vanished.
+        if not inst.deployed or not inst.host_id:
+            return {"ok": False, "error": _(
+                "This staging has not been deployed yet.",
+            )}
+        if not inst.running:
+            return {"ok": False, "error": _(
+                "This staging is stopped. Start it to read its mailbox.",
+            )}
+        return inst
+
+    def _mailbox_rule(self):
+        """Per-user cap for one read of a staging's captured mailbox.
+
+        Its own bucket and its own setting rather than the log one: a
+        mail read costs a ``docker compose exec`` plus an HTTP call
+        inside the stack, where a log read is a ``tail`` on the host.
+        """
+        return Rule(
+            f"mailbox_user:{request.env.uid}",
+            _("Too many mailbox reads recently. Try again in a minute."),
+            cap_key="rate_limit_mail_reads_per_min",
+            log_tag=f"mailbox user={request.env.uid}",
+        )
+
+    def _mailbox_run(self, inst, command, failure):
+        """Run *command* on the instance's host and decode its JSON.
+
+        The projection always prints one JSON object, so anything else
+        on stdout means the pipeline broke before it ran — most often a
+        catcher that is not up. That is reported as itself instead of
+        being parsed into a confusing empty mailbox.
+
+        :param inst: the ``cloud.instance`` being read
+        :param str command: what to run over SSH
+        :param str failure: user-facing message if the read fails
+        :return: the decoded dict, or an error dict
+        """
+        try:
+            stdout, stderr = self._ssh_run(inst.host_id, command)
+        except Exception as exc:  # noqa: BLE001 — surfaced, not swallowed
+            _logger.warning(
+                "[mailbox] could not read the catcher of instance %s: %s",
+                inst.id, exc,
+            )
+            return safe_error_response(exc, failure)
+        try:
+            payload = json.loads((stdout or "").strip())
+        except ValueError:
+            # Empty output or anything that is not JSON means the
+            # pipeline died before the projection ran — a stopped
+            # catcher, a proxy error page — not an empty mailbox.
+            _logger.warning(
+                "[mailbox] instance %s answered no JSON: %s",
+                inst.id, (stderr or stdout or "")[:400],
+            )
+            return {"ok": False, "error": _(
+                "The mail catcher did not answer. It may not be running.",
+            )}
+        if not payload.get("ok"):
+            return {"ok": False, "error": failure}
+        return payload
+
+    @http.route(["/cloud/instance_relay_test_mail"], type="jsonrpc", auth="user")
+    def cloud_instance_relay_test_mail(self, instance_id):
+        """Send one test mail through a production's relay, to the caller.
+
+        The recipient is the caller's own address, never one the request
+        names; what may hold the test back, its hourly count included,
+        is ``cloud.instance.send_relay_test_mail``'s. The job says
+        whether the relay's server took the mail.
+
+        :param int instance_id: the production instance
+        :returns: the job's response (``_job_response``), or
+            ``{'ok': False, 'error': …}``
+        """
+        self._sec()._check_cloud_group("group_cloud_consultant")
+        inst = request.env["cloud.instance"].browse(instance_id)
+        if not inst.exists():
+            return {"ok": False, "error": _("Instance not found")}
+        try:
+            job_id = inst.send_relay_test_mail()
+        except Exception as exc:
+            return safe_error_response(exc, _("Could not send the test mail"))
+        return _job_response(request.env, job_id)
+
+    @http.route(["/cloud/instance_mailbox"], type="jsonrpc", auth="user")
+    def cloud_instance_mailbox(self, instance_id, limit=None, start=0):
+        """List the mail a staging captured instead of sending.
+
+        Read live over SSH and never stored: these are password resets,
+        invitations and customer addresses belonging to whoever owns
+        the database this staging was copied from. Same role as the
+        logs (developer+), for the same reason.
+        """
+        self._sec()._check_can_view_logs()
+        limited = rate_gate_json(self._mailbox_rule())
+        if limited:
+            return limited
+        inst = self._mailbox_instance(instance_id)
+        if isinstance(inst, dict):
+            return inst
+        return self._mailbox_run(
+            inst,
+            mailbox_list_command(
+                inst.get_remote_dir(), self._MAILBOX_YAML, limit, start,
+            ),
+            _("Could not read the mailbox"),
+        )
+
+    @http.route(["/cloud/instance_mail"], type="jsonrpc", auth="user")
+    def cloud_instance_mail(self, instance_id, message_id):
+        """Return one captured message, decoded, with its attachments listed.
+
+        The attachments' bytes stay on the host: the panel shows what
+        was attached and how big it was, which is what tells you the
+        mail was built right, without turning the tab into a way to
+        pull a customer's files through the panel.
+        """
+        self._sec()._check_can_view_logs()
+        limited = rate_gate_json(self._mailbox_rule())
+        if limited:
+            return limited
+        if not is_safe_mail_id(message_id):
+            return {"ok": False, "error": _("Invalid message id")}
+        inst = self._mailbox_instance(instance_id)
+        if isinstance(inst, dict):
+            return inst
+        return self._mailbox_run(
+            inst,
+            mailbox_message_command(
+                inst.get_remote_dir(), self._MAILBOX_YAML, message_id,
+            ),
+            _("Could not read the message"),
+        )
+
+    @http.route(["/cloud/instance_mailbox_clear"], type="jsonrpc", auth="user")
+    def cloud_instance_mailbox_clear(self, instance_id):
+        """Empty a staging's captured mailbox.
+
+        Destructive but bounded: the catcher holds its mail in memory
+        and loses it on every restart anyway, so this is the button
+        that makes "now watch what this action sends" readable.
+        """
+        self._sec()._check_can_view_logs()
+        limited = rate_gate_json(self._mailbox_rule())
+        if limited:
+            return limited
+        inst = self._mailbox_instance(instance_id)
+        if isinstance(inst, dict):
+            return inst
+        command = mailbox_clear_command(
+            inst.get_remote_dir(), self._MAILBOX_YAML,
+        )
+        try:
+            stdout, stderr = self._ssh_run(inst.host_id, command)
+        except Exception as exc:  # noqa: BLE001 — surfaced, not swallowed
+            _logger.warning(
+                "[mailbox] could not clear the catcher of instance %s: %s",
+                inst.id, exc,
+            )
+            return safe_error_response(exc, _("Could not clear the mailbox"))
+        if "IC_MAILBOX_CLEARED" not in (stdout or ""):
+            _logger.warning(
+                "[mailbox] clear on instance %s did not confirm: %s",
+                inst.id, (stderr or stdout or "")[:400],
+            )
+            return {"ok": False, "error": _(
+                "The mail catcher did not answer. It may not be running.",
+            )}
+        request.env["cloud.audit.log"].sudo().create({
+            "action": "Cleared staging mailbox",
+            "instance_id": inst.id,
+        })
+        return {"ok": True}
+
+    # ── Monitoring (Fase 4 / A10) ─────────────────────────────────────────
+
+    @http.route(["/cloud/monitoring/config"], type="jsonrpc", auth="user")
+    def cloud_monitoring_config(self):
+        """Return what the Monitoring page and ``get_monitoring`` read.
+
+        Deliberately narrow: whether metrics are collected, whether a
+        central is set to read them from, and the hosts the caller can
+        read, each with whether its agents are installed and whether it
+        sends its security logs. The central's URLs and the credentials
+        stay server-side — the browser has no business knowing them.
+
+        The page draws its own boards: its Hosts view picks a host by
+        ``id`` from ``hosts`` and asks ``/cloud/host/resource_series`` for
+        it.
+        """
+        self._sec()._check_can_view_metrics()
+        settings = request.env["cloud.settings"].sudo()._get_system()
+        hosts = request.env["cloud.host"].search([], order="name")
+        return {
+            "ok": True,
+            "enabled": bool(settings.metrics_enabled),
+            "central": bool((settings.metrics_central_url or "").strip()),
+            "hosts": [
+                {
+                    "id": h.id,
+                    "name": h.name,
+                    "metrics_agents_state": h.metrics_agents_state,
+                    "security_logs_enabled": h.security_logs_enabled,
+                }
+                for h in hosts
+            ],
+        }

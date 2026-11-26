@@ -1,0 +1,476 @@
+"""Derive ``cloud.instance.running`` from metrics (Fase 4 / A8).
+
+Today ``running`` is written by ``instance_health_executor`` — one SSH job
+per instance every few minutes, the telemetry that does not scale past
+~100 targets. This is its replacement: the same fact read from cAdvisor,
+which the agents already report.
+
+**Why cAdvisor and not Traefik.** ``running`` means *the instance's
+``odoo`` container is up*, which is the same thing the SSH probe
+measures. "Is anyone using it" is a different fact, already modelled by
+``sleeping`` (decided by Sablier from real traffic) and by
+``last_activity_at``. If ``running`` were sourced from request traffic, a
+healthy but idle instance would read as not-running, and the 14-day
+auto-suspend that hangs off that chain would eventually act on legitimate
+idleness — a billing consequence, not just a cosmetic one.
+
+**Nothing is retired here.** The SSH telemetry keeps running until this
+signal has been verified against real data; flipping the source and
+deleting the old one in the same step is how you find out too late that
+the new one had a blind spot.
+"""
+import logging
+from datetime import timedelta
+
+from odoo import api, fields, models
+
+from ._concurrency import read_committed_cursor
+from .cloud_metric_rule import promql_query
+
+_logger = logging.getLogger(__name__)
+
+# A container is considered up when cAdvisor saw it within this window.
+# Comfortably above the 30 s scrape interval so one missed scrape does
+# not flap the flag.
+_SEEN_WINDOW_SECONDS = 180
+
+#: How long after a job confirmed ``running`` (``running_confirmed_at``)
+#: the cron does not read an ``odoo`` it cannot see as a stop. A job that
+#: starts or recreates the container — a deploy, a rebuild, a restore,
+#: a restart — takes its series away at once, and the new one is not
+#: answered for about a minute: up to 30 s until the agent's next scrape
+#: (``scrape_interval``, ansible/playbooks/host_observability.yml) and
+#: about 30 s more until VictoriaMetrics serves it (its
+#: ``-search.latencyOffset``, left at the default). The window above
+#: does not cover that gap: it bounds the age of a series still there,
+#: not the absence of one. Those 60 s twice over, so one late scrape
+#: does not end it. QA d76c (26-oct-2026): a PITR restore confirmed the
+#: instance at 23:11:51, the cron stopped it at 23:12:22, and the panel
+#: showed it "Stopped", without Restart or Shell, until 23:14:31.
+_CONFIRMED_GRACE_SECONDS = 120
+
+#: How long a metrics reading keeps the SSH health probe from writing
+#: ``running``. Comfortably above the liveness cron's own period so one
+#: skipped tick does not hand the flag back and forth.
+_LIVENESS_HANDOVER_SECONDS = 900
+
+#: The compose service whose container decides whether an instance is up.
+#: Every other container of the stack can be running while this one is
+#: not — that is exactly what a sleeping instance looks like.
+_ODOO_SERVICE = "odoo"
+
+#: The names of containers that run a service of the stack without being
+#: the stack's own: the one-offs of ``docker compose run``
+#: (``<project>-odoo-run-<hash>``), a restore's for one, and the
+#: rebuild's boot test, a ``run`` of ``odoo`` under a name of its own
+#: (``ic_boot_odoo_<id>``, scripts/rebuild.sh) that boots the new image
+#: while the instance's odoo may be stopped. Matched whole, as PromQL
+#: anchors a regex. The CPU and memory panels of
+#: ``ansible/files/dashboards/incubacloud-instance.json`` leave out the
+#: same names, which ``test_observability_wiring`` holds them to.
+_ONE_OFF_NAMES = ".+-run-[0-9a-f]{12}|ic_boot_odoo_[0-9]+"
+
+#: Which instances the backend reports on at all, by any container of
+#: theirs. Not a liveness answer: it says whose telemetry reaches us,
+#: and therefore whose ``running`` may be written at all. One-off
+#: containers count, the boot test's too: whatever they run, they are
+#: the instance's.
+_COVERAGE_EXPRESSION = (
+    "max by (instance_id) (time() - container_last_seen{"
+    'instance_id!=""})'
+)
+
+#: How long since each instance's ``odoo`` container was reported. The
+#: service label is there because the agents are started with
+#: ``com.docker.compose.service`` whitelisted (see host_observability).
+#: ``min``, the freshest of its series: a service has several once its
+#: container is recreated, the old one's staying reported, ageing, for
+#: minutes beside the new one's. ``max`` read the old one, and an odoo
+#: back for minutes read as unseen — on 22-oct-2026 (QA) a production
+#: that answered showed "Stopped" for four minutes after a backup.
+#: Containers that run odoo without being the instance's own (see
+#: ``_ONE_OFF_NAMES``) carry the service's label too, and with ``min``
+#: one would pass for an odoo that is stopped. They are left out by name.
+_ODOO_EXPRESSION = (
+    "min by (instance_id) (time() - container_last_seen{"
+    'instance_id!="", '
+    f'container_label_com_docker_compose_service="{_ODOO_SERVICE}", '
+    f'name!~"{_ONE_OFF_NAMES}"'
+    "})"
+)
+
+#: Which hosts the backend hears from, through any container at all —
+#: the agents' own included, so a host whose every instance is stopped
+#: still answers. It only says whose silence means something. ``min``
+#: for the same reason as above: a host is heard while anything on it
+#: is, and read by its oldest series it went quiet whenever a container
+#: on it had just been removed. One-offs and boot tests count here too.
+_HOST_COVERAGE_EXPRESSION = (
+    "min by (host_id) (time() - container_last_seen)"
+)
+
+
+class CloudInstance(models.Model):
+    _inherit = "cloud.instance"
+
+    metrics_last_seen = fields.Datetime(
+        string="Metrics last seen",
+        copy=False,
+        readonly=True,
+        help="Last time the metrics backend reported on this instance. "
+             "Written only by the cron below, and read by the SSH health "
+             "probe to decide who owns ``running``: two writers with no "
+             "arbitration would fight over the flag every few minutes.",
+    )
+    running_confirmed_at = fields.Datetime(
+        string="Running confirmed at",
+        copy=False,
+        readonly=True,
+        help="Last time a job that brought the instance's odoo up "
+             "confirmed it running. For a short while after, the metrics "
+             "cron does not mark the instance stopped: the job took the "
+             "container's series away, and the new one takes about a "
+             "minute to arrive. Cleared whenever the instance is written "
+             "as stopped.",
+    )
+    running_stopped_at = fields.Datetime(
+        string="Running stopped at",
+        copy=False,
+        readonly=True,
+        help="Last time the instance was written as stopped. The metrics "
+             "cron does not read an odoo last seen before it as a start: "
+             "a stopped container's series stays reported, ageing, for "
+             "minutes after the stop.",
+    )
+
+    def write(self, vals):
+        """Close a job's grace, and note the stop, when written stopped.
+
+        ``running_confirmed_at`` holds the metrics cron back from reading
+        a missing ``odoo`` as a stop. A stop written by anyone — a Stop
+        job, the probe that found the container down, a layer above that
+        parks the stack after its own job — ends that grace: a
+        confirmation from before it must not hold the next stop back.
+
+        The stop's moment is kept (``running_stopped_at``): the stopped
+        container's series stays reported, ageing, for minutes after it,
+        and the cron does not read one last seen before the stop as the
+        instance up again. QA b100 (2-nov-2026): a Stop job wrote the
+        instance stopped at 02:01:36 and the cron raised it again at
+        02:01:43, on the series of the container it had just stopped.
+
+        :param dict vals: the values to write
+        :return: what ``write`` returns
+        """
+        if "running" in vals and not vals["running"]:
+            vals = vals | {
+                "running_confirmed_at": False,
+                "running_stopped_at": fields.Datetime.now(),
+            }
+        return super().write(vals)
+
+    def _running_confirmed_vals(self):
+        """Return the values a job writes once it has brought odoo up.
+
+        ``running``, and when it was confirmed: for
+        ``_CONFIRMED_GRACE_SECONDS`` after, the liveness cron does not
+        read the series the job took away as a stop. Only for a job that
+        started or recreated the container itself; what the cron or the
+        health probe see is an observation, and opens no grace.
+
+        :return: values for ``write``
+        :rtype: dict
+        """
+        return {
+            "running": True,
+            "running_confirmed_at": fields.Datetime.now(),
+        }
+
+    def _running_confirmed_after(self, moment):
+        """Return whether a job confirmed this instance running after *moment*.
+
+        Read from its row, locked, and not from the cache: the cron read
+        its rows before deciding, and a job that has confirmed the
+        instance since — or is committing its confirmation now, which the
+        lock waits for — must not see it overwritten with a stop. Asked
+        only before writing one, on a row the write locks anyway.
+
+        ``FOR NO KEY UPDATE``, not ``FOR UPDATE``: held that way, the
+        write that follows counts as a change of the row's key, and any
+        REPEATABLE READ transaction begun before this cursor commits that
+        then inserts or updates a row keyed on the instance — a job
+        stored ``done`` — fails to serialize (a move, 7-nov-2026).
+
+        :param datetime moment: when the grace that still counts began
+        :rtype: bool
+        """
+        self.ensure_one()
+        self.env.cr.execute(
+            "SELECT running_confirmed_at FROM cloud_instance"
+            " WHERE id = %s FOR NO KEY UPDATE",
+            (self.id,),
+        )
+        row = self.env.cr.fetchone()
+        return bool(row and row[0] and row[0] > moment)
+
+    def _running_stopped_since(self, moment):
+        """Return whether this instance was written stopped at or after *moment*.
+
+        Read from its row, locked, and not from the cache, for the same
+        reason as ``_running_confirmed_after``: a Stop committing as the
+        cron decides must not see its stop undone by a series from before
+        it. Asked only before writing a start, on a row the write locks
+        anyway, and locked ``FOR NO KEY UPDATE`` for the same reason.
+
+        :param datetime moment: when the ``odoo`` the cron read was last seen
+        :rtype: bool
+        """
+        self.ensure_one()
+        self.env.cr.execute(
+            "SELECT running_stopped_at FROM cloud_instance"
+            " WHERE id = %s FOR NO KEY UPDATE",
+            (self.id,),
+        )
+        row = self.env.cr.fetchone()
+        return bool(row and row[0] and row[0] >= moment)
+
+    def _metric_alerts_suppressed(self):
+        """Return True when metric alerts about this instance are noise.
+
+        Core always answers False: it knows of no legitimate reason for a
+        deployed instance to stop reporting. A layer above may — one
+        that sleeps an instance on idle stops every container, so cAdvisor
+        goes quiet and "down" is precisely what a naive rule concludes.
+        That layer overrides this.
+
+        Asking the instance, rather than testing a field core does not
+        have, is what keeps the sleep feature out of core entirely.
+        """
+        self.ensure_one()
+        return False
+
+    def _liveness_covered_by_metrics(self):
+        """Return True when metrics are the authority on ``running`` here.
+
+        Arbitration, not preference. Both the metrics cron and the SSH
+        health probe can determine whether an instance is up, and with
+        observability on they would otherwise both write the flag on
+        their own schedules — agreeing most of the time, and flapping the
+        instance's state whenever they briefly did not.
+
+        Metrics win while they are fresh because they are continuous and
+        cheap; the SSH probe remains the fallback and takes over by
+        itself the moment the readings go stale, so there is no window
+        where nobody decides.
+
+        One exception, in the probe: an ``odoo`` it sees running and
+        answering is written running whoever owns the flag. That is
+        direct evidence, fresher than any scrape; a stopped one is
+        still left to the metrics while they are fresh.
+        """
+        self.ensure_one()
+        settings = self.env["cloud.settings"].sudo()._get_system()
+        if not settings.metrics_enabled:
+            return False
+        if not self.metrics_last_seen:
+            return False
+        age = (
+            fields.Datetime.now() - self.metrics_last_seen
+        ).total_seconds()
+        return age <= _LIVENESS_HANDOVER_SECONDS
+
+    @api.model
+    def _ages_by_instance(self, base, expression, user, token,
+                          label="instance_id"):
+        """Return ``{record id: seconds since last seen}``, or ``None``.
+
+        ``None`` is "the question could not be asked" — a transport or
+        protocol failure — and callers must treat it as unknown rather
+        than as an answer. An empty dict is a real answer: the backend
+        replied and nothing matched.
+
+        :param str base: metrics backend root
+        :param str expression: PromQL returning one sample per instance
+        :param str user: metrics account this panel authenticates as
+        :param str token: password half of that credential
+        :param str label: the sample label that carries the record id —
+            ``instance_id`` by default, ``host_id`` for host coverage
+        :rtype: dict | None
+        """
+        verify = self.env["cloud.settings"].sudo()._central_tls_verify()
+        try:
+            samples = promql_query(
+                base, expression, token=token, user=user, verify=verify,
+            )
+        except Exception as exc:  # noqa: BLE001 — logged, never fatal
+            _logger.warning(
+                "[metrics] could not refresh instance liveness: %s", exc,
+            )
+            return None
+
+        ages = {}
+        for labels, age_seconds in samples:
+            raw = (labels or {}).get(label)
+            if not raw:
+                continue
+            try:
+                ages[int(raw)] = age_seconds
+            except (TypeError, ValueError):
+                continue
+        return ages
+
+    @api.model
+    def _cron_refresh_running_from_metrics(self):
+        """Update ``running`` for instances the metrics backend covers.
+
+        Two questions, not one. The first is which instances the backend
+        reports on at all; the second is how long since each one's
+        ``odoo`` container was seen. Only the second decides the flag —
+        ``running`` has always meant *that* container, the same thing the
+        SSH probe measures, and asking about any container of the stack
+        answers a different question. An instance can keep its database
+        and backup containers up while its ``odoo`` is stopped, so the
+        loose form said "yes" all night and the flag never fell: the
+        sleep/wake tracking that hangs off it never fired, and the panel
+        showed a stopped instance as running.
+
+        A third question covers the stack stopped whole. Its containers
+        leave the backend within a scrape, so it drops out of the first
+        answer altogether, and left alone its flag stayed True until the
+        SSH probe took it back up to twenty minutes later. An instance
+        the backend used to report on and now reports nothing of, on a
+        host that still reports containers, has its whole stack stopped
+        and is written as not running. Never one the backend never
+        reported on, and never when the host itself has gone quiet.
+
+        Neither answer undoes a job's word too soon. A job that starts or
+        recreates ``odoo`` takes its series away and confirms ``running``
+        (``running_confirmed_at``); for ``_CONFIRMED_GRACE_SECONDS`` after,
+        an ``odoo`` the backend does not show, or a stack it does not show
+        at all, leaves the flag up. A rise read here opens no grace, and a
+        stop written by anyone closes it (``write``).
+
+        Nor does a series undo a stop. A stopped ``odoo``'s series stays
+        within the window for minutes, and one last seen no later than
+        the instance was written stopped (``running_stopped_at``) is that
+        container's, and leaves the flag down. One seen after it — a
+        start without a job, such as a wake on traffic — raises it.
+
+        Fail-safe, three times over:
+
+        * a backend that cannot be reached updates nothing — silence is
+          not evidence that instances stopped;
+        * an instance the backend has never reported on is left untouched
+          rather than marked stopped, so a host whose agents are not
+          installed yet keeps whatever the SSH telemetry says; and
+        * a fleet that reports containers but not one ``odoo`` among them
+          is a broken query or a missing label far more plausibly than
+          every instance stopping at once, so that too changes nothing.
+        """
+        settings = self.env["cloud.settings"].sudo()._get_system()
+        if not settings.metrics_enabled:
+            return
+        base = (settings.metrics_central_url or "").strip()
+        if not base:
+            return
+        user, token = settings._metrics_auth()
+
+        covered = self._ages_by_instance(
+            base, _COVERAGE_EXPRESSION, user, token,
+        )
+        if not covered:
+            return
+        # Before the question, so that what is read as when an ``odoo``
+        # was last seen errs early: a series only just older than a stop
+        # must not pass for one seen after it.
+        asked_at = fields.Datetime.now()
+        odoo_ages = self._ages_by_instance(
+            base, _ODOO_EXPRESSION, user, token,
+        )
+        if odoo_ages is None:
+            return
+        if not odoo_ages:
+            _logger.warning(
+                "[metrics] %d instance(s) report containers but none "
+                "reports an %r container — leaving liveness untouched",
+                len(covered), _ODOO_SERVICE,
+            )
+            return
+
+        host_ages = self._ages_by_instance(
+            base, _HOST_COVERAGE_EXPRESSION, user, token, label="host_id",
+        )
+        reporting_hosts = [
+            host_id for host_id, age in (host_ages or {}).items()
+            if age <= _SEEN_WINDOW_SECONDS
+        ]
+
+        now = fields.Datetime.now()
+        grace_start = now - timedelta(seconds=_CONFIRMED_GRACE_SECONDS)
+        # The stamping runs on its own READ COMMITTED cursor, opened
+        # only now that the HTTP query is done: these are the very rows
+        # the SSH health probe writes ``last_health_check`` on, and
+        # under the default snapshot isolation whichever of the two
+        # arrived second lost the row outright. See ``_concurrency``.
+        with read_committed_cursor(self.env.registry) as cr:
+            env = self.env(cr=cr)
+            instances = (
+                env["cloud.instance"].sudo().browse(list(covered)).exists()
+            )
+            for inst in instances:
+                age = odoo_ages.get(inst.id)
+                running = age is not None and age <= _SEEN_WINDOW_SECONDS
+                if (
+                    inst.running and not running
+                    and inst._running_confirmed_after(grace_start)
+                ):
+                    # A job has just brought it up: its new series is
+                    # not answered yet. See ``_CONFIRMED_GRACE_SECONDS``.
+                    running = True
+                if (
+                    running and not inst.running
+                    and inst._running_stopped_since(
+                        asked_at - timedelta(seconds=age),
+                    )
+                ):
+                    # The series of the container a stop took down,
+                    # still ageing out of the window. See ``write``.
+                    running = False
+                vals = {"metrics_last_seen": now}
+                if inst.running != running:
+                    vals["running"] = running
+                    _logger.info(
+                        "[metrics] instance %s running: %s → %s",
+                        inst.name, not running, running,
+                    )
+                # ``metrics_last_seen`` is stamped even when nothing
+                # changed: it is what tells the SSH health probe that
+                # liveness is already covered here, and "no change" is
+                # exactly the steady state where that matters most.
+                inst.write(vals)
+            if reporting_hosts:
+                # Not stamped: ``metrics_last_seen`` is the last time the
+                # backend reported on the instance, and silence is not.
+                parked = env["cloud.instance"].sudo().search([
+                    ("id", "not in", list(covered)),
+                    ("host_id", "in", reporting_hosts),
+                    ("running", "=", True),
+                    ("metrics_last_seen", "!=", False),
+                    # Nor one a job has just brought up, as above.
+                    "|", ("running_confirmed_at", "=", False),
+                    ("running_confirmed_at", "<=", grace_start),
+                ])
+                for inst in parked:
+                    if inst._running_confirmed_after(grace_start):
+                        continue
+                    _logger.info(
+                        "[metrics] instance %s running: True → False"
+                        " (no container reported on a reporting host)",
+                        inst.name,
+                    )
+                    inst.write({"running": False})
+
+    @api.model
+    def _metrics_liveness_window(self):
+        """Return the freshness window, in seconds, for tests and docs."""
+        return _SEEN_WINDOW_SECONDS

@@ -1,0 +1,433 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+
+        <!-- Queue attributes (see cloud.job.type): ``queue_collapse``
+             returns the identical job already waiting instead of a
+             second one, ``queue_exclusive`` lets one wait at most and
+             ``failure_holds_queue`` holds the target's queue after a
+             failure until it is retried or its alert dismissed. -->
+
+        <record id="host_probe" model="cloud.job.type">
+            <field name="name">Host Probe</field>
+            <field name="code">host_probe</field>
+            <field name="apply_to">host</field>
+            <field name="description">Probes the host to check its status and availability.</field>
+
+        </record>
+
+        <record id="host_metrics" model="cloud.job.type">
+            <field name="name">Host Metrics</field>
+            <field name="code">host_metrics</field>
+            <field name="apply_to">host</field>
+            <field name="description">Collects CPU cores, total RAM and disk health from the host.</field>
+            <field name="priority_tier">low</field>
+        </record>
+
+        <record id="deploy_instance" model="cloud.job.type">
+            <field name="name">Deploy Instance</field>
+            <field name="code">deploy_instance</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Deploys a doodba instance via copier on the target host.</field>
+            <field name="queue_collapse">True</field>
+            <field name="failure_holds_queue">True</field>
+        </record>
+
+        <record id="full_setup" model="cloud.job.type">
+            <field name="name">Setup Host</field>
+            <field name="code">full_setup</field>
+            <field name="apply_to">host</field>
+            <field name="description">Full host setup: checks OS/disk, installs all tools, deploys Traefik.</field>
+        </record>
+
+        <record id="push_trusted_proxies" model="cloud.job.type">
+            <field name="name">Push Trusted Proxy Settings</field>
+            <field name="code">push_trusted_proxies</field>
+            <field name="apply_to">host</field>
+            <field name="description">Re-ships the Traefik configuration that says which proxies in front of this host may be believed, and restarts the proxy so the static setting takes effect.</field>
+            <!-- Shown in the host action bar: applying a change to the
+                 proxy settings otherwise needs a full setup run, which
+                 reinstalls tooling this has nothing to do with. -->
+            <field name="show_as_action">True</field>
+            <field name="action_icon">fa-shield</field>
+            <field name="action_order">40</field>
+            <!-- The last step restarts Traefik, and on the host that
+                 serves this panel that means the panel's own requests
+                 and its bus connection die for a few seconds. Without
+                 this notice the operator reads the resulting
+                 "connection interrupted" as a broken action. -->
+            <field name="action_confirm">Traefik will restart on this host. The panel and every instance it serves will be unreachable for a few seconds, and this page may report a lost connection while it comes back.</field>
+        </record>
+
+        <record id="sync_direct_path" model="cloud.job.type">
+            <field name="name">Sync Direct Path</field>
+            <field name="code">sync_direct_path</field>
+            <field name="apply_to">host</field>
+            <field name="description">Applies the list of platform addresses admitted on the host's direct port, in nftables and in Traefik, reads it back, and probes the direct names the host publishes. Never restarts the proxy.</field>
+            <!-- Shown on the page of a host that publishes a direct port
+                 (cloud.host._offered_actions): after changing the list by
+                 hand, or to probe a direct name now rather than at the
+                 next pass of its cron. -->
+            <field name="show_as_action">True</field>
+            <field name="action_icon">fa-exchange</field>
+            <field name="action_order">45</field>
+            <!-- The list and the probes are read when the job runs, so a
+                 waiting one covers every change queued behind it. -->
+            <field name="queue_collapse">True</field>
+        </record>
+
+        <record id="push_edge_guard" model="cloud.job.type">
+            <field name="name">Push Edge Guard</field>
+            <field name="code">push_edge_guard</field>
+            <field name="apply_to">host</field>
+            <field name="description">Writes the edge guard to the host's proxy, the router that refuses Odoo's public /website/info page on every instance, and checks the proxy refuses it. Never restarts the proxy.</field>
+            <!-- Queued by the update that introduced it and by the host
+                 Check when the file is missing or differs; Full Setup
+                 writes it itself. Nothing for a person to run. -->
+            <field name="show_as_action">False</field>
+            <!-- The document is rendered when the job runs, so a waiting
+                 one covers every request queued behind it. A failure
+                 must not hold the host's queue (the default). -->
+            <field name="queue_collapse">True</field>
+        </record>
+
+        <record id="start_instance" model="cloud.job.type">
+            <field name="name">Start Instance</field>
+            <field name="code">start_instance</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Starts a stopped doodba instance (docker compose up -d).</field>
+            <field name="queue_collapse">True</field>
+        </record>
+
+        <record id="stop_instance" model="cloud.job.type">
+            <field name="name">Stop Instance</field>
+            <field name="code">stop_instance</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Stops a running doodba instance (docker compose stop).</field>
+            <field name="queue_collapse">True</field>
+        </record>
+
+        <record id="restart_instance" model="cloud.job.type">
+            <field name="name">Restart Instance</field>
+            <field name="code">restart_instance</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Restarts a doodba instance (docker compose restart).</field>
+            <field name="queue_collapse">True</field>
+        </record>
+
+        <record id="rebuild_instance" model="cloud.job.type">
+            <field name="name">Rebuild Instance</field>
+            <field name="code">rebuild_instance</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Rebuilds the Odoo Docker image without cache (docker compose build --pull --no-cache odoo).</field>
+            <field name="queue_collapse">True</field>
+            <field name="failure_holds_queue">True</field>
+        </record>
+
+        <record id="delete_project" model="cloud.job.type">
+            <field name="name">Delete Project</field>
+            <field name="code">delete_project</field>
+            <field name="apply_to">host</field>
+            <field name="description">Removes the project directory from the host after verifying no containers remain under it.</field>
+        </record>
+
+        <record id="delete_instance" model="cloud.job.type">
+            <field name="name">Delete Instance</field>
+            <field name="code">delete_instance</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Stops and removes a doodba instance from the host.</field>
+            <field name="queue_exclusive">True</field>
+            <field name="failure_holds_queue">True</field>
+        </record>
+
+        <record id="purge_archived_backups" model="cloud.job.type">
+            <field name="name">Delete Archived Copy</field>
+            <field name="code">purge_archived_backups</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Empties an archived instance's backup prefix from a throwaway container, then removes the record. Nothing is redeployed.</field>
+        </record>
+
+        <record id="restore_instance" model="cloud.job.type">
+            <field name="name">Restore Database</field>
+            <field name="code">restore_instance</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Restores a doodba instance database from a .zip backup file.</field>
+            <field name="queue_exclusive">True</field>
+            <field name="failure_holds_queue">True</field>
+        </record>
+
+        <record id="grant_restore_upload_key" model="cloud.job.type">
+            <field name="name">Grant Restore Upload Key</field>
+            <field name="code">grant_restore_upload_key</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Installs a one-use SSH key on the host, restricted to writing one directory, so a backup archive can be uploaded without anybody being given access to the machine.</field>
+        </record>
+
+        <record id="verify_restore_upload" model="cloud.job.type">
+            <field name="name">Check Uploaded Archive</field>
+            <field name="code">verify_restore_upload</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Reports the name, size and SHA-256 of what arrived through an upload key, computed on the host, so it can be confirmed before it is restored.</field>
+        </record>
+
+        <record id="watch_restore_uploads" model="cloud.job.type">
+            <field name="name">Watch Restore Upload Doors</field>
+            <field name="code">watch_restore_uploads</field>
+            <field name="apply_to">host</field>
+            <field name="description">Measures what the open upload doors of a host hold and the disk free, and closes a door past its limit, or every door once the disk of the instances is down to its reserve.</field>
+            <field name="priority_tier">low</field>
+            <field name="queue_collapse">True</field>
+        </record>
+
+        <record id="revoke_restore_upload_key" model="cloud.job.type">
+            <field name="name">Revoke Restore Upload Key</field>
+            <field name="code">revoke_restore_upload_key</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Removes a one-use upload key from the host, and its directory unless a restore is about to read it.</field>
+        </record>
+
+        <record id="move_cutover" model="cloud.job.type">
+            <field name="name">Move Cutover</field>
+            <field name="code">move_cutover</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Verifies the destination instance is healthy and cuts the instance over to the new host (flips host_id, re-points DNS).</field>
+            <field name="failure_holds_queue">True</field>
+        </record>
+
+        <record id="move_cleanup_source" model="cloud.job.type">
+            <field name="name">Move Cleanup (source)</field>
+            <field name="code">move_cleanup_source</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Removes the copy a move froze on the old host, without archiving the instance record.</field>
+            <!-- False, not left out: an update writes only the fields
+                 listed, and the type held the queue until 1.0.200. It
+                 runs after the cutover, when the instance already lives
+                 on the destination: a failure to remove the old copy
+                 must not stop its backups and jobs. Its alert stays,
+                 and so does the retry. -->
+            <field name="failure_holds_queue">False</field>
+        </record>
+
+        <record id="move_quiet_check" model="cloud.job.type">
+            <field name="name">Move Quiet Check</field>
+            <field name="code">move_quiet_check</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Checks, right before a move stops the instance on its source, that nothing is running on it; when something is, the move is postponed and the source keeps serving.</field>
+        </record>
+
+        <record id="move_fingerprint" model="cloud.job.type">
+            <field name="name">Move Fingerprint</field>
+            <field name="code">move_fingerprint</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Counts the rows of a few tables and the filestore's files on the source of a move, once Odoo is stopped, so the restore on the destination can check it received the same.</field>
+        </record>
+
+        <record id="move_freeze_source" model="cloud.job.type">
+            <field name="name">Move Freeze (source)</field>
+            <field name="code">move_freeze_source</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Stops the old host copy after a successful move and keeps it, data included, for a while before it is removed.</field>
+        </record>
+
+        <record id="move_rollback_cleanup" model="cloud.job.type">
+            <field name="name">Move Rollback Cleanup</field>
+            <field name="code">move_rollback_cleanup</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Cleans up the half-built destination after a rolled-back move (docker compose down -v + rm -rf, non-fatal).</field>
+            <field name="failure_holds_queue">True</field>
+        </record>
+
+        <record id="export_instance" model="cloud.job.type">
+            <field name="name">Export for Development</field>
+            <field name="code">export_instance</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Packages the instance's Doodba project as a development copy — configuration, repositories and dependencies, without env files, keys, tokens or logs — and makes it available for download.</field>
+            <field name="queue_collapse">True</field>
+        </record>
+
+        <record id="setup_whitelist" model="cloud.job.type">
+            <field name="name">Setup Whitelist</field>
+            <field name="code">setup_whitelist</field>
+            <field name="apply_to">host</field>
+            <field name="description">Creates or updates ~/globalwhitelist/docker-compose.yaml and brings whitelist proxy services up.</field>
+        </record>
+
+        <record id="install_observability" model="cloud.job.type">
+            <field name="name">Install Observability</field>
+            <field name="code">install_observability</field>
+            <field name="apply_to">host</field>
+            <field name="description">Installs the metrics agents (node_exporter, cAdvisor, vmagent, and Fluent Bit where the host sends its security logs) on the host and labels every container with its instance/project so the panel can attribute metrics. Push-only: no inbound port is opened.</field>
+            <field name="priority_tier">low</field>
+            <!-- Deliberately NOT offered as a button. It used to be one,
+                 justified as "how an operator refreshes the labels after
+                 adding instances" — a task that became automatic when
+                 deploy/move/remove started refreshing them itself. What
+                 was left was a button whose only remaining purpose was
+                 enrolment, and enrolment is not a decision: there is no
+                 host to which observability does not apply. It is now
+                 applied by the reconciliation cron, so the button was
+                 pure noise, and worse, its presence implied a step that
+                 an operator could forget. The job itself stays — it is
+                 what the cron queues. -->
+            <field name="show_as_action">False</field>
+            <field name="queue_collapse">True</field>
+        </record>
+
+        <record id="deploy_metrics_central" model="cloud.job.type">
+            <field name="name">Deploy Metrics Central</field>
+            <field name="code">deploy_metrics_central</field>
+            <field name="apply_to">host</field>
+            <field name="description">Deploys the central metrics stack on the target host: VictoriaMetrics, vmauth and Loki, the store of the hosts' security logs. Run it again against another host to move it.</field>
+        </record>
+
+        <record id="sync_metrics_accounts" model="cloud.job.type">
+            <field name="name">Sync Metrics Accounts</field>
+            <field name="code">sync_metrics_accounts</field>
+            <field name="apply_to">host</field>
+            <!-- Deliberately NOT in cloud.job._hidden_job_types: hidden
+                 types are exempt from the active-job guard, and this one
+                 rewrites the very file a central deployment writes. Being
+                 visible is what serialises the two against the same
+                 host. -->
+            <field name="show_as_action">False</field>
+            <field name="description">Rewrites the gateway's access-control list on an already-deployed central. Granting an account is a sub-second reload of the proxy — it never touches the compose file, so it cannot recreate VictoriaMetrics or Loki.</field>
+            <field name="queue_collapse">True</field>
+        </record>
+
+        <record id="host_hardening" model="cloud.job.type">
+            <field name="name">Harden Host</field>
+            <field name="code">host_hardening</field>
+            <field name="apply_to">host</field>
+            <field name="description">Applies the in-host security recipe (non-root operator user, hardened sshd on a rotated port, nftables allowlist, fail2ban, sysctl, unattended-upgrades, docker daemon, journald, auditd) and disables root SSH only after proving the new login works.</field>
+        </record>
+
+        <record id="host_reboot_check" model="cloud.job.type">
+            <field name="name">Check for a Pending Restart</field>
+            <field name="code">host_reboot_check</field>
+            <field name="apply_to">host</field>
+            <field name="description">Reads whether the server waits for a restart to install its updates, and queues the restart inside the server's window when nothing of the panel runs there.</field>
+            <field name="priority_tier">low</field>
+        </record>
+
+        <record id="host_reboot" model="cloud.job.type">
+            <field name="name">Restart Server</field>
+            <field name="code">host_reboot</field>
+            <field name="apply_to">host</field>
+            <field name="description">Restarts the server to install its updates, once nothing of the panel runs there, and waits until it is back. The jobs of the server and of its instances wait for it.</field>
+            <field name="priority_tier">low</field>
+            <field name="queue_exclusive">True</field>
+        </record>
+
+        <record id="delete_host" model="cloud.job.type">
+            <field name="name">Delete Host</field>
+            <field name="code">delete_host</field>
+            <field name="apply_to">host</field>
+            <field name="description">Stops Traefik, removes the traefik directory and archives the host record.</field>
+        </record>
+
+        <record id="docker_prune" model="cloud.job.type">
+            <field name="name">Docker Prune</field>
+            <field name="code">docker_prune</field>
+            <field name="apply_to">host</field>
+            <field name="description">Reclaims disk space by removing unused Docker containers, images, networks and build cache (docker system prune -af).</field>
+            <field name="priority_tier">low</field>
+        </record>
+
+        <record id="discard_handoff" model="cloud.job.type">
+            <field name="name">Discard Handed-over Backup</field>
+            <field name="code">discard_handoff</field>
+            <field name="apply_to">host</field>
+            <field name="description">Removes from the host the backup a download handed over for a restore that will no longer run.</field>
+        </record>
+
+        <record id="backup_list" model="cloud.job.type">
+            <field name="name">List Backups</field>
+            <field name="code">backup_list</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Lists available backups via duplicity collection-status.</field>
+            <field name="queue_collapse">True</field>
+        </record>
+
+        <record id="backup_create" model="cloud.job.type">
+            <field name="name">Create Backup</field>
+            <field name="code">backup_create</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Creates a manual backup (duplicity for production, click-odoo-backupdb for others).</field>
+            <field name="queue_collapse">True</field>
+        </record>
+
+        <record id="backup_download" model="cloud.job.type">
+            <field name="name">Download Backup</field>
+            <field name="code">backup_download</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Downloads a specific backup from duplicity as a ZIP file.</field>
+        </record>
+
+        <record id="backup_download_neutralized" model="cloud.job.type">
+            <field name="name">Download Neutralized Backup</field>
+            <field name="code">backup_download_neutralized</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Downloads a neutralized copy of a backup (crons off, mail servers archived, credentials scrubbed, database.is_neutralized=true). Safe for testing/troubleshooting.</field>
+        </record>
+
+        <record id="backup_restore" model="cloud.job.type">
+            <field name="name">Restore Backup</field>
+            <field name="code">backup_restore</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Restores a production instance from a duplicity backup (destructive operation).</field>
+            <field name="queue_exclusive">True</field>
+            <field name="failure_holds_queue">True</field>
+        </record>
+
+        <record id="instance_health" model="cloud.job.type">
+            <field name="name">Instance Health Check</field>
+            <field name="code">instance_health</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Checks container state, HTTP health, CPU/memory peaks and error log count for a deployed instance.</field>
+            <field name="priority_tier">low</field>
+        </record>
+
+        <record id="relay_test_mail" model="cloud.job.type">
+            <field name="name">Relay Test Mail</field>
+            <field name="code">relay_test_mail</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Sends one mail through a production instance's mail relay to the person who asks, and says whether the relay's server took it. Changes nothing on the instance.</field>
+            <!-- One waiting at most, not a collapse: the mail goes to
+                 the job's creator, so a collapse would hand one person's
+                 test to another, and each test may wait two minutes in a
+                 production's queue. -->
+            <field name="queue_exclusive">True</field>
+            <!-- False, not left out: an update writes only the fields
+                 listed. A test that could not reach the relay must not
+                 stop a production's backups and deploys; its alert says
+                 what failed. -->
+            <field name="failure_holds_queue">False</field>
+        </record>
+
+        <record id="read_last_login" model="cloud.job.type">
+            <field name="name">Read Last Login</field>
+            <field name="code">read_last_login</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Reads the most recent login from a staging instance's own database, so the staging autopurge can tell a used environment from a forgotten one. Takes no action and changes nothing inside the instance.</field>
+            <field name="priority_tier">low</field>
+        </record>
+
+        <record id="capture_secret_key" model="cloud.job.type">
+            <field name="name">Capture Encryption Key</field>
+            <field name="code">capture_secret_key</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Reads the encryption key an instance holds on its host, so the panel keeps a copy and a move or a new host never loses it. Changes nothing on the host.</field>
+            <field name="priority_tier">low</field>
+        </record>
+
+        <record id="check_admin_password" model="cloud.job.type">
+            <field name="name">Check Admin Password</field>
+            <field name="code">check_admin_password</field>
+            <field name="apply_to">instance</field>
+            <field name="description">Checks whether a running instance's Odoo admin user still has Odoo's default password and, only then, gives it a random one that is not kept anywhere and restarts Odoo. A password somebody set is left as it is.</field>
+            <field name="priority_tier">low</field>
+            <field name="queue_collapse">True</field>
+        </record>
+
+    </data>
+</odoo>

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+<!-- This contains the tour assets. They are included during testing. -->
+<template id="incubacloud.index" name="Cloud Index">&lt;!DOCTYPE html&gt;
+<html>
+    <head>
+        <title>IncubaCloud</title>
+        <!-- Declared here: a customer's panel has no website module to
+             serve /favicon.ico, and its tab showed the browser's globe. -->
+        <link rel="icon" type="image/svg+xml" href="/incubacloud/static/src/img/icon-solid.svg"/>
+
+        <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
+        <meta http-equiv="content-type" content="text/html, charset=utf-8" />
+        <!-- No ``user-scalable=no``: blocking pinch-zoom fails WCAG 1.4.4
+             (Resize text). Users must be able to zoom the panel. -->
+        <meta name="viewport" content="width=device-width, initial-scale=1"/>
+
+        <!-- Relay fonts: Space Grotesk (display) + Hanken Grotesk (UI) + JetBrains Mono (data),
+             served by this module, never by Google. -->
+        <link rel="stylesheet" href="/incubacloud/static/fonts/fonts.css"/>
+
+        <style> body { background: #0c100e; } </style>
+
+        <script type="text/javascript">
+            var odoo = <t t-out="json.dumps({
+                'csrf_token': request.csrf_token(None),
+                '__session_info__': session_info,
+                'from_backend': from_backend,
+                'debug': debug,
+            })"/>;
+            odoo.loadMenusPromise = Promise.resolve();
+        </script>
+        <t t-call-assets="incubacloud.assets_prod"/>
+    </head>
+    <body class="cloud">
+    </body>
+</html>
+</template>
+
+</odoo>

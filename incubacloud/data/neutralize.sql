@@ -1,0 +1,183 @@
+-- IncubaCloud core — neutralize environment-specific data after prod restore.
+-- Run, with every installed module's own file, by `odoo neutralize -d <db>`
+-- and by `click-odoo-restoredb --neutralize` (no manifest entry needed).
+-- Each file is one statement: one error aborts the whole neutralization.
+--
+-- Usage:
+--   click-odoo-restoredb --neutralize devel <backup>
+--   docker compose exec -T db psql -U odoo -d devel -c "DELETE FROM ir_mail_server
+--       WHERE name = 'neutralization - disable emails' AND smtp_host = 'invalid'"
+--   invoke restart
+--
+-- The DELETE drops the placeholder server Odoo's own neutralization adds,
+-- so mail falls back to the stack's MailHog instead of failing. Only on a
+-- stack whose SMTP is a mail catcher (devel, staging): on prod.yaml the
+-- fallback is the real relay.
+
+-- 1. Nullify all EncryptedChar fields (prevents decrypt crashes with wrong key)
+UPDATE cloud_host SET password = '', key_file = NULL, traefik_panel_password = '';
+UPDATE cloud_backup_backend SET s3_secret_access_key = NULL, passphrase = NULL;
+UPDATE cloud_github_app SET webhook_secret = NULL, private_key = '';
+UPDATE cloud_instance SET odoo_admin_password = NULL, odoo_admin_user_password = NULL,
+    postgres_password = NULL, smtp_relay_password = NULL;
+UPDATE cloud_settings SET github_pat = NULL, metrics_remote_write_token = NULL,
+    metrics_operator_token = NULL, metrics_delete_auth_key = NULL;
+UPDATE cloud_host SET tls_default_key = NULL, tls_default_cert = NULL;
+UPDATE cloud_job SET secret_payload = NULL;
+UPDATE res_users SET cloud_telegram_bot_token = NULL, cloud_webhook_secret = NULL;
+-- A column added after a copy was taken is missing from it, and a copy is
+-- neutralized before it is upgraded: one unknown column aborts the whole
+-- neutralization, Odoo's own included. Such a column is cleared on its own,
+-- skipped where the copy predates it (secret_key: 1.0.189).
+DO $$ BEGIN
+    UPDATE cloud_instance SET secret_key = NULL;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
+-- The relay's OAuth2 client secret (1.0.224), in a block of its own so a
+-- copy that lacks it still loses secret_key. Its directory and client ids
+-- stay: they name the application at Microsoft and sign in to nothing
+-- without the secret.
+DO $$ BEGIN
+    UPDATE cloud_instance SET smtp_relay_oauth_client_secret = NULL;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
+-- The metrics central's certificate authority (1.0.228): production's
+-- agents trust it, so a copy holding its key could stand in for the
+-- central before them. Its certificate and the end of the leaf go with
+-- it, so the copy mints an authority of its own if it ever deploys one.
+DO $$ BEGIN
+    UPDATE cloud_settings SET metrics_ca_key = NULL, metrics_ca_cert = NULL,
+        metrics_central_cert_expires = NULL;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
+-- The agents' write-only credential and a read credential being rotated in
+-- (1.0.230): production's central knows both, so a copy holding them could
+-- write as production's servers or read as its panel.
+DO $$ BEGIN
+    UPDATE cloud_settings SET metrics_agent_token = NULL,
+        metrics_read_token_next = NULL, metrics_credentials_deployed = NULL;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
+-- An SFTP backup destination's private key (1.0.232): the destination's
+-- server accepts it, so a copy holding it could read and delete the
+-- backups there. Its public half and the trusted server key stay.
+DO $$ BEGIN
+    UPDATE cloud_backup_backend SET sftp_private_key = NULL;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
+-- Its password (1.0.238), for the same reason.
+DO $$ BEGIN
+    UPDATE cloud_backup_backend SET sftp_password = NULL;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
+
+-- 2. Clear known_hosts fingerprints (prod-specific)
+UPDATE cloud_host SET known_hosts_key = NULL;
+
+-- 3. Deactivate infra records to prevent accidental SSH/provisioning
+UPDATE cloud_host SET active = false;
+UPDATE cloud_instance SET active = false;
+-- Nothing else leaves the copy: its jobs and alerts would call the users'
+-- webhooks, and its metrics would go to production's central.
+UPDATE res_users SET cloud_webhook_url = NULL;
+UPDATE cloud_settings SET metrics_enabled = false;
+-- Production's queue travels with the copy, and what has not finished
+-- would run there: cancelled, with the cloud.job that mirrors it. So is
+-- what waits in an instance's queue (``queued``, no queue.job yet), which
+-- the copy's dispatcher would start. A job waiting for an alert has no
+-- state and is left as it is: only resolving that alert would start it.
+WITH live AS (
+    UPDATE queue_job SET state = 'cancelled'
+     WHERE state IN ('wait_dependencies', 'pending', 'enqueued', 'started')
+    RETURNING id
+)
+UPDATE cloud_job SET state = 'cancelled'
+ WHERE queue_job_id IN (SELECT id FROM live) OR state = 'queued';
+
+-- 4. Delete ephemeral session data; a console open in production is not
+-- open in the copy (the host's console is younger than some copies).
+DELETE FROM cloud_terminal_route;
+DELETE FROM cloud_host_terminal_route;
+DELETE FROM cloud_restore_upload_grant;
+DELETE FROM cloud_rate_limit;
+DELETE FROM mail_mail;
+UPDATE cloud_instance_session SET state = 'closed',
+    closed_at = now() AT TIME ZONE 'UTC' WHERE state = 'open';
+DO $$ BEGIN
+    UPDATE cloud_host_session SET state = 'closed',
+        closed_at = now() AT TIME ZONE 'UTC' WHERE state = 'open';
+EXCEPTION WHEN undefined_table THEN NULL;
+END $$;
+
+-- 5. Clear environment-specific ir.config_parameters
+DELETE FROM ir_config_parameter WHERE key = 'incubacloud.backup_backend_id';
+DELETE FROM ir_config_parameter WHERE key = 'incubacloud.host_autoassign';
+UPDATE ir_config_parameter SET value = '' WHERE key = 'web.base.url';
+-- The central's URLs of before its single name (1.0.228): production's
+-- way back, which the copy's switch turned off would write as its own.
+DELETE FROM ir_config_parameter WHERE key = 'incubacloud.metrics_central_legacy_urls';
+
+-- 6. The direct path (1.0.200): its DNS token, the central's direct name
+-- (no host of the copy may be offered it) and the dates of production's
+-- last probes, which say nothing about the copy. Newer than older copies.
+DO $$ BEGIN
+    UPDATE cloud_settings SET acme_dns_cloudflare_token = NULL,
+        metrics_central_direct_host = NULL;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
+DELETE FROM ir_config_parameter
+ WHERE key LIKE 'incubacloud.direct\_checked\_at.%';
+
+-- 7. Git providers (1.0.221): their tokens, which reach private
+-- repositories and, with the api scope, write to them. The servers stay,
+-- for the copy to read public repositories. Newer than older copies.
+DO $$ BEGIN
+    UPDATE cloud_git_credential SET token = NULL;
+EXCEPTION WHEN undefined_table THEN NULL;
+END $$;
+
+-- 8. GitLab webhooks (1.0.221): their secrets and routing keys. A copy takes
+-- no push of production's repositories, and without the tokens of section 7
+-- it could not register them again; their deliveries go with them.
+DO $$ BEGIN
+    DELETE FROM cloud_gitlab_hook;
+EXCEPTION WHEN undefined_table THEN NULL;
+END $$;
+
+-- 9. Odoo's database.secret, the key that signs sessions, signup and reset
+-- links, portal and unsubscribe links, and names the panel's handoffs: the
+-- copy gets one of its own, a uuid4 as Odoo creates it. A session or a link
+-- of production's does not open the copy, nor one of the copy's
+-- production; whoever is signed in to the copy signs in again. Nothing the
+-- panel stores is derived from it: a handoff is named from it only while its
+-- chain runs, and section 3 cancels the chains. A restore as a copy
+-- (click-odoo-restoredb's default) already gives a new one, with
+-- database.uuid; odoo neutralize after a pg_restore did not.
+UPDATE ir_config_parameter SET value = gen_random_uuid()::text
+ WHERE key = 'database.secret';
+
+-- 10. The heartbeat of the scheduled actions (1.0.228): the copy's pings
+-- would tell production's heartbeat check that production is alive. Newer
+-- than older copies.
+DO $$ BEGIN
+    UPDATE cloud_settings SET cron_heartbeat_url = NULL;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
+
+-- 11. Checkpoints of jobs with steps run apart on a server (1.0.225): a row
+-- says the job may have something running on a server of production's,
+-- which the copy's reconciliation would go and stop. Its plan holds
+-- commands with secrets too. Newer than older copies.
+DO $$ BEGIN
+    DELETE FROM cloud_job_checkpoint;
+EXCEPTION WHEN undefined_table THEN NULL;
+END $$;
+
+-- 12. The holds of the servers' restarts (1.0.232): a copy restarts no
+-- server of production's. Its hosts are archived above and its jobs
+-- cancelled, which ends every hold already, and Odoo's own neutralization
+-- switches the check's cron off; the rows go too. Newer than older copies.
+DO $$ BEGIN
+    DELETE FROM cloud_host_reboot;
+EXCEPTION WHEN undefined_table THEN NULL;
+END $$;

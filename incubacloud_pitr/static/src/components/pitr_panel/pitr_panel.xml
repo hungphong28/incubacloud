@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <t t-name="incubacloud_pitr.PitrPanel">
+        <div class="rl-card rl-card-pad ic-pitr-panel" t-if="props.environment === 'production'">
+            <div class="ic-pitr-head">
+                <strong>Continuous recovery</strong>
+                <t t-if="state.data">
+                    <span t-att-class="'rl-pill ' + pillClass"><span class="rl-d"/><t t-esc="stateLabel"/></span>
+                </t>
+                <span class="ic-pitr-tz" t-if="state.data and state.data.state !== 'off'">Times in your local time</span>
+            </div>
+            <t t-if="state.loading and !state.data">
+                <div class="ic-pitr-muted"><i class="fa fa-spinner fa-spin"/> Loading…</div>
+            </t>
+            <t t-elif="state.error">
+                <div class="ic-pitr-muted" role="alert" t-esc="state.error"/>
+            </t>
+            <t t-elif="state.data and !state.data.postgres_supported">
+                <div class="ic-pitr-muted">
+                    Needs PostgreSQL 12 or later, which this Odoo series does not run on.
+                </div>
+            </t>
+            <t t-elif="state.data and !state.data.available">
+                <div class="ic-pitr-muted">
+                    Needs a backup backend: this instance could then be restored to any minute of its backup window.
+                </div>
+            </t>
+            <t t-elif="state.data and state.data.state === 'off' and !state.data.enabled">
+                <div class="ic-pitr-muted">
+                    Off. Switched on, the database is archived continuously and the files copied as they change, so the instance can be restored to any minute of the last <t t-esc="state.data.window_days"/> days. Switching it on rebuilds the instance and restarts its database once.
+                </div>
+                <div class="ic-pitr-actions" t-if="props.canManage">
+                    <button class="rl-btn rl-btn-primary rl-btn-sm" t-att-disabled="state.busy or state.data.busy" t-on-click="enable">Switch on</button>
+                </div>
+            </t>
+            <t t-elif="state.data">
+                <div class="ic-pitr-body">
+                    <dl class="ic-pitr-facts">
+                        <dt>Restorable to</dt>
+                        <dd>
+                            <t t-if="windowFrom">
+                                <t t-esc="windowText"/>
+                                <span class="ic-pitr-muted" t-esc="keptText"/>
+                            </t>
+                            <t t-elif="state.data.state === 'enabling'">nothing yet: taking the first base copy…</t>
+                            <t t-else="">nothing yet</t>
+                        </dd>
+                        <dt>Last archived</dt>
+                        <dd>
+                            <t t-if="lastArchived"><t t-esc="formatDate(lastArchived)"/> <span class="ic-pitr-muted">(<t t-esc="ago(lastArchived)"/>)</span></t>
+                            <t t-else="">—</t>
+                        </dd>
+                        <dt>Checked</dt>
+                        <dd>
+                            <t t-if="checkedAt"><t t-esc="ago(checkedAt)"/> <span class="ic-pitr-muted" t-esc="cadenceText"/></t>
+                            <t t-else="">not yet</t>
+                        </dd>
+                    </dl>
+                    <div class="ic-pitr-side">
+                        <div class="rl-frow">
+                            <label t-att-for="props.canManage and !state.data.external ? 'ic-pitr-objective' : undefined">Loses at most</label>
+                            <t t-if="props.canManage and !state.data.external">
+                                <RlSelect id="'ic-pitr-objective'"
+                                          value="state.data.objective"
+                                          options="objectiveOptions"
+                                          disabled="state.busy or state.data.busy"
+                                          onChange="(value) => this.setObjective(value)"
+                                          ariaLabel="'Recovery objective'"/>
+                            </t>
+                            <t t-else=""><div t-esc="objectiveLabel(state.data.objective)"/></t>
+                        </div>
+                        <div class="ic-pitr-actions" t-if="props.canManage and !state.data.external">
+                            <button class="rl-btn rl-btn-primary rl-btn-sm" t-att-disabled="state.busy or state.data.busy or !windowFrom" t-on-click="openRestore">Restore to a moment…</button>
+                            <button class="rl-btn rl-btn-ghost rl-btn-sm" t-att-disabled="state.busy or state.data.busy" t-on-click="disable">Switch off</button>
+                        </div>
+                    </div>
+                </div>
+            </t>
+            <IcModal t-if="state.restoring" title="'Restore to a moment'" boxClass="'ic-restore-box'" onClose="() => this.closeRestore()">
+                <div class="ic-restore-header">
+                    <h3 class="ic-confirm-title">Restore to a moment</h3>
+                    <span class="ic-restore-instance-name" t-esc="props.instanceName"/>
+                </div>
+                <p class="ic-pitr-restore-note">
+                    The database and the files go back to the moment chosen; whatever happened after it is undone. Odoo is stopped meanwhile. A backup of the present is taken first.
+                </p>
+                <p class="ic-pitr-restore-note" t-if="props.autoUpdate">
+                    Its modules are then updated to the code the instance runs now. To undo a deployment, revert its code first, or its migration runs again.
+                </p>
+                <div class="rl-frow">
+                    <label for="ic-pitr-when">Moment (your local time)</label>
+                    <input id="ic-pitr-when" type="datetime-local" class="rl-input" t-att-min="minInput" t-att-max="maxInput" t-model="state.when" aria-describedby="ic-pitr-range"/>
+                    <div id="ic-pitr-range" class="ic-pitr-muted ic-pitr-range" t-esc="rangeText"/>
+                </div>
+                <div class="rl-frow">
+                    <label for="ic-pitr-confirm">Type <strong class="ic-pitr-confirm-name" t-esc="props.instanceName"/> to confirm</label>
+                    <input id="ic-pitr-confirm" type="text" class="rl-input" t-model="state.confirmName" autocomplete="off"/>
+                </div>
+                <div class="ic-confirm-actions">
+                    <button class="ic-confirm-btn-cancel" t-on-click="closeRestore">Cancel</button>
+                    <button class="ic-confirm-btn-ok danger" t-att-disabled="!restoreReady or state.busy" t-on-click="restore">Restore</button>
+                </div>
+            </IcModal>
+        </div>
+    </t>
+
+</templates>

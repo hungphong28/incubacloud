@@ -1,0 +1,860 @@
+"""Tests for cloud.instance.move_to_host orchestration.
+
+The move reuses existing executors in one two-host ``enqueue_chain``; the
+source is only torn down as the last step, so a failure anywhere earlier
+breaks the chain and leaves the source recoverable. These tests pin the
+chain shape, the validations, the watchdog recovery, and the rollback —
+the SSH executors themselves are mocked away.
+
+Updated 2026-07 to cover the robust rollback that cancels the chain and
+enqueues cleanup+start instead of silently ignoring the in-flight jobs.
+"""
+import asyncio
+from unittest.mock import MagicMock, patch
+
+from odoo.exceptions import UserError
+from odoo.tests.common import TransactionCase
+
+from odoo.addons.queue_job.exception import JobError
+
+from ..models.abstract_executor import JobRefused
+from ..models.registry import executor_registry
+from ..models.transport import SSHTransport
+
+
+class TestInstanceMove(TransactionCase):
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.env['cloud.project'].create({'name': 'move-proj'})
+        self.source = self.env['cloud.host'].create({
+            'name': 'src', 'ip_address': '10.0.0.1', 'port': 22,
+            'user': 'root', 'login_type': 'ssh_key',
+            'wildcard_domain': 'src.example.com',
+            'status': 'compatible', 'traefik_deployed': True,
+        })
+        self.target = self.env['cloud.host'].create({
+            'name': 'tgt', 'ip_address': '10.0.0.2', 'port': 22,
+            'user': 'root', 'login_type': 'ssh_key',
+            'wildcard_domain': 'tgt.example.com',
+            'status': 'compatible', 'traefik_deployed': True,
+        })
+        self.bb = self.env['cloud.backup.backend'].create({
+            'name': 'move-bb',
+            'backend_type': 's3',
+            's3_bucket': 'move-bucket',
+        })
+        self.inst = self.env['cloud.instance'].create({
+            'name': 'movable', 'project_id': self.project.id,
+            'environment': 'production', 'host_id': self.source.id,
+            'state': 'deployed', 'backup_backend_id': self.bb.id,
+        })
+
+    def _patch_chain(self):
+        return patch.object(
+            type(self.env['cloud.job']), 'enqueue_chain',
+            return_value=[1, 2, 3, 4, 5, 6, 7, 8, 9],
+        )
+
+    def _patch_enqueue(self, return_value=8):
+        return patch.object(
+            type(self.env['cloud.job']), 'enqueue',
+            return_value=return_value,
+        )
+
+    # ── Chain shape & validations ──────────────────────────────────────
+
+    def test_move_builds_two_host_chain(self):
+        with self._patch_chain() as m:
+            res = self.inst.move_to_host(self.target)
+        self.assertTrue(res['ok'])
+        steps = m.call_args[0][0]
+        expected_codes = [
+            'deploy_instance', 'stop_instance', 'move_quiet_check',
+            'stop_instance', 'move_fingerprint', 'backup_download',
+            'restore_instance', 'move_cutover', 'move_freeze_source',
+        ]
+        self.assertEqual(
+            [s['job_type_code'] for s in steps], expected_codes,
+        )
+        self.assertEqual(
+            [s['host_id'] for s in steps],
+            [self.target.id, self.target.id, self.source.id, self.source.id,
+             self.source.id, self.source.id, self.target.id, self.target.id,
+             self.source.id],
+        )
+        # The destination's odoo stops before the source's, outside the
+        # window the customer waits through; the instance is not marked
+        # stopped by it.
+        self.assertEqual(
+            steps[1]['payload'], {'services': ['odoo'], 'move_target': True},
+        )
+        # Nothing said what started it: an operator's move.
+        self.assertEqual(
+            steps[2]['payload'], {'move_options': {'trigger': 'manual'}},
+        )
+        # The source's stop starts the cut the cutover measures.
+        self.assertEqual(
+            steps[3]['payload'], {'services': ['odoo'], 'move_cut': True},
+        )
+        # The data goes as a live dump of the stopped panel's database,
+        # staged on the source (handoff) and streamed by the restore: no
+        # backup container, no bucket, never an ir.attachment.
+        self.assertEqual(
+            steps[5]['payload'],
+            {'time': 'live', 'download_type': 'all', 'handoff': 'host'},
+        )
+        self.assertEqual(steps[6]['payload']['mode'], 'from_host')
+        self.assertEqual(
+            steps[6]['payload']['source_job_id'], '__chain_job_5__',
+        )
+        # And is checked against what the source counted.
+        self.assertEqual(
+            steps[6]['payload']['verify_job'], '__chain_job_4__',
+        )
+        # The same database changing hosts, not a copy: it keeps its
+        # secret (the links it signed), uuid and base URL.
+        self.assertIs(steps[6]['payload']['as_move'], True)
+        self.assertEqual(self.inst.move_origin_host_id, self.source)
+        self.assertEqual(self.inst.move_target_host_id, self.target)
+        self.assertEqual(self.inst.move_chain_job_ids, '1,2,3,4,5,6,7,8,9')
+
+    def test_the_move_options_reach_the_quiet_check(self):
+        with self._patch_chain() as m:
+            self.inst.move_to_host(self.target, move_options={'trigger': 'idle'})
+        quiet = next(
+            s for s in m.call_args[0][0]
+            if s['job_type_code'] == 'move_quiet_check'
+        )
+        self.assertEqual(quiet['payload'], {'move_options': {'trigger': 'idle'}})
+
+    def test_every_layer_step_takes_its_place(self):
+        """Prepare steps before the quiet check, pre-steps after it, cut
+        steps after the source's stop, post-restore steps before the
+        cutover, freeze steps last; the restore still finds the download
+        and the fingerprint."""
+        def layer_step(name):
+            return {
+                'host_id': self.source.id, 'instance_id': self.inst.id,
+                'job_type_code': 'start_instance', 'payload': {'layer': name},
+            }
+        Instance = type(self.inst)
+        with self._patch_chain() as m, patch.object(
+            Instance, '_move_prepare_steps',
+            return_value=[layer_step('prepare')],
+        ), patch.object(
+            Instance, '_move_pre_steps', return_value=[layer_step('pre')],
+        ), patch.object(
+            Instance, '_move_cut_steps', return_value=[layer_step('cut')],
+        ), patch.object(
+            Instance, '_move_post_restore_steps',
+            return_value=[layer_step('post')],
+        ), patch.object(
+            Instance, '_move_freeze_steps', return_value=[layer_step('freeze')],
+        ):
+            self.inst.move_to_host(self.target)
+        steps = m.call_args[0][0]
+        labels = [
+            (s.get('payload') or {}).get('layer') or s['job_type_code']
+            for s in steps
+        ]
+        self.assertEqual(labels, [
+            'deploy_instance', 'stop_instance', 'prepare', 'move_quiet_check',
+            'pre', 'stop_instance', 'cut', 'move_fingerprint', 'backup_download',
+            'restore_instance', 'post', 'move_cutover', 'move_freeze_source',
+            'freeze',
+        ])
+        restore = steps[labels.index('restore_instance')]['payload']
+        self.assertEqual(
+            restore['source_job_id'],
+            f"__chain_job_{labels.index('backup_download')}__",
+        )
+        self.assertEqual(
+            restore['verify_job'],
+            f"__chain_job_{labels.index('move_fingerprint')}__",
+        )
+
+    def test_stopping_the_destination_leaves_the_instance_running(self):
+        """The source still serves until its own stop: only that one marks
+        the instance stopped."""
+        from ..models.stop_instance_executor import StopInstanceExecutor
+
+        for payload, running in (
+            ({'services': ['odoo'], 'move_target': True}, True),
+            ({'services': ['odoo']}, False),
+        ):
+            with self.subTest(payload=payload):
+                self.inst.running = True
+                ex = object.__new__(StopInstanceExecutor)
+                ex.job = MagicMock(spec=type(self.env['cloud.job']))
+                ex.job.instance_id = self.inst
+                ex.job.payload = payload
+                ex.env = self.env
+                ex._log_buffer = []
+                asyncio.run(ex.on_success([]))
+                self.assertEqual(self.inst.running, running)
+
+    def test_move_validations(self):
+        with self._patch_chain():
+            with self.assertRaises(UserError):
+                self.inst.move_to_host(self.source)
+            # A move needs a deployed instance: walk the teardown path to
+            # make it a draft, then bring it back.
+            self.inst._transition('deleting')
+            self.inst._transition('draft')
+            with self.assertRaises(UserError):
+                self.inst.move_to_host(self.target)
+            self.inst._transition('deployed')
+            self.target.traefik_deployed = False
+            with self.assertRaises(UserError):
+                self.inst.move_to_host(self.target)
+
+    def test_move_blocked_when_already_moving(self):
+        self.inst.move_origin_host_id = self.source.id
+        with self._patch_chain():
+            with self.assertRaises(UserError):
+                self.inst.move_to_host(self.target)
+
+    def test_a_move_needs_no_backup_backend(self):
+        """An instance without a backup container may have no backend
+        either: the move used to stop at "service backup is not
+        running" (QA, 2026-10-15). It carries a live dump instead."""
+        self.inst.backup_backend_id = False
+        self.env['ir.config_parameter'].sudo().set_param(
+            'incubacloud.backup_backend_id', '',
+        )
+        self.assertFalse(self.inst.instance_backup_dst)
+        with self._patch_chain() as m:
+            self.inst.move_to_host(self.target)
+        codes = [s['job_type_code'] for s in m.call_args[0][0]]
+        self.assertNotIn('backup_create', codes)
+        download = m.call_args[0][0][codes.index('backup_download')]
+        self.assertEqual(download['payload']['time'], 'live')
+
+    def test_core_deploy_job_type(self):
+        self.assertEqual(
+            self.inst._move_deploy_job_type(), 'deploy_instance',
+        )
+
+    # ── Rollback — new robust behaviour ────────────────────────────────
+
+    def test_rollback_enqueues_cleanup_and_start(self):
+        """Rollback cancels the chain and enqueues two recovery jobs."""
+        self.inst.write({
+            'move_origin_host_id': self.source.id,
+            'move_target_host_id': self.target.id,
+            'move_chain_job_ids': '1,2,3',
+        })
+        with self._patch_enqueue(return_value=42) as m:
+            res = self.inst.rollback_move()
+        self.assertTrue(res['ok'])
+        self.assertEqual(res['job_id'], 42)
+        # Two enqueues: start_instance on source, cleanup on target.
+        self.assertEqual(m.call_count, 2)
+        calls = m.call_args_list
+        # First call: start_instance on source
+        self.assertEqual(calls[0][0][0], self.source.id)
+        self.assertEqual(calls[0][0][2], 'start_instance')
+        self.assertTrue(calls[0][1].get('bypass_running_check'))
+        # Second call: move_rollback_cleanup on target
+        self.assertEqual(calls[1][0][0], self.target.id)
+        self.assertEqual(calls[1][0][2], 'move_rollback_cleanup')
+        self.assertTrue(calls[1][1].get('bypass_running_check'))
+        # Markers are NOT cleared — cleanup does that on success.
+        self.assertEqual(self.inst.move_origin_host_id, self.source)
+        self.assertEqual(self.inst.move_target_host_id, self.target)
+        self.assertTrue(self.inst.move_rollback_in_progress)
+
+    def test_rollback_requires_in_progress(self):
+        with self.assertRaises(UserError):
+            self.inst.rollback_move()
+
+    def test_rollback_rejects_when_cutover_completed(self):
+        """Rollback raises when host_id already flipped (cutover done)."""
+        self.inst.write({
+            'move_origin_host_id': self.source.id,
+            'host_id': self.target.id,
+        })
+        with self.assertRaises(UserError) as ctx:
+            self.inst.rollback_move()
+        self.assertIn('already completed', str(ctx.exception))
+
+    def test_rollback_rejects_duplicate(self):
+        """Second rollback call while one is running raises."""
+        self.inst.write({
+            'move_origin_host_id': self.source.id,
+            'move_target_host_id': self.target.id,
+            'move_rollback_in_progress': True,
+        })
+        with self.assertRaises(UserError) as ctx:
+            self.inst.rollback_move()
+        self.assertIn('already in progress', str(ctx.exception))
+
+    def test_do_rollback_move_host_mismatch_returns_false(self):
+        """_do_rollback_move returns False when host_id ≠ origin."""
+        self.inst.move_origin_host_id = self.source.id
+        self.inst.host_id = self.target.id
+        result = self.inst._do_rollback_move()
+        self.assertFalse(result)
+
+    def test_do_rollback_move_no_origin_returns_false(self):
+        """_do_rollback_move returns False when no marker is set."""
+        result = self.inst._do_rollback_move()
+        self.assertFalse(result)
+
+    # ── Chain cancellation ─────────────────────────────────────────────
+
+    def test_cancel_move_chain_with_no_chain_jobs(self):
+        """_cancel_move_chain is a no-op when move_chain_job_ids is empty."""
+        self.inst.move_chain_job_ids = False
+        with self._patch_enqueue() as m:
+            self.inst._cancel_move_chain()
+        m.assert_not_called()
+
+    def test_cancel_move_chain_skips_terminal_jobs(self):
+        """Only active jobs are cancelled; terminal ones are skipped."""
+        job_type = self.env['cloud.job.type'].search(
+            [('code', '=', 'deploy_instance')], limit=1,
+        )
+        jobs = []
+        for state in ('done', 'failed', 'cancelled'):
+            job = self.env['cloud.job'].create({
+                'host_id': self.source.id,
+                'instance_id': self.inst.id,
+                'job_type_id': job_type.id,
+                'name': f'Job {state}',
+            })
+            self.env.cr.execute(
+                "UPDATE cloud_job SET state = %s WHERE id = %s",
+                (state, job.id),
+            )
+            jobs.append(job)
+        self.env['cloud.job'].invalidate_model(['state'])
+        self.inst.move_chain_job_ids = ','.join(
+            str(j.id) for j in jobs
+        )
+        try:
+            self.inst._cancel_move_chain()
+        except Exception:
+            self.fail("_cancel_move_chain should not raise on terminal jobs")
+
+    def test_cancel_move_chain_cancels_active_jobs(self):
+        """Active jobs in the chain get cancelled."""
+        job_type = self.env['cloud.job.type'].search(
+            [('code', '=', 'deploy_instance')], limit=1,
+        )
+        jobs = [
+            self.env['cloud.job'].create({
+                'host_id': self.source.id,
+                'instance_id': self.inst.id,
+                'job_type_id': job_type.id,
+                'name': f'Active job {i}',
+            })
+            for i in range(2)
+        ]
+        for job in jobs:
+            self.env.cr.execute(
+                "UPDATE cloud_job SET state = %s WHERE id = %s",
+                ('started', job.id),
+            )
+        self.env['cloud.job'].invalidate_model(['state'])
+        self.inst.move_chain_job_ids = ','.join(
+            str(j.id) for j in jobs
+        )
+        with patch.object(
+            type(self.env['cloud.job']), 'cancel_job',
+        ) as mock_cancel:
+            self.inst._cancel_move_chain()
+        self.assertEqual(mock_cancel.call_count, 2)
+
+    def test_get_move_chain_jobs_preserves_order(self):
+        """_get_move_chain_jobs returns jobs in chain order, not DB order."""
+        job_type = self.env['cloud.job.type'].search(
+            [('code', '=', 'deploy_instance')], limit=1,
+        )
+        jobs_created = [
+            self.env['cloud.job'].create({
+                'host_id': self.source.id,
+                'instance_id': self.inst.id,
+                'job_type_id': job_type.id,
+                'name': f'Job {i}',
+            })
+            for i in range(3)
+        ]
+        ids = [j.id for j in jobs_created]
+        self.inst.move_chain_job_ids = ','.join(
+            str(ids[i]) for i in (1, 0, 2)  # middle, first, last
+        )
+        jobs = self.inst._get_move_chain_jobs()
+        self.assertEqual([j.id for j in jobs], [ids[1], ids[0], ids[2]])
+
+    # ── Watchdog recovery (cron_recover_stuck_moves) ────────────────────
+
+    def _make_terminal_job(self, state='failed'):
+        jt = self.env['cloud.job.type'].search(
+            [('code', '=', 'deploy_instance')], limit=1,
+        )
+        return self.env['cloud.job'].create({
+            'host_id': self.source.id,
+            'instance_id': self.inst.id,
+            'job_type_id': jt.id,
+            'name': 'Terminal move job',
+            'state': state,
+        })
+
+    def _make_active_job(self, state='started'):
+        """Create a ``cloud.job`` and force-persist its state via SQL."""
+        jt = self.env['cloud.job.type'].search(
+            [('code', '=', 'deploy_instance')], limit=1,
+        )
+        job = self.env['cloud.job'].create({
+            'host_id': self.source.id,
+            'instance_id': self.inst.id,
+            'job_type_id': jt.id,
+            'name': 'Active move job',
+        })
+        self.env.cr.execute(
+            "UPDATE cloud_job SET state = %s WHERE id = %s",
+            (state, job.id),
+        )
+        self.env['cloud.job'].invalidate_model(['state'])
+        return job
+
+    def test_watchdog_triggers_rollback_and_alerts(self):
+        """When all jobs are terminal, watchdog calls _do_rollback_move
+        (enqueues cleanup+start) and creates a move_stuck alert. Markers
+        are NOT cleared — the rollback cleanup clears them on success."""
+        self.inst.write({
+            'move_origin_host_id': self.source.id,
+            'move_target_host_id': self.target.id,
+            'host_id': self.source.id,
+        })
+        self._make_terminal_job('failed')
+        with self._patch_enqueue() as m:
+            self.env['cloud.instance'].cron_recover_stuck_moves()
+        # Two enqueue calls: start_instance + move_rollback_cleanup.
+        self.assertEqual(m.call_count, 2)
+        # Markers are NOT cleared (rollback cleanup does that on success).
+        self.assertTrue(self.inst.move_origin_host_id)
+        self.assertTrue(self.inst.move_rollback_in_progress)
+        # Alert created.
+        alert = self.env['cloud.alert'].sudo().search([
+            ('instance_id', '=', self.inst.id),
+            ('code', '=', 'move_stuck'),
+            ('state', '=', 'active'),
+        ])
+        self.assertEqual(len(alert), 1)
+        self.assertEqual(alert.level, 'critical')
+
+    def test_watchdog_skips_move_in_progress(self):
+        """When an active job exists, watchdog leaves the instance alone."""
+        self.inst.move_origin_host_id = self.source.id
+        self._make_terminal_job('failed')
+        self._make_active_job('started')
+        with patch.object(
+            type(self.env['cloud.job']), 'enqueue',
+        ) as m:
+            self.env['cloud.instance'].cron_recover_stuck_moves()
+        m.assert_not_called()
+        self.assertEqual(self.inst.move_origin_host_id, self.source)
+        self.assertEqual(
+            self.env['cloud.alert'].sudo().search_count([
+                ('instance_id', '=', self.inst.id),
+                ('code', '=', 'move_stuck'),
+            ]),
+            0,
+        )
+
+    def test_watchdog_skips_hidden_jobs(self):
+        """Hidden job types don't count as in-flight."""
+        self.inst.move_origin_host_id = self.source.id
+        jt = self.env['cloud.job.type'].search(
+            [('code', '=', 'host_metrics')], limit=1,
+        )
+        job = self.env['cloud.job'].create({
+            'host_id': self.source.id,
+            'instance_id': self.inst.id,
+            'job_type_id': jt.id,
+            'name': 'Metrics poll',
+        })
+        self.env.cr.execute(
+            "UPDATE cloud_job SET state = %s WHERE id = %s",
+            ('started', job.id),
+        )
+        self.env['cloud.job'].invalidate_model(['state'])
+        with self._patch_enqueue() as m:
+            self.env['cloud.instance'].cron_recover_stuck_moves()
+        m.assert_called()
+
+    def test_watchdog_dedup_alert(self):
+        """Second pass with existing active move_stuck alert does not
+        create a duplicate."""
+        self.inst.write({
+            'move_origin_host_id': self.source.id,
+            'host_id': self.source.id,
+        })
+        self._make_terminal_job('failed')
+        self.env['cloud.alert'].sudo().create({
+            'code': 'move_stuck',
+            'level': 'critical',
+            'message': 'Existing alert',
+            'instance_id': self.inst.id,
+            'host_id': self.source.id,
+        })
+        with self._patch_enqueue():
+            self.env['cloud.instance'].cron_recover_stuck_moves()
+        self.assertEqual(
+            self.env['cloud.alert'].sudo().search_count([
+                ('instance_id', '=', self.inst.id),
+                ('code', '=', 'move_stuck'),
+            ]),
+            1,
+        )
+
+    # ── Cron: failed rollback cleanup ──────────────────────────────────
+
+    def test_cron_recovers_failed_rollback_cleanup(self):
+        """When rollback was started but cleanup failed (no active jobs,
+        markers still set), the cron clears markers and raises a
+        move_rollback_failed alert."""
+        self.inst.write({
+            'move_origin_host_id': self.source.id,
+            'move_target_host_id': self.target.id,
+            'move_chain_job_ids': '1,2,3',
+            'move_rollback_in_progress': True,
+            'host_id': self.source.id,
+        })
+        with self._patch_enqueue():
+            self.env['cloud.instance'].cron_recover_stuck_moves()
+        # Markers cleared by cron.
+        self.assertFalse(self.inst.move_origin_host_id)
+        self.assertFalse(self.inst.move_target_host_id)
+        self.assertFalse(self.inst.move_chain_job_ids)
+        self.assertFalse(self.inst.move_rollback_in_progress)
+        # move_rollback_failed alert created.
+        alert = self.env['cloud.alert'].sudo().search([
+            ('instance_id', '=', self.inst.id),
+            ('code', '=', 'move_rollback_failed'),
+            ('state', '=', 'active'),
+        ])
+        self.assertEqual(len(alert), 1)
+        self.assertEqual(alert.level, 'warning')
+
+    def test_cron_skips_rollback_in_progress_with_active_jobs(self):
+        """When rollback is in progress AND there are active jobs,
+        the cron leaves everything alone."""
+        self.inst.write({
+            'move_origin_host_id': self.source.id,
+            'move_target_host_id': self.target.id,
+            'move_rollback_in_progress': True,
+            'host_id': self.source.id,
+        })
+        self._make_active_job('started')
+        with self._patch_enqueue() as m:
+            self.env['cloud.instance'].cron_recover_stuck_moves()
+        m.assert_not_called()
+        self.assertTrue(self.inst.move_origin_host_id)
+        self.assertTrue(self.inst.move_rollback_in_progress)
+        self.assertEqual(
+            self.env['cloud.alert'].sudo().search_count([
+                ('instance_id', '=', self.inst.id),
+                ('code', '=', 'move_rollback_failed'),
+            ]),
+            0,
+        )
+
+    # ── The move's own jobs refuse a host that is not theirs ───────────
+
+    def _executor(self, code, host, payload=None):
+        """The executor the runner builds for a *code* job on *host*.
+
+        :param payload: the job's payload, if any
+        """
+        job = self.env['cloud.job'].create({
+            'host_id': host.id,
+            'instance_id': self.inst.id,
+            'job_type_id': self.env['cloud.job.type'].search(
+                [('code', '=', code)], limit=1,
+            ).id,
+            'name': code,
+            'payload': payload or False,
+        })
+        return executor_registry.get(code)(job, host)
+
+    def _rollback_cleanup(self, host, chain='1,2,3'):
+        """The executor of a rollback's cleanup on *host*, queued for *chain*.
+
+        :param chain: the ``move_chain_job_ids`` of the move it rolled back
+        """
+        return self._executor('move_rollback_cleanup', host, payload={
+            'move_rollback': True, 'move_chain_job_ids': chain,
+        })
+
+    def _rolling_back(self, chain='1,2,3'):
+        """Mark the instance as rolling back its move of *chain* to the target."""
+        self.inst.write({
+            'move_origin_host_id': self.source.id,
+            'move_target_host_id': self.target.id,
+            'move_chain_job_ids': chain,
+            'move_rollback_in_progress': True,
+        })
+
+    def _third_host(self):
+        """A host the move has nothing to do with."""
+        return self.env['cloud.host'].create({
+            'name': 'other', 'ip_address': '10.0.0.3', 'port': 22,
+            'user': 'root', 'login_type': 'ssh_key',
+            'wildcard_domain': 'other.example.com',
+        })
+
+    def test_the_rollback_cleanup_runs_on_the_moves_target_alone(self):
+        """On the source it removed the live copy (28-oct-2026)."""
+        self._rolling_back()
+        self._rollback_cleanup(self.target).pre_run_checks()
+        for host in (self.source, self._third_host()):
+            with self.subTest(host=host.name), self.assertRaises(JobRefused):
+                self._rollback_cleanup(host).pre_run_checks()
+
+    def test_the_rollback_cleanup_refuses_without_a_rollback_in_progress(self):
+        """A failed cleanup retried later, with the markers of a new move to
+        the same target set: it would wait for that move, then remove its
+        copy and its markers."""
+        self.inst.write({
+            'move_origin_host_id': self.source.id,
+            'move_target_host_id': self.target.id,
+            'move_chain_job_ids': '1,2,3',
+        })
+        with self.assertRaisesRegex(JobRefused, 'no rollback'):
+            self._rollback_cleanup(self.target).pre_run_checks()
+
+    def test_the_rollback_cleanup_of_an_earlier_rollback_is_refused(self):
+        """Only the cleanup the rollback under way queued removes its target."""
+        self._rolling_back(chain='4,5,6')
+        with self.assertRaisesRegex(JobRefused, 'earlier rollback'):
+            self._rollback_cleanup(self.target, chain='1,2,3').pre_run_checks()
+        with self.assertRaisesRegex(JobRefused, 'earlier rollback'):
+            self._executor(
+                'move_rollback_cleanup', self.target,
+                payload={'move_rollback': True},
+            ).pre_run_checks()
+        self._rollback_cleanup(self.target, chain='4,5,6').pre_run_checks()
+
+    def test_the_rollback_cleanup_reads_the_markers_again_after_its_wait(self):
+        """Waited out, it went on «anyway»: by then the rollback may have
+        ended and a new move begun."""
+        self.registry_enter_test_mode()
+        self._rolling_back()
+        executor = self._rollback_cleanup(self.target)
+        executor.pre_run_checks()
+        self.inst.move_rollback_in_progress = False
+        executor.MOVE_CHAIN_TERMINAL_TIMEOUT = 0
+        # What the cleanup reads on a cursor of its own is in the database.
+        self.env.flush_all()
+        transport = MagicMock(spec=SSHTransport)
+        with self.assertRaisesRegex(JobRefused, 'no rollback'):
+            asyncio.run(executor.before_execute(transport))
+
+    def test_the_rollback_cleanup_refuses_once_the_move_is_over(self):
+        """Cut over, the target is where the instance lives; undone, the
+        markers that named it are gone."""
+        self.inst.write({
+            'host_id': self.target.id,
+            'move_origin_host_id': self.source.id,
+            'move_target_host_id': self.target.id,
+        })
+        with self.assertRaises(JobRefused):
+            self._executor('move_rollback_cleanup', self.target).pre_run_checks()
+        self.inst.write({
+            'host_id': self.source.id,
+            'move_origin_host_id': False,
+            'move_target_host_id': False,
+        })
+        with self.assertRaises(JobRefused):
+            self._executor('move_rollback_cleanup', self.target).pre_run_checks()
+
+    def test_a_refused_rollback_cleanup_reaches_no_host(self):
+        """Refused before it connects: nothing at all runs on the source."""
+        # The refusal is logged on cursors of their own, riding on the
+        # test's transaction only in this mode.
+        self.registry_enter_test_mode()
+        self.inst.write({
+            'move_origin_host_id': self.source.id,
+            'move_target_host_id': self.target.id,
+            'move_rollback_in_progress': True,
+        })
+        job = self._executor('move_rollback_cleanup', self.source).job
+        Host = type(self.env['cloud.host'])
+        with patch.object(Host, 'get_transport', autospec=True) as connect, \
+                self.assertRaises(JobError):
+            job.execute()
+        connect.assert_not_called()
+        self.assertTrue(self.inst.move_origin_host_id)
+
+    def test_the_source_cleanup_never_runs_where_the_instance_lives(self):
+        """It removes the copy a move froze, on its host alone: never the
+        copy the instance lives in, nor anything on a host with none."""
+        self.inst.write({
+            'host_id': self.target.id,
+            'move_frozen_source_host_id': self.source.id,
+        })
+        self._executor('move_cleanup_source', self.source).pre_run_checks()
+        for host in (self.target, self._third_host()):
+            with self.subTest(host=host.name), self.assertRaises(JobRefused):
+                self._executor('move_cleanup_source', host).pre_run_checks()
+        self.inst.move_frozen_source_host_id = False
+        with self.assertRaises(JobRefused):
+            self._executor('move_cleanup_source', self.source).pre_run_checks()
+
+    def test_the_source_cleanup_runs_on_the_target_of_a_new_move_it_froze(self):
+        """Moving back to the host of the frozen copy: the copy goes first,
+        on the new move's target, before its deploy builds there."""
+        self.inst.write({
+            'host_id': self.target.id,
+            'move_origin_host_id': self.target.id,
+            'move_target_host_id': self.source.id,
+            'move_frozen_source_host_id': self.source.id,
+        })
+        self._executor('move_cleanup_source', self.source).pre_run_checks()
+
+    def test_the_cutover_belongs_to_the_move_in_progress(self):
+        """Retried once the move was undone, it handed the instance to a
+        copy of the data taken before the rollback."""
+        self.inst.write({
+            'move_origin_host_id': self.source.id,
+            'move_target_host_id': self.target.id,
+        })
+        self._executor('move_cutover', self.target).pre_run_checks()
+        with self.assertRaises(JobRefused):
+            self._executor('move_cutover', self._third_host()).pre_run_checks()
+        self.inst.move_rollback_in_progress = True
+        with self.assertRaises(JobRefused):
+            self._executor('move_cutover', self.target).pre_run_checks()
+        self.inst.write({
+            'move_origin_host_id': False,
+            'move_target_host_id': False,
+            'move_rollback_in_progress': False,
+        })
+        with self.assertRaises(JobRefused):
+            self._executor('move_cutover', self.target).pre_run_checks()
+
+    def test_cron_move_stuck_alert_only_when_no_rollback_in_progress(self):
+        """move_stuck alert is only created when the cron triggers
+        recovery (move_rollback_in_progress was False)."""
+        self.inst.write({
+            'move_origin_host_id': self.source.id,
+            'host_id': self.source.id,
+        })
+        self._make_terminal_job('failed')
+        with self._patch_enqueue():
+            self.env['cloud.instance'].cron_recover_stuck_moves()
+        self.assertEqual(
+            self.env['cloud.alert'].sudo().search_count([
+                ('instance_id', '=', self.inst.id),
+                ('code', '=', 'move_stuck'),
+                ('state', '=', 'active'),
+            ]),
+            1,
+        )
+
+
+class TestMoveDnsRepointNotice(TransactionCase):
+    """The cutover must tell the operator to re-point DNS.
+
+    On a bare core install nothing updates the A-record, so a successful
+    move leaves the instance answering on a different IP and unreachable
+    until a human acts. Silence there reads as a broken move.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.env['cloud.project'].create({'name': 'dns-proj'})
+        self.source = self.env['cloud.host'].create({
+            'name': 'dns-src', 'ip_address': '10.0.0.1', 'port': 22,
+            'user': 'root', 'login_type': 'ssh_key',
+            'wildcard_domain': 'src.example.com',
+            'status': 'compatible', 'traefik_deployed': True,
+        })
+        self.target = self.env['cloud.host'].create({
+            'name': 'dns-tgt', 'ip_address': '10.0.0.2', 'port': 22,
+            'user': 'root', 'login_type': 'ssh_key',
+            'wildcard_domain': 'tgt.example.com',
+            'status': 'compatible', 'traefik_deployed': True,
+        })
+        self.inst = self.env['cloud.instance'].create({
+            'name': 'dns-movable', 'project_id': self.project.id,
+            'environment': 'production', 'host_id': self.source.id,
+            'state': 'deployed',
+        })
+
+    def _alerts(self):
+        return self.env['cloud.alert'].sudo().search([
+            ('instance_id', '=', self.inst.id),
+            ('code', '=', 'move_dns_repoint'),
+            ('state', '=', 'active'),
+        ])
+
+    def test_core_dns_is_not_managed(self):
+        """A bare core install never re-points DNS by itself."""
+        self.assertFalse(self.inst._move_dns_is_managed())
+
+    def test_notice_names_the_domain_and_the_new_ip(self):
+        """The operator must not have to look the IP up elsewhere."""
+        self.inst.domain = 'shop.example.com'
+        alert = self.inst._notify_move_dns_repoint(self.target)
+        self.assertEqual(alert.level, 'warning')
+        self.assertIn('shop.example.com', alert.message)
+        self.assertIn('10.0.0.2', alert.message)
+        self.assertEqual(alert.host_id, self.target)
+        self.assertEqual(alert.project_id, self.project)
+
+    def test_notice_is_skipped_when_dns_is_managed(self):
+        """A layer that manages the DNS re-points it itself — no false alarm."""
+        with patch.object(
+            type(self.inst), '_move_dns_is_managed', return_value=True,
+        ):
+            self.assertIsNone(self.inst._notify_move_dns_repoint(self.target))
+        self.assertFalse(self._alerts())
+
+    def test_second_move_updates_the_existing_notice(self):
+        """A repeated move refreshes the alert instead of stacking."""
+        self.inst.domain = 'shop.example.com'
+        first = self.inst._notify_move_dns_repoint(self.source)
+        second = self.inst._notify_move_dns_repoint(self.target)
+        self.assertEqual(first, second)
+        self.assertEqual(len(self._alerts()), 1)
+        self.assertIn('10.0.0.2', second.message)
+
+    def test_dismissed_notice_does_not_block_a_new_one(self):
+        """Once dismissed, the next move raises a fresh alert."""
+        self.inst._notify_move_dns_repoint(self.target).state = 'dismissed'
+        self.inst._notify_move_dns_repoint(self.target)
+        self.assertEqual(len(self._alerts()), 1)
+
+    def test_cutover_raises_the_notice_on_success(self):
+        """The executor wires the notice into the successful cutover."""
+        from odoo.addons.incubacloud.models.move_cutover_executor import (
+            MoveCutoverExecutor,
+        )
+
+        jt = self.env['cloud.job.type'].search(
+            [('code', '=', 'move_cutover')], limit=1,
+        )
+        self.inst.write({'move_origin_host_id': self.source.id})
+        job = self.env['cloud.job'].create({
+            'host_id': self.target.id,
+            'instance_id': self.inst.id,
+            'job_type_id': jt.id,
+            'name': 'Cutover',
+        })
+        executor = MoveCutoverExecutor(job, self.target)
+        # A dedicated loop, left unregistered: ``asyncio.run`` clears the
+        # thread's current loop on exit and later tests in the same run
+        # call ``get_event_loop()``.
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(executor.on_success({}))
+        finally:
+            loop.close()
+
+        self.assertEqual(self.inst.host_id, self.target)
+        self.assertEqual(len(self._alerts()), 1)

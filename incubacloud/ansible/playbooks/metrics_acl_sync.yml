@@ -1,0 +1,72 @@
+---
+# Grant (and revoke) metrics accounts on an already-deployed central.
+# Driven by MetricsAclSyncExecutor.
+#
+# ── Why this exists as its own playbook ────────────────────────────────
+#
+# vmauth's user list is the access-control list, and it was only ever
+# written by the full deployment. That is fine when there is exactly one
+# account minted by that same deployment — the self-hosted case, where
+# minting and granting are literally the same act and cannot drift.
+#
+# In a shared central they are not the same act: accounts are minted
+# whenever a panel is given one, and the list is a snapshot of whoever
+# existed the last time somebody deployed. Every account minted after
+# that holds a credential the gateway has never heard of, and its agents
+# retry against a 401 forever — which reads, from their side, as our
+# software being broken.
+#
+# Re-running the full deployment would fix it and is the wrong tool: it
+# rewrites the compose file and recreates whatever differs. That is the
+# right hammer for *deploying* and a reckless one for *granting one
+# account*. This playbook does only the part that grants: rewrite the
+# document and reload the proxy. Everything it does is also done by the
+# full deployment, from the same task files.
+#
+# What it deliberately does NOT do: touch the compose file, so it cannot
+# recreate VictoriaMetrics or Loki. Adding an account is a sub-second
+# reload of one proxy, not a blip for the whole fleet.
+
+- name: Sync the metrics access-control list
+  hosts: all
+  gather_facts: true
+
+  vars:
+    ic_central_dir: "{{ ansible_env.HOME }}/observability-central"
+    # The WHOLE access-control document — every account, not just the new
+    # ones. It replaces the file, so a partial list would revoke everyone
+    # missing from it.
+    ic_vmauth_config: ""
+    ic_bridge_ip: "{{ ansible_docker0.ipv4.address | default('172.17.0.1') }}"
+    ic_gateway_bind: "{{ ic_bridge_ip }}:8428"
+
+  tasks:
+    - name: Refuse to sync a central that is not deployed here
+      # Writing auth.yml into a directory nobody serves would report
+      # success and grant nothing — the exact silent failure this whole
+      # change exists to remove. The panel records which host carries the
+      # central; if that record and this host disagree, stop.
+      ansible.builtin.stat:
+        path: "{{ ic_central_dir }}/docker-compose.yaml"
+      register: ic_central_compose
+
+    - name: Fail when there is no central on this host
+      ansible.builtin.assert:
+        that: ic_central_compose.stat.exists
+        fail_msg: >-
+          No metrics central found at {{ ic_central_dir }}. Deploy the
+          central before syncing accounts against it.
+
+    - name: Write the vmauth access-control config
+      ansible.builtin.include_tasks: tasks/vmauth_acl_write.yml
+
+    - name: Apply the access-control config and verify the boundary
+      ansible.builtin.include_tasks: tasks/vmauth_acl_apply.yml
+
+    - name: Export the sync facts
+      ansible.builtin.set_stats:
+        aggregate: false
+        data:
+          # The boundary answered through the front door AND refused an
+          # anonymous write. Anything less is not a successful grant.
+          ic_acl_synced: "{{ (ic_vm_health.status | default(0)) == 200 }}"

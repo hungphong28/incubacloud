@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates>
+
+    <t t-name="incubacloud.ProjectSidebar">
+        <div class="ic-psidebar">
+
+            <!-- Back to projects -->
+            <button class="rl-ctx-back" t-on-click="goBack">
+                <t t-out="env.icon('back', 14)"/> Projects
+            </button>
+
+            <t t-if="loading">
+                <div class="ic-psidebar-loading" style="padding: 12px;">
+                    <div class="ic-skeleton-text ic-skeleton-sm"/>
+                    <div class="ic-skeleton-text ic-skeleton-lg" style="margin-top: 8px;"/>
+                    <div class="ic-skeleton-text ic-skeleton-md" style="margin-top: 4px;"/>
+                    <div class="ic-skeleton-text ic-skeleton-sm" style="margin-top: 12px;"/>
+                    <div class="ic-skeleton-text ic-skeleton-lg" style="margin-top: 8px;"/>
+                </div>
+            </t>
+
+            <t t-else="">
+
+                <!-- Project name + Odoo version -->
+                <div class="rl-ctx-proj">
+                    <t t-esc="projectName"/>
+                    <t t-if="odooVersion">
+                        <span class="rl-ctx-projver">Odoo <t t-esc="odooVersion"/></span>
+                    </t>
+                </div>
+
+                <!-- Instances grouped by environment -->
+                <t t-foreach="['production', 'staging']" t-as="envKey" t-key="envKey">
+                    <div class="rl-ctx-sec">
+                        <div class="rl-ctx-sech">
+                            <span t-esc="envLabel(envKey)"/>
+                            <t t-if="env.permissions?.can_create_instance">
+                                <button class="rl-ctx-add"
+                                        t-att-title="addTitle(envKey)"
+                                        t-att-disabled="needsProduction(envKey) or null"
+                                        t-on-click="() => this.createInstance(envKey)">
+                                    <t t-out="env.icon('plus', 13)"/>
+                                </button>
+                            </t>
+                        </div>
+                        <t t-foreach="filteredGrouped[envKey] || []" t-as="inst" t-key="inst.id">
+                            <button t-att-class="'rl-ctx-item' + (selectedId === inst.id ? ' active' : '')"
+                                    t-on-click="() => this.selectInstance(inst)">
+                                <span t-att-class="'rl-pill ' + statusPill(inst) + ' rl-pill--bare'">
+                                    <span class="rl-d"/>
+                                </span>
+                                <span class="rl-ctx-name" t-esc="inst.name"/>
+                                <t t-if="inst.pr_number and inst.pr_kind === 'gitlab'">
+                                    <span class="ic-pr-badge">MR !<t t-esc="inst.pr_number"/></span>
+                                </t>
+                                <t t-elif="inst.pr_number">
+                                    <span class="ic-pr-badge">PR #<t t-esc="inst.pr_number"/></span>
+                                </t>
+                                <t t-if="expiryLabel(inst)">
+                                    <span t-att-class="'ic-expiry-badge' + (inst.autopurge_days_left &lt;= 3 ? ' urgent' : '')"
+                                          t-att-title="expiryTitle(inst)"
+                                          t-esc="expiryLabel(inst)"/>
+                                </t>
+                                <span class="rl-ctx-ver" t-esc="inst.odoo_version || ''"/>
+                                <t t-if="env.permissions?.can_clone_to_staging and inst.state === 'deployed' and inst.environment === 'production'">
+                                    <span class="rl-ctx-clone" title="Clone to Staging"
+                                          t-on-click.stop="() => this.cloneToStaging(inst)">
+                                        <t t-out="env.icon('arrowdown', 13)"/>
+                                    </span>
+                                </t>
+                                <t t-if="inst.tags and inst.tags.length">
+                                    <div class="ic-psidebar-tag-list">
+                                        <t t-foreach="inst.tags" t-as="tag" t-key="tag.id">
+                                            <span class="ic-psidebar-tag-badge"
+                                                  t-att-style="tagBadgeStyle(tag)">
+                                                <span class="ic-tag-dot"
+                                                      t-att-style="tagDotStyle(tag)"/>
+                                                <t t-esc="tag.name"/>
+                                            </span>
+                                        </t>
+                                    </div>
+                                </t>
+                            </button>
+                        </t>
+                        <t t-if="!(filteredGrouped[envKey] || []).length">
+                            <div class="rl-ctx-empty">— no instances</div>
+                        </t>
+                    </div>
+                </t>
+
+                <!-- Project config section (PM+) -->
+                <t t-if="env.permissions?.can_create_project">
+                    <div class="rl-ctx-sec">
+                        <div class="rl-ctx-sech">
+                            <span>Project</span>
+                        </div>
+                        <button t-att-class="'rl-ctx-item' + (['project_detail', 'project_settings'].includes(activeSection) ? ' active' : '')"
+                                t-on-click="goProjectSettings">
+                            <i class="fa fa-cog ic-psidebar-icon"/>
+                            <span class="rl-ctx-name">Settings</span>
+                        </button>
+                    </div>
+                </t>
+
+            </t>
+
+            <!-- Clone to staging modal -->
+            <IcModal t-if="ui.cloneModal"
+                     title="'Clone to Staging'"
+                     onClose="() => { ui.cloneModal = null; }">
+                <h3 class="ic-confirm-title">Clone to Staging</h3>
+                <p class="ic-confirm-message">
+                    Create a staging copy with the production database.
+                </p>
+                <div class="ic-clone-input">
+                    <label>Staging name</label>
+                    <input type="text"
+                           t-att-value="ui.cloneModal.name"
+                           t-on-input="(ev) => { ui.cloneModal.name = ev.target.value; }"/>
+                </div>
+                <t t-if="ui.cloneModal.error">
+                    <div class="ic-restore-error" t-esc="ui.cloneModal.error"/>
+                </t>
+                <div class="ic-confirm-actions">
+                    <button class="ic-confirm-btn-cancel"
+                            t-on-click="() => { ui.cloneModal = null; }">Cancel</button>
+                    <button class="ic-confirm-btn-ok"
+                            t-att-disabled="!ui.cloneModal.name.trim() or ui.cloneModal.loading"
+                            t-on-click="doClone">
+                        <t t-if="ui.cloneModal.loading">
+                            <i class="fa fa-spinner fa-spin"/> Cloning…
+                        </t>
+                        <t t-else="">
+                            <t t-out="env.icon('arrowdown', 15)"/> Clone
+                        </t>
+                    </button>
+                </div>
+            </IcModal>
+        </div>
+    </t>
+
+</templates>

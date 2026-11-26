@@ -1,0 +1,259 @@
+"""Server and monitoring tools: a manager's. Credentials stay in the panel."""
+
+from odoo import api, models
+from odoo.exceptions import UserError
+
+from ..protocol.tool_spec import ToolSpec, boolean, obj, record_id, string
+from .mcp_catalog import tool_policies
+from .mcp_tools_settings import normalized_setting
+
+_MANAGER = "group_cloud_manager"
+
+_HOST = record_id("The server.")
+_HOST_VALS = {
+    "type": "object",
+    "additionalProperties": True,
+    "description": "Server fields as the panel's form sends them. Passwords and keys "
+    "are refused: the user sets the server's SSH credentials in the panel.",
+}
+
+TOOLS = (
+    ToolSpec(
+        "manage_host",
+        "Create a server (vals), change one (host_id and vals), or set up its egress "
+        "whitelist (host_id and setup_whitelist=true). The proxies it trusts for "
+        "client addresses (trusted_proxy_ranges) change, and its security logs "
+        "stop (security_logs_enabled false), only with the user's approval.",
+        _MANAGER,
+        obj(
+            {
+                "host_id": _HOST,
+                "vals": _HOST_VALS,
+                "setup_whitelist": boolean("Set up the server's whitelist."),
+            }
+        ),
+        handler="_tool_manage_host",
+        confirm="conditional",
+        requires=(
+            "for a server's SSH credentials, the user in the panel; for "
+            "setup_whitelist, a server already set up."
+        ),
+    ),
+    ToolSpec(
+        "harden_host",
+        "Check what hardening would change on a server, or apply it (apply=true), "
+        "optionally followed by its full setup.",
+        _MANAGER,
+        obj(
+            {
+                "host_id": _HOST,
+                "apply": boolean("Apply instead of checking."),
+                "chain_full_setup": boolean("Run the full setup after it."),
+            },
+            required=("host_id",),
+        ),
+        handler="_tool_harden_host",
+        # Applying queues host_hardening, and full_setup when chained: both
+        # ask through run_host_action and retry_job (_confirm_harden_host).
+        confirm="conditional",
+        requires=(
+            "a server the panel reaches by SSH with a trusted key "
+            "(trust_host_key); apply after a preflight that found nothing "
+            "blocking."
+        ),
+    ),
+    ToolSpec(
+        "browse_host_dir",
+        "List a directory of a server, to find an instance to import.",
+        _MANAGER,
+        obj(
+            {
+                "host_id": _HOST,
+                "path": string("The directory; ~ by default.", max_length=500),
+            },
+            required=("host_id",),
+        ),
+        route="/cloud/browse_host_dir",
+        read_only=True,
+        untrusted=True,
+    ),
+    ToolSpec(
+        "import_host_instance",
+        "Import an instance that already runs on a server.",
+        _MANAGER,
+        obj(
+            {"host_id": _HOST, "path": string("Its directory.", max_length=500)},
+            required=("host_id", "path"),
+        ),
+        route="/cloud/import_host_instance",
+        requires="a directory found with browse_host_dir holding a Doodba instance.",
+    ),
+    ToolSpec(
+        "deploy_monitoring",
+        "Deploy the central monitoring stack on a server.",
+        _MANAGER,
+        obj({"host_id": _HOST}, required=("host_id",)),
+        route="/cloud/monitoring/deploy_central",
+        enqueues=True,
+        requires="a server the panel has set up (run_host_action full_setup).",
+    ),
+)
+
+ROUTES = {
+    "/cloud/create_host": "manage_host",
+    "/cloud/save_host": "manage_host",
+    "/cloud/setup_whitelist": "manage_host",
+    "/cloud/preflight_host_hardening": "harden_host",
+    "/cloud/apply_host_hardening": "harden_host",
+    "/cloud/browse_host_dir": "browse_host_dir",
+    "/cloud/import_host_instance": "import_host_instance",
+    "/cloud/monitoring/deploy_central": "deploy_monitoring",
+}
+
+
+class McpCatalogManager(models.AbstractModel):
+    """The server and monitoring tools, and the routes they call."""
+
+    _inherit = "incubacloud.mcp.catalog"
+
+    @api.model
+    def _tool_specs(self):
+        """Add the server and monitoring tools."""
+        return super()._tool_specs() + list(TOOLS)
+
+    @api.model
+    def _route_policies(self):
+        """Classify the server and monitoring routes."""
+        return {**super()._route_policies(), **tool_policies(ROUTES)}
+
+
+class McpToolsManager(models.AbstractModel):
+    """Handlers of the server tools that choose between routes."""
+
+    _inherit = "incubacloud.mcp.tools"
+
+    @api.model
+    def _tool_manage_host(self, args):
+        """Create, change or set up the whitelist of a server."""
+        host_id = args.get("host_id")
+        if args.get("setup_whitelist"):
+            if not host_id:
+                raise UserError(self.env._("Give the server (host_id)."))
+            return self._with_job_state(
+                self._route("/cloud/setup_whitelist", host_id=host_id)
+            )
+        if not args.get("vals"):
+            raise UserError(self.env._("Give the server's fields (vals)."))
+        route = "/cloud/save_host" if host_id else "/cloud/create_host"
+        self._only_host_fields(route, args["vals"])
+        if host_id:
+            return self._route(route, host_id=host_id, vals=args["vals"])
+        return self._route(route, vals=args["vals"])
+
+    @api.model
+    def _only_host_fields(self, route, vals):
+        """Refuse a field of *vals* that *route* does not write.
+
+        The routes keep the fields they know and drop the rest without a
+        word, so a misspelt field answered ok and changed nothing. What
+        they know is read from the controller that serves them, layered
+        modules' additions included; ``whitelist`` is written by a save only.
+
+        :raises UserError: naming the unknown fields and the accepted ones
+        """
+        controller = self.env["incubacloud.mcp.dispatch"]._controller(route)
+        allowed = set(controller._HOST_ALLOWED)
+        if route == "/cloud/save_host":
+            allowed.add("whitelist")
+        unknown = sorted(set(vals) - allowed)
+        if unknown:
+            secrets = self.env["incubacloud.mcp.secrets"]._field_names()
+            raise UserError(
+                self.env._(
+                    "Unknown server field(s): %(keys)s. Accepted: %(accepted)s.",
+                    keys=", ".join(unknown),
+                    accepted=", ".join(sorted(allowed - set(secrets))),
+                )
+            )
+
+    @api.model
+    def _confirm_manage_host(self, args):
+        """Ask for approval when a change to a server lowers a defence (D2).
+
+        Its trusted proxy ranges decide whose word the server takes for a
+        client's address, as the panel's own do: the message says from
+        what to what. Turning off its security logs blinds the record an
+        attack is read from, and an agent misled into it must not do that
+        quietly (review of 12-nov-2026). Turning them on asks nothing.
+        """
+        vals = args.get("vals") or {}
+        if args.get("setup_whitelist"):
+            return None
+        host = {}
+        if args.get("host_id") and (
+            "trusted_proxy_ranges" in vals or "security_logs_enabled" in vals
+        ):
+            host = self._route("/cloud/get_host", host_id=args["host_id"])
+        texts = []
+        if "trusted_proxy_ranges" in vals:
+            current = host.get("trusted_proxy_ranges") or ""
+            new = vals["trusted_proxy_ranges"]
+            key = "trusted_proxy_ranges"
+            if normalized_setting(key, new, current) != normalized_setting(
+                key, current, current
+            ):
+                texts.append(self.env._(
+                    "Change which proxies the server trusts for client addresses:\n"
+                    "- trusted_proxy_ranges: %(old)r → %(new)r",
+                    old=current,
+                    new=new,
+                ))
+        if (
+            "security_logs_enabled" in vals
+            and not vals["security_logs_enabled"]
+            and (host.get("security_logs_enabled") or not args.get("host_id"))
+        ):
+            texts.append(self.env._(
+                "Stop sending this server's security logs (SSH sign-ins, sudo, "
+                "fail2ban and changes to sensitive files) to the metrics central."
+            ))
+        return "\n".join(texts) or None
+
+    @api.model
+    def _confirm_harden_host(self, args):
+        """Ask before the hardening is applied, and the full setup it chains.
+
+        The jobs are the ones run_host_action asks for, with its words: the
+        hardening moves SSH to another port and turns off root's login,
+        and the full setup may leave every instance unreachable for a
+        while. Checking what the hardening would change asks nothing.
+
+        :param dict args: the validated arguments
+        :return: what the user approves, or None
+        """
+        if not args.get("apply"):
+            return None
+        host_id = args["host_id"]
+        text = self._confirm_run_host_action(
+            {"code": "host_hardening", "host_id": host_id}
+        )
+        if args.get("chain_full_setup"):
+            text += " " + self._confirm_run_host_action(
+                {"code": "full_setup", "host_id": host_id}
+            )
+        return text
+
+    @api.model
+    def _tool_harden_host(self, args):
+        """Preflight or apply the hardening of a server."""
+        if not args.get("apply"):
+            return self._route(
+                "/cloud/preflight_host_hardening", host_id=args["host_id"]
+            )
+        return self._with_job_state(
+            self._route(
+                "/cloud/apply_host_hardening",
+                host_id=args["host_id"],
+                chain_full_setup=bool(args.get("chain_full_setup")),
+            )
+        )

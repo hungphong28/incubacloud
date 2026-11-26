@@ -1,0 +1,1236 @@
+"""
+Tests for executor features: stop_on_failure, _prod_services,
+SMTP stripping, safe boot test, and click-odoo-update integration.
+"""
+import contextlib
+import http.client
+import os
+import shlex
+import subprocess
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+from odoo.tests.common import BaseCase, TransactionCase
+
+from types import SimpleNamespace
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_deploy_executor(smtp_relay_host='', environment='production',
+                          odoo_version='19.0', **extra):
+    """Build a minimal DeployInstanceExecutor without an Odoo environment."""
+    from odoo.addons.incubacloud.models.deploy_instance_executor import (
+        DeployInstanceExecutor,
+    )
+
+    inst = SimpleNamespace(
+        name='test-inst',
+        doodba_project_name='test_proj',
+        postgres_username='odoo',
+        postgres_dbname='prod',
+        environment=environment,
+        smtp_relay_host=smtp_relay_host,
+        smtp_relay_auth='password',
+        odoo_version=odoo_version,
+        domain='test.example.com',
+        project_id=SimpleNamespace(remote_folder='projects'),
+        odoo_initial_lang=None,
+        # Not moving, unless a test says it is; no repository line, as the
+        # executor reads them to count what 8.0 to 10.0 fetch first.
+        **({'move_origin_host_id': False, 'repo_ids': []} | extra),
+    )
+
+    ex = object.__new__(DeployInstanceExecutor)
+    ex._inst = lambda: inst
+    # The addon hooks, as core answers them: nothing to add.
+    ex._addon_env_files = dict
+    ex._addon_override_fragments = dict
+    ex._inst_dir = lambda i: f"~/projects/{i.name}"
+    ex._tmp = lambda suffix: f"/tmp/.incubacloud-test_proj-{suffix}"
+    ex._base_url = lambda: "https://test.example.com"
+    ex._backup_enabled = bool
+    # Reads cloud.settings in production; stubbed here like the other
+    # environment reads so get_commands() works without a database.
+    ex._copier_template = lambda: ("gh:Tecnativa/doodba-copier-template", "")
+    # Same reason: the log archive retention lives in cloud.settings.
+    ex._log_archive_days = lambda: 60
+    # And the series sent back to cloning in the image, a system parameter.
+    ex._repos_in_image_series = frozenset
+    ex.job = SimpleNamespace(id=42)
+    ex._scripts_requested = False
+    ex._scripts_uploaded = False
+    ex._script_overlay_cache = None
+    return ex
+
+
+def _make_rebuild_executor(smtp_relay_host='', environment='production',
+                           odoo_version='19.0', auto_update=True,
+                           boot_test=True, **extra):
+    """Build a minimal RebuildInstanceExecutor without an Odoo environment."""
+    from odoo.addons.incubacloud.models.rebuild_instance_executor import (
+        RebuildInstanceExecutor,
+    )
+
+    inst = SimpleNamespace(**{
+        "id": 42,
+        "name": 'test-inst',
+        "doodba_project_name": 'test_proj',
+        "postgres_username": 'odoo',
+        "postgres_dbname": 'prod',
+        "postgres_version": '17',
+        "environment": environment,
+        "smtp_relay_host": smtp_relay_host,
+        "smtp_relay_auth": 'password',
+        "odoo_version": odoo_version,
+        "domain": 'test.example.com',
+        "project_id": SimpleNamespace(remote_folder='projects'),
+        "odoo_initial_lang": None,
+        "auto_update": auto_update,
+        "boot_test": boot_test,
+        # A test of the smart rebuild names its own.
+        "rebuild_fingerprint": 'fp1',
+        "last_rebuild_fingerprint": 'fp0',
+        # No repository line, unless a test says so.
+        "repo_ids": [],
+        # Its admin password checked already: no check after the restart.
+        "admin_password_state": "own",
+        "admin_password_checked_at": False,
+    } | extra)
+
+    ex = object.__new__(RebuildInstanceExecutor)
+    ex._inst = lambda: inst
+    ex._addon_env_files = dict
+    ex._addon_override_fragments = dict
+    ex._inst_dir = lambda i: f"~/projects/{i.name}"
+    ex._tmp = lambda suffix: f"/tmp/.incubacloud-test_proj-{suffix}"
+    ex._base_url = lambda: "https://test.example.com"
+    ex._sys = lambda *_a, **_k: None
+    ex._backup_enabled = bool
+    ex._backup_retention = lambda: '3M'
+    ex._copier_template = lambda: ("gh:Tecnativa/doodba-copier-template", "")
+    # Same reason: the log archive retention lives in cloud.settings.
+    ex._log_archive_days = lambda: 60
+    # And the series sent back to cloning in the image, a system parameter.
+    ex._repos_in_image_series = frozenset
+    ex.job = SimpleNamespace(id=42)
+    ex._scripts_requested = False
+    ex._scripts_uploaded = False
+    ex._script_overlay_cache = None
+    return ex
+
+
+@contextlib.contextmanager
+def _apart_runs_attached(executor_cls):
+    """Run the steps marked ``detached`` of *executor_cls* as attached ones.
+
+    For a test of what a plan does with the answers of its steps, through
+    a fake ``transport.execute``: no checkpoint is written and nothing of
+    ``detached_step.sh`` is asked; a step apart gets what ``execute``
+    answers its command, with its own timeout.
+
+    :param type executor_cls: the executor class whose plan runs
+    """
+    async def _attached(self, transport, _index, _label, command, opts, resume=False):
+        """Answer the step through ``transport.execute``, as attached."""
+        extra = {"timeout": opts["timeout"]} if opts.get("timeout") else {}
+        return await transport.execute(
+            command, self.on_stdout, self.on_stderr, **extra,
+        )
+
+    with mock.patch.object(
+        executor_cls, "_open_checkpoint", autospec=True,
+    ), mock.patch.object(executor_cls, "_run_detached", _attached):
+        yield
+
+
+def _find_cmd(cmds, label_substring):
+    """Return the first command tuple whose label contains *label_substring*."""
+    return next(
+        (c for c in cmds if label_substring in c[0]),
+        None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Class 1: TestStopOnFailure
+# ---------------------------------------------------------------------------
+
+class TestStopOnFailure(BaseCase):
+    """Test that command tuples support 2-element and 3-element formats."""
+
+    def test_two_tuple_has_no_opts(self):
+        item = ('label', 'cmd')
+        self.assertEqual(len(item), 2)
+        with self.assertRaises(IndexError):
+            item[2]  # noqa: B018 — intentional access
+
+    def test_three_tuple_has_opts(self):
+        item = ('label', 'cmd', {"stop_on_failure": True})
+        self.assertTrue(item[2]["stop_on_failure"])
+
+    def test_opts_default_empty(self):
+        item = ('label', 'cmd')
+        opts = item[2] if len(item) == 3 else {}
+        self.assertEqual(opts, {})
+
+
+# ---------------------------------------------------------------------------
+# Class 2: TestProdServices
+# ---------------------------------------------------------------------------
+
+class TestProdServices(TransactionCase):
+    """The services a production stack runs follow its SMTP relay.
+
+    ``_prod_services`` hands the instance's own ``expected_services`` on
+    (the one list deploy, rebuild and the health probe share), so the
+    rule is pinned there, on real records.
+    """
+
+    def setUp(self):
+        super().setUp()
+        project = self.env["cloud.project"].create({"name": "ProdSvc"})
+        host = self.env["cloud.host"].create({
+            "name": "prodsvc-host", "ip_address": "192.0.2.72",
+            "user": "ubuntu", "wildcard_domain": "prodsvc.example.com",
+        })
+        self.instance = self.env["cloud.instance"].create({
+            "name": "prodsvc", "project_id": project.id,
+            "environment": "production", "host_id": host.id,
+        })
+
+    def test_smtp_included_when_host_set(self):
+        self.instance.smtp_relay_host = 'mail.example.com'
+        self.assertIn('smtp', self.instance.expected_services())
+
+    def test_smtp_excluded_without_a_relay(self):
+        for relay in ('', False):
+            with self.subTest(relay=relay):
+                self.instance.smtp_relay_host = relay
+                self.assertNotIn('smtp', self.instance.expected_services())
+
+    def test_always_includes_odoo_and_db(self):
+        services = self.instance.expected_services()
+        self.assertIn('odoo', services)
+        self.assertIn('db', services)
+
+    def test_a_staging_always_has_its_mail_catcher(self):
+        """Not a relay: it keeps a copy of production from mailing anyone."""
+        self.instance.environment = 'staging'
+        self.instance.smtp_relay_host = False
+        self.assertIn('smtp', self.instance.expected_services())
+
+
+# ---------------------------------------------------------------------------
+# Class 3: TestRebuildCommandsBootTest
+# ---------------------------------------------------------------------------
+
+class TestRebuildCommandsBootTest(BaseCase):
+    """The safe-boot step runs ``rebuild.sh boot-test``. Its pipeline —
+    containerised chown, in-container backup_label removal, pre-cleanup on
+    both sides of the boundary, exit-code propagation — is safety-critical
+    and covered end to end in ``tests/shell/rebuild.bats``. Here we pin
+    the wiring: the step invokes the right operation, with the instance id
+    and postgres parameters, and stops the chain on failure so a bad boot
+    never reaches ``up -d``."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        ex = _make_rebuild_executor()
+        cls.cmds = ex.get_commands()
+        cls.cmd = _find_cmd(cls.cmds, "Test new image (safe boot check)")
+        cls.argv = shlex.split(cls.cmd[1]) if cls.cmd else []
+
+    def test_boot_test_command_present(self):
+        self.assertIsNotNone(self.cmd, "Boot test command not found")
+
+    def test_boot_test_invokes_the_rebuild_boot_test_op(self):
+        self.assertTrue(self.argv[1].endswith("/rebuild.sh"), self.argv[1])
+        self.assertEqual(self.argv[2], "boot-test")
+
+    def test_boot_test_passes_the_instance_and_pg_parameters(self):
+        # argv: bash <path> boot-test <dir> <inst_id> <project> <user> <pgver> <db> <cap_s>
+        _, _, _op, _dir, inst_id, project, pg_user, pg_ver, dbname, cap = self.argv
+        self.assertEqual(inst_id, "42")
+        self.assertEqual(project, "test_proj")
+        self.assertEqual(pg_user, "odoo")
+        self.assertEqual(pg_ver, "17")
+        self.assertEqual(dbname, "prod")
+        # The step's cap, which the script's budget must end inside (#91).
+        self.assertEqual(cap, "21600")
+
+    def test_boot_test_has_stop_on_failure(self):
+        # A failed boot must abort before ``up -d`` so the instance keeps
+        # running on the old image.
+        self.assertEqual(len(self.cmd), 3)
+        self.assertTrue(self.cmd[2].get("stop_on_failure"))
+
+    def test_update_command_runs_through_the_cron_guard(self):
+        # The step is wrapped by ``cron_guard.sh``, which pauses the
+        # instance's crons around click-odoo-update: Odoo refuses to
+        # modify an ir_cron row whose job is running, so an unguarded
+        # update died whenever a tick was in flight.
+        cmd = _find_cmd(self.cmds, "Update changed modules")
+        self.assertIsNotNone(cmd, "Update command not found")
+        self.assertIn("cron_guard.sh", cmd[1])
+
+    def test_build_has_stop_on_failure(self):
+        cmd = _find_cmd(self.cmds, "Rebuild Odoo image")
+        self.assertIsNotNone(cmd, "Rebuild command not found")
+        self.assertEqual(len(cmd), 3)
+        self.assertTrue(cmd[2].get("stop_on_failure"))
+
+    def test_the_build_runs_apart_before_the_point_of_no_return(self):
+        """Marked ``detached`` (11-nov-2026): a stop still leaves the old image."""
+        labels = [cmd[0] for cmd in self.cmds]
+        cmd = _find_cmd(self.cmds, "Rebuild Odoo image")
+        from odoo.addons.incubacloud.models.rebuild_instance_executor import (
+            RebuildInstanceExecutor,
+        )
+
+        self.assertTrue(cmd[2].get("detached"))
+        self.assertLess(
+            labels.index(cmd[0]), labels.index(RebuildInstanceExecutor._no_return_from),
+        )
+
+    def test_the_long_steps_run_apart_with_their_options(self):
+        """Phase 3 (12-nov-2026): the download, the build, the boot test
+        and the update run apart, each with the options it had; the
+        update is the point of no return. «Ensure incubacloud_connect»
+        stays attached: a query on a database that nearly always has it."""
+        self.assertEqual(
+            [
+                (c[0], c[2]) for c in self.cmds
+                if len(c) == 3 and c[2].get("detached")
+            ],
+            [
+                ("Fetch the repositories", {
+                    "stop_on_failure": True, "timeout": 1260, "detached": True,
+                }),
+                ("Rebuild Odoo image", {"stop_on_failure": True, "detached": True}),
+                # Six hours, not the transport's hour (#91): the script
+                # keeps a budget by the database's size inside it.
+                ("Test new image (safe boot check)", {
+                    "stop_on_failure": True, "detached": True, "timeout": 21600,
+                }),
+                ("Update changed modules", {
+                    "stop_on_failure": True, "detached": True,
+                }),
+            ],
+        )
+        ensure = _find_cmd(self.cmds, "Ensure incubacloud_connect")
+        self.assertEqual(len(ensure), 2)
+
+    def test_a_boot_test_that_stopped_itself_says_why(self):
+        """#91: the script's reason (no room, no time) is the job's error,
+        not «exited with status 1»: it is what the failure's alert shows."""
+        errors = _make_rebuild_executor().parse_results({
+            "Test new image (safe boot check)": {
+                "exit_status": 1,
+                "stdout": (
+                    "[incubacloud] boot test: the database takes 1.0 GiB\n"
+                    "[incubacloud] ERROR: boot test stopped: No room on the"
+                    " server for the boot test: x. Nothing was changed.\n"
+                ),
+            },
+        })
+        self.assertEqual(
+            errors, ["No room on the server for the boot test: x. Nothing was changed."],
+        )
+
+    def test_a_boot_that_failed_keeps_its_exit_status(self):
+        errors = _make_rebuild_executor().parse_results({
+            "Test new image (safe boot check)": {
+                "exit_status": 3, "stdout": "Traceback (most recent call last)",
+            },
+        })
+        self.assertEqual(
+            errors, ["'Test new image (safe boot check)' exited with status 3"],
+        )
+
+    def test_a_staging_neutralizes_again_attached(self):
+        """The UPDATEs after the update are short: not run apart."""
+        cmds = _make_rebuild_executor(environment="staging").get_commands()
+        step = _find_cmd(cmds, "Neutralize again after the update")
+        self.assertEqual(step[2], {"stop_on_failure": True})
+
+    def test_a_failed_build_is_repeated_once(self):
+        """A passing failure at GitHub must not fail the whole rebuild."""
+        build = _find_cmd(self.cmds, "Rebuild Odoo image")[1]
+        self.assertEqual(build.count("docker compose build"), 2)
+        self.assertIn("|| {", build)
+        self.assertIn("sleep 60", build)
+
+
+class TestStepsApartAreKeptAsWritten(BaseCase):
+    """What a step run apart keeps on the server and in the checkpoint.
+
+    Its command is written to the step's directory and to the checkpoint's
+    plan (phase 3, 12-nov-2026): it names the files that hold secrets,
+    never a secret. And it stays POSIX: on a server that falls back to
+    running it attached (``DETACHED_EXIT_ATTACHED``) it runs in the user's
+    login shell, dash on a self-hosted one.
+    """
+
+    #: What would give a secret away inside a command.
+    _SECRET_MARKS = ("password", "token", "secret", "x-access-token", "oauth2:")
+
+    @staticmethod
+    def _apart(cmds):
+        """The steps of *cmds* marked to run apart.
+
+        :rtype: list
+        """
+        return [c for c in cmds if len(c) == 3 and c[2].get("detached")]
+
+    def _plans(self):
+        """The plans of a deploy and a rebuild, by series and environment.
+
+        :return: ``[(name, cmds), ...]``
+        """
+        plans = []
+        for make in (_make_deploy_executor, _make_rebuild_executor):
+            for version in ("8.0", "19.0"):
+                for environment in ("production", "staging"):
+                    ex = make(odoo_version=version, environment=environment)
+                    plans.append((
+                        f"{type(ex).__name__} {version} {environment}",
+                        ex.get_commands(),
+                    ))
+        return plans
+
+    def test_no_step_apart_names_a_secret(self):
+        for name, cmds in self._plans():
+            for label, command, _opts in self._apart(cmds):
+                with self.subTest(plan=name, step=label):
+                    lowered = command.lower()
+                    for mark in self._SECRET_MARKS:
+                        self.assertNotIn(mark, lowered)
+
+    def test_every_step_apart_parses_in_a_posix_shell(self):
+        shell = "dash" if subprocess.run(
+            ["sh", "-c", "command -v dash"], capture_output=True, check=False,
+        ).returncode == 0 else "sh"
+        for name, cmds in self._plans():
+            for label, command, _opts in self._apart(cmds):
+                with self.subTest(plan=name, step=label):
+                    checked = subprocess.run(
+                        [shell, "-n", "-c", command],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(checked.returncode, 0, checked.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Class 4: TestDeployCommandsChecksums
+# ---------------------------------------------------------------------------
+
+class TestDeployCommandsChecksums(BaseCase):
+    """Test that deploy get_commands() includes checksums baseline step."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        ex = _make_deploy_executor()
+        cls.cmds = ex.get_commands()
+
+    def test_checksums_step_present(self):
+        cmd = _find_cmd(self.cmds, "Initialize module checksums")
+        self.assertIsNotNone(cmd, "Checksums step not found")
+
+    def test_checksums_uses_only_compute_hashes(self):
+        cmd = _find_cmd(self.cmds, "Initialize module checksums")
+        self.assertIn("--only-compute-hashes", cmd[1])
+
+    def _container_run(self, help_text):
+        """Run the step's container command with a stand-in click-odoo-update.
+
+        :param str help_text: what the stand-in's ``--help`` prints.
+        :returns: the arguments the stand-in was run with, last call.
+        :rtype: str
+        """
+        argv = shlex.split(_find_cmd(self.cmds, "Initialize module checksums")[1])
+        start = argv.index("odoo", argv.index("--rm")) + 1
+        self.assertEqual(argv[start:start + 2], ["sh", "-c"])
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = Path(tmp, "calls")
+            tool = Path(tmp, "click-odoo-update")
+            tool.write_text(
+                "#!/bin/sh\n"
+                f'[ "$1" = --help ] && {{ echo {shlex.quote(help_text)}; exit 0; }}\n'
+                f'echo "$*" > {shlex.quote(str(calls))}\n'
+            )
+            tool.chmod(0o755)
+            subprocess.run(
+                ["sh", "-c", *argv[start + 2:]], check=True,
+                env=os.environ | {"PATH": f"{tmp}:{os.environ['PATH']}"},
+            )
+            return calls.read_text().strip()
+
+    def test_checksums_are_only_computed_where_the_tool_can(self):
+        self.assertEqual(
+            self._container_run("  --only-compute-hashes  Only compute"),
+            "--only-compute-hashes --database prod",
+        )
+
+    def test_an_old_click_odoo_stores_them_with_a_plain_run(self):
+        """click-odoo-contrib 1.12, on 8.0 to 10.0, has no such option."""
+        self.assertEqual(
+            self._container_run("  --list-only  Log the list"), "--database prod",
+        )
+
+    def test_init_db_has_stop_on_failure(self):
+        cmd = _find_cmd(self.cmds, "Initialize database")
+        self.assertIsNotNone(cmd, "Init DB command not found")
+        self.assertEqual(len(cmd), 3)
+        self.assertTrue(cmd[2].get("stop_on_failure"))
+
+    def test_the_long_steps_run_apart_with_their_options(self):
+        """Phase 3 (12-nov-2026): the download, the pull, the build and
+        the two runs of Odoo on the new database run apart; the pull with
+        a cap of its own, as it had none but the default. The steps that
+        take seconds by nature stay attached."""
+        from odoo.addons.incubacloud.models.deploy_instance_executor import (
+            _PULL_STEP_TIMEOUT_S,
+        )
+
+        self.assertEqual(_PULL_STEP_TIMEOUT_S, 900)
+        self.assertEqual(
+            [
+                (c[0], c[2]) for c in self.cmds
+                if len(c) == 3 and c[2].get("detached")
+            ],
+            [
+                ("Fetch the repositories", {
+                    "stop_on_failure": True, "timeout": 1260, "detached": True,
+                }),
+                ("Pull images", {"timeout": 900, "detached": True}),
+                ("Build Odoo image", {"stop_on_failure": True, "detached": True}),
+                ("Initialize database", {
+                    "stop_on_failure": True, "detached": True,
+                }),
+                ("Initialize module checksums", {"detached": True}),
+            ],
+        )
+        for label in ("Start database", "Set system parameters", "Start instance"):
+            self.assertEqual(len(_find_cmd(self.cmds, label)), 2, label)
+
+    def test_a_moves_deploy_keeps_its_steps_apart_but_the_initialization(self):
+        """A move's destination initializes nothing, yet still downloads,
+        pulls and builds apart: it keeps a checkpoint."""
+        cmds = _make_deploy_executor(move_origin_host_id=7).get_commands()
+        self.assertEqual(
+            [c[0] for c in cmds if len(c) == 3 and c[2].get("detached")],
+            ["Fetch the repositories", "Pull images", "Build Odoo image"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Class 5: TestSmtpStripping
+# ---------------------------------------------------------------------------
+
+class TestSmtpStripping(BaseCase):
+    """Test SMTP service stripping from prod.yaml when appropriate."""
+
+    def test_smtp_strip_when_no_host_production(self):
+        cmds = _make_deploy_executor(smtp_relay_host='', environment='production').get_commands()
+        cmd = _find_cmd(cmds, "Strip smtp service")
+        self.assertIsNotNone(cmd, "Strip step should be present for prod without smtp")
+
+    def test_no_smtp_strip_when_host_set(self):
+        cmds = _make_deploy_executor(
+            smtp_relay_host='mail.example.com', environment='production',
+        ).get_commands()
+        cmd = _find_cmd(cmds, "Strip smtp service")
+        self.assertIsNone(cmd, "Strip step should NOT be present when smtp is configured")
+
+    def test_no_smtp_strip_for_staging(self):
+        cmds = _make_deploy_executor(smtp_relay_host='', environment='staging').get_commands()
+        cmd = _find_cmd(cmds, "Strip smtp service")
+        self.assertIsNone(cmd, "Strip step should NOT be present for staging")
+
+
+# ---------------------------------------------------------------------------
+# Smart Rebuild (fingerprint-based cache decision)
+# ---------------------------------------------------------------------------
+
+class TestSmartRebuildCommands(BaseCase):
+    """Test that rebuild uses --no-cache only when fingerprint changed."""
+
+    def test_full_rebuild_when_fingerprint_differs(self):
+        """When fingerprints differ, build should use --no-cache --pull."""
+        cmds = _make_rebuild_executor(
+            rebuild_fingerprint='aaa',
+            last_rebuild_fingerprint='bbb',
+        ).get_commands()
+        cmd = _find_cmd(cmds, "Rebuild Odoo image")
+        self.assertIsNotNone(cmd)
+        self.assertIn('--no-cache', cmd[1])
+        self.assertIn('--pull', cmd[1])
+
+    def test_cached_rebuild_when_fingerprint_matches(self):
+        """When fingerprints match, build should NOT use --no-cache."""
+        cmds = _make_rebuild_executor(
+            rebuild_fingerprint='same',
+            last_rebuild_fingerprint='same',
+        ).get_commands()
+        cmd = _find_cmd(cmds, "Rebuild Odoo image")
+        self.assertIsNotNone(cmd)
+        self.assertNotIn('--no-cache', cmd[1])
+        self.assertNotIn('--pull', cmd[1])
+
+    def test_first_rebuild_is_always_full(self):
+        """When last_rebuild_fingerprint is None, build must be full."""
+        cmds = _make_rebuild_executor(
+            rebuild_fingerprint='abc',
+            last_rebuild_fingerprint=None,
+        ).get_commands()
+        cmd = _find_cmd(cmds, "Rebuild Odoo image")
+        self.assertIsNotNone(cmd)
+        self.assertIn('--no-cache', cmd[1])
+
+    def test_first_rebuild_when_empty_string(self):
+        """When last_rebuild_fingerprint is empty, build must be full."""
+        cmds = _make_rebuild_executor(
+            rebuild_fingerprint='abc',
+            last_rebuild_fingerprint='',
+        ).get_commands()
+        cmd = _find_cmd(cmds, "Rebuild Odoo image")
+        self.assertIsNotNone(cmd)
+        self.assertIn('--no-cache', cmd[1])
+
+
+# ---------------------------------------------------------------------------
+# incubacloud.env injection
+# ---------------------------------------------------------------------------
+
+class TestIncubaclouEnvInjection(BaseCase):
+    """The env_file injection runs ``deploy.sh inject-secret-env`` on both
+    deploy and rebuild. Here we pin the wiring — the step is present and
+    invokes that operation; the behaviour it guarantees (targets prod.yaml
+    and test.yaml, not common.yaml; idempotent) is covered by
+    ``tests/shell/deploy.bats``.
+    """
+
+    def _deploy_inject_cmd(self, **kwargs):
+        cmds = _make_deploy_executor(**kwargs).get_commands()
+        return _find_cmd(cmds, "Inject incubacloud.env in prod.yaml and test.yaml")
+
+    def _rebuild_inject_cmd(self, **kwargs):
+        cmds = _make_rebuild_executor(**kwargs).get_commands()
+        return _find_cmd(cmds, "Inject incubacloud.env in prod.yaml and test.yaml")
+
+    def _assert_inject_op(self, cmd):
+        self.assertIsNotNone(cmd, "Inject step must be present")
+        argv = shlex.split(cmd[1])
+        self.assertTrue(argv[1].endswith("/deploy.sh"), argv[1])
+        self.assertEqual(argv[2], "inject-secret-env")
+
+    def test_deploy_inject_step_invokes_the_script(self):
+        self._assert_inject_op(self._deploy_inject_cmd(environment='production'))
+
+    def test_rebuild_inject_step_invokes_the_script(self):
+        self._assert_inject_op(self._rebuild_inject_cmd())
+
+    def _labels(self, cmds):
+        return [c[0] for c in cmds]
+
+    def test_deploy_writes_the_panels_key_between_copier_and_ensure(self):
+        """Copier creates ``.docker/``; ``ensure-secret-key`` must then
+        find the panel's key there and keep it, never generate one."""
+        executor = _make_deploy_executor()
+        cmds = executor.get_commands()
+        labels = self._labels(cmds)
+        write = labels.index("Write incubacloud.env")
+        self.assertGreater(write, labels.index("Deploy with copier"))
+        self.assertLess(write, labels.index("Ensure incubacloud.env"))
+        cmd = _find_cmd(cmds, "Write incubacloud.env")[1]
+        self.assertIn(f"{executor._job_dir()}/incubacloud.env", cmd)
+        self.assertIn("~/projects/test-inst/.docker/incubacloud.env", cmd)
+        self.assertIn("chmod 600 ~/projects/test-inst/.docker/incubacloud.env", cmd)
+
+    def test_rebuild_writes_the_panels_key_before_ensure(self):
+        labels = self._labels(_make_rebuild_executor().get_commands())
+        self.assertLess(
+            labels.index("Write incubacloud.env"),
+            labels.index("Ensure incubacloud.env"),
+        )
+        self.assertGreater(
+            labels.index("Write incubacloud.env"),
+            labels.index("Update with copier"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Class 8: TestAutoUpdateFlag
+# ---------------------------------------------------------------------------
+
+class TestRebuildRenewsNeutralization(BaseCase):
+    """The rebuild of a staging or a preview neutralizes it again after its update.
+
+    The update rewrites the records its data files leave unprotected
+    (``noupdate`` off), scheduled actions and mail servers among them: a
+    neutralized copy (``database.is_neutralized``) came out of the rebuild
+    with them live. The host neutralizes it again and routes its mail to
+    the stack's catcher (``restore.sh renew-neutralization``); one that is
+    not neutralized is left as it is. Never on a production, whose
+    ``smtplocal`` is the real relay.
+    """
+
+    LABEL = "Neutralize again after the update"
+
+    def _labels(self, cmds):
+        """The labels of *cmds*, in order."""
+        return [c[0] for c in cmds]
+
+    def test_a_staging_is_neutralized_again_after_its_update(self):
+        cmds = _make_rebuild_executor(environment="staging").get_commands()
+        labels = self._labels(cmds)
+        self.assertIn(self.LABEL, labels)
+        update = labels.index("Update changed modules")
+        self.assertLess(update, labels.index(self.LABEL))
+        self.assertLess(labels.index(self.LABEL), labels.index("Restart instance"))
+        step = _find_cmd(cmds, self.LABEL)
+        self.assertIn(
+            "restore.sh renew-neutralization '~/projects/test-inst' odoo prod",
+            step[1],
+        )
+        self.assertIn("IC_NEUTRALIZE=", step[1])
+        self.assertTrue(step[2].get("stop_on_failure"))
+
+    def test_a_production_is_not(self):
+        cmds = _make_rebuild_executor(environment="production").get_commands()
+        self.assertNotIn(self.LABEL, self._labels(cmds))
+
+    def test_a_staging_rebuilt_without_its_update_is_not(self):
+        cmds = _make_rebuild_executor(
+            environment="staging", auto_update=False,
+        ).get_commands()
+        self.assertNotIn(self.LABEL, self._labels(cmds))
+
+
+class TestAutoUpdateFlag(BaseCase):
+    """Rebuild skips boot test + update when ``auto_update`` is off.
+
+    Default is ``True`` (preserves current behavior for all pre-existing
+    instances). When an operator flips it off — e.g. a production with a
+    change-management policy — both ``click-odoo-update`` steps go away
+    but the image rebuild, the ``incubacloud_connect`` reinstall and the
+    final ``up -d`` still run, so the operator can ship new image bits
+    without forcing module migrations.
+    """
+
+    def test_auto_update_true_keeps_both_click_odoo_steps(self):
+        cmds = _make_rebuild_executor(auto_update=True).get_commands()
+        self.assertIsNotNone(
+            _find_cmd(cmds, "Test new image (safe boot check)"),
+            "boot test must be present when auto_update=True",
+        )
+        self.assertIsNotNone(
+            _find_cmd(cmds, "Update changed modules"),
+            "click-odoo-update must be present when auto_update=True",
+        )
+
+    def test_auto_update_false_skips_boot_test_and_update(self):
+        cmds = _make_rebuild_executor(auto_update=False).get_commands()
+        self.assertIsNone(
+            _find_cmd(cmds, "Test new image (safe boot check)"),
+            "boot test must be skipped when auto_update=False",
+        )
+        self.assertIsNone(
+            _find_cmd(cmds, "Update changed modules"),
+            "click-odoo-update must be skipped when auto_update=False",
+        )
+
+    def test_auto_update_false_keeps_tail_steps(self):
+        """Skipping updates must not strip the incubacloud_connect install
+        and the final restart — those guarantee the new image actually
+        runs even without module migrations."""
+        cmds = _make_rebuild_executor(auto_update=False).get_commands()
+        self.assertIsNotNone(
+            _find_cmd(cmds, "Ensure incubacloud_connect"),
+            "incubacloud_connect reinstall must still run",
+        )
+        self.assertIsNotNone(
+            _find_cmd(cmds, "Restart instance"),
+            "docker compose up -d must still run",
+        )
+
+    def test_the_boot_test_switch_off_keeps_the_update(self):
+        """«Test the new image before applying it» off (#91): only the boot
+        test goes; the modules are still updated, and the log says so."""
+        said = []
+        ex = _make_rebuild_executor(boot_test=False)
+        ex._sys = said.append
+        cmds = ex.get_commands()
+        self.assertIsNone(_find_cmd(cmds, "Test new image (safe boot check)"))
+        self.assertIsNotNone(_find_cmd(cmds, "Update changed modules"))
+        self.assertTrue(any(
+            "«Test the new image before applying it» is off" in line
+            for line in said
+        ), said)
+
+    def test_auto_update_false_skips_the_boot_test_whatever_its_switch(self):
+        cmds = _make_rebuild_executor(auto_update=False, boot_test=True).get_commands()
+        self.assertIsNone(_find_cmd(cmds, "Test new image (safe boot check)"))
+
+    def test_auto_update_false_keeps_image_rebuild(self):
+        """The image itself must still be rebuilt; auto_update only
+        gates the DB-side update, not the Docker-side one."""
+        cmds = _make_rebuild_executor(auto_update=False).get_commands()
+        self.assertIsNotNone(
+            _find_cmd(cmds, "Rebuild Odoo image"),
+            "image rebuild must still run when auto_update=False",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Idempotent ~/.gitconfig guard
+# ---------------------------------------------------------------------------
+
+class TestGitConfigIdempotentGuard(BaseCase):
+    """Pin the read-first guard on ``init.defaultBranch``.
+
+    An unconditional ``git config --global init.defaultBranch master``
+    takes the ``~/.gitconfig`` lock on every deploy and rebuild.
+    When two jobs hit the same host in the same tick (a cron enqueues
+    N builds against one host and a dedicated channel runs them in
+    parallel), the second one fails with
+    ``error: could not lock config file ~/.gitconfig: File exists``
+    and the whole deploy unravels.
+
+    The fix has two layers and this test class guards both:
+
+    1. ``full_setup`` seeds the setting once per host, in a serialized
+       step that cannot race with itself.
+    2. The deploy / rebuild ``path_prefix`` reads first
+       (``--get``) and only writes when the value is absent, so a host
+       already seeded never touches the lock again.
+    """
+
+    # ``--get`` is a read, not a write — it does not take the ~/.gitconfig
+    # lock, so concurrent siblings on the same host never collide.
+    _READ_FIRST_TOKEN = (
+        'git config --global --get init.defaultBranch >/dev/null 2>&1'
+    )
+
+    def _path_prefix_step(self, executor_factory, label):
+        """Return the (label, cmd) tuple for the copier step from a
+        freshly built executor's get_commands() output.
+
+        ``_make_deploy_executor`` builds a SimpleNamespace that doesn't
+        carry ``effective_backup_backend`` (a model field), so any path
+        through ``_backup_enabled()`` blows up with AttributeError.
+        Stub it to ``False`` — backup-stripping behaviour is unrelated
+        to the gitconfig guard under test here.
+        """
+        ex = executor_factory()
+        ex._backup_enabled = bool
+        cmds = ex.get_commands()
+        cmd = _find_cmd(cmds, label)
+        self.assertIsNotNone(cmd, f"Step '{label}' missing from get_commands()")
+        return cmd
+
+    def test_deploy_copier_step_invokes_the_script(self):
+        """The gitconfig read-first guard now lives inside ``deploy.sh
+        copier-deploy`` (asserted in tests/shell/deploy.bats); here we
+        pin that the deploy step routes through it."""
+        cmd = self._path_prefix_step(_make_deploy_executor, "Deploy with copier")
+        argv = shlex.split(cmd[1])
+        self.assertTrue(argv[1].endswith("/deploy.sh"), argv[1])
+        self.assertEqual(argv[2], "copier-deploy")
+
+    def test_rebuild_copier_step_invokes_the_script(self):
+        """Same guard, inside ``rebuild.sh copier-update`` (asserted in
+        tests/shell/rebuild.bats)."""
+        cmd = self._path_prefix_step(_make_rebuild_executor, "Update with copier")
+        argv = shlex.split(cmd[1])
+        self.assertTrue(argv[1].endswith("/rebuild.sh"), argv[1])
+        self.assertEqual(argv[2], "copier-update")
+
+    def _install_script_text(self):
+        """Return the text of ``scripts/full_setup_install.sh``.
+
+        The Phase-2 install catalog moved from the ``SETUP_COMMANDS``
+        Python list to this versioned script; these guards now assert on
+        the script itself.
+        """
+        import os
+
+        from odoo.modules.module import get_module_path
+
+        path = os.path.join(
+            get_module_path("incubacloud"),
+            "scripts", "full_setup_install.sh",
+        )
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_full_setup_has_seed_step(self):
+        """full_setup must seed init.defaultBranch once per host."""
+        self.assertIn("init.defaultBranch", self._install_script_text())
+
+    def test_full_setup_seed_step_is_idempotent(self):
+        """The seed reads before writing — re-running Setup Host on an
+        already-configured host must not rewrite (no ~/.gitconfig lock).
+        """
+        self.assertIn(self._READ_FIRST_TOKEN, self._install_script_text())
+
+    def test_full_setup_seed_runs_after_install_git(self):
+        """Git must be installed before ``git config`` runs — otherwise the
+        first Setup Host run would call it before the binary exists.
+        """
+        text = self._install_script_text()
+        git_install = text.find("command -v git")
+        git_seed = text.find("git config --global --get init.defaultBranch")
+        self.assertGreater(git_install, -1, "install-git step missing")
+        self.assertGreater(git_seed, -1, "gitconfig seed step missing")
+        self.assertLess(
+            git_install, git_seed,
+            "git must be installed before the gitconfig seed",
+        )
+
+
+class TestEveryHostnameIsCapped(BaseCase):
+    """Deploy and rebuild cap every container hostname, in any environment.
+
+    The odoo service's hostname is the instance's domain, so a long one
+    broke the deploy whatever the backup did: on 10-oct-2026 Docker
+    refused a domain of 68 bytes at the first ``docker compose run``.
+    """
+
+    def _cap(self, cmds):
+        """The cap step of *cmds*, or None."""
+        return _find_cmd(cmds, "Cap container hostnames")
+
+    def test_deploy_caps_in_every_environment(self):
+        for environment in ('production', 'staging'):
+            cmd = self._cap(
+                _make_deploy_executor(environment=environment).get_commands(),
+            )
+            self.assertIsNotNone(cmd, environment)
+            self.assertIn("cap-hostnames", cmd[1])
+
+    def test_deploy_caps_before_the_database_is_initialised(self):
+        labels = [c[0] for c in _make_deploy_executor().get_commands()]
+        init = next(i for i, label in enumerate(labels) if "Initialize" in label)
+        self.assertLess(labels.index("Cap container hostnames"), init)
+
+    def test_rebuild_caps_after_copier_regenerates_the_files(self):
+        for environment in ('production', 'staging'):
+            cmds = _make_rebuild_executor(environment=environment).get_commands()
+            labels = [c[0] for c in cmds]
+            self.assertIn("Cap container hostnames", labels, environment)
+            copier = next(i for i, label in enumerate(labels) if "copier" in label.lower())
+            self.assertLess(copier, labels.index("Cap container hostnames"))
+
+
+class TestTheBuildFollowsTheBranchHeads(BaseCase):
+    """A push reaches the image even when Docker could reuse its cache.
+
+    The image clones the repositories inside its build, so with nothing
+    in the build context changed the clone came from the cache: on
+    5-nov-2026 a second push within the hour of the GitHub token (the
+    one thing in ``repos.yaml`` that changed) was rebuilt "done" in a
+    minute, every layer CACHED, the old code still running. The heads
+    file ``deploy.sh record-heads`` writes into the context is what
+    changes now; its own behaviour is covered by ``tests/shell/deploy.bats``.
+    Every series downloads its repositories on the host from core 1.0.224:
+    the image clones them only for a series the parameter
+    ``incubacloud.repos_in_image_series`` sends back, 19.0 here.
+    """
+
+    _TOKEN = "ghs_secretTokenOfTheHour"
+    _PINNED = "0123456789abcdef0123456789abcdef01234567"
+
+    def _repos_yaml(self):
+        """A rendered repos.yaml: odoo on its series, one branch, one pin."""
+        auth = f"https://x-access-token:{self._TOKEN}@github.com/acme"
+        return (
+            "odoo:\n"
+            "  remotes:\n    odoo: https://github.com/odoo/odoo.git\n"
+            "  target: odoo $ODOO_VERSION\n"
+            "  merges:\n  - odoo $ODOO_VERSION\n"
+            "addons:\n"
+            f"  merges:\n  - addons main\n"
+            f"  remotes:\n    addons: {auth}/addons.git\n"
+            "  target: addons main\n"
+            "pinned:\n"
+            f"  merges:\n  - pinned {self._PINNED}\n"
+            f"  remotes:\n    pinned: {auth}/pinned.git\n"
+            "  target: pinned main\n"
+        )
+
+    @staticmethod
+    def _in_image(ex):
+        """Send *ex*'s series, 19.0, back to cloning in the image, as the
+        parameter ``incubacloud.repos_in_image_series`` does.
+
+        :return: *ex*
+        """
+        ex._repos_in_image_series = lambda: frozenset({"19.0"})
+        return ex
+
+    def _argv(self, command):
+        """The words of the ``record-heads`` call at the start of *command*."""
+        words = shlex.split(command.split(" && ", 1)[0])
+        self.assertTrue(words[1].endswith("/deploy.sh"), words)
+        return words[2:]
+
+    def test_a_rebuild_records_the_heads_before_it_builds(self):
+        """Cached or not, the lookup runs in the build's own step."""
+        for last in ("fp1", "fp0"):
+            ex = self._in_image(
+                _make_rebuild_executor(last_rebuild_fingerprint=last),
+            )
+            build = _find_cmd(ex.get_commands(), "Rebuild Odoo image")[1]
+            self.assertEqual(
+                self._argv(build),
+                ["record-heads", "~/projects/test-inst",
+                 ex._tmp("repo-heads.tsv")],
+            )
+            self.assertLess(
+                build.index("record-heads"), build.index("docker compose build"),
+            )
+
+    def test_a_deploy_records_them_before_the_image_is_built(self):
+        """The first ``docker compose run`` builds it; a move's ``up``."""
+        for moving in (False, True):
+            cmds = self._in_image(
+                _make_deploy_executor(move_origin_host_id=moving),
+            ).get_commands()
+            labels = [c[0] for c in cmds]
+            self.assertIn("Record repository heads", labels, moving)
+            heads = labels.index("Record repository heads")
+            self.assertLess(labels.index("Write repos.yaml"), heads)
+            self.assertLess(heads, labels.index("Start instance"))
+            if not moving:
+                self.assertLess(heads, labels.index("Initialize database"))
+            self.assertEqual(
+                self._argv(cmds[heads][1])[0], "record-heads",
+            )
+
+    def test_the_spec_asks_branches_and_takes_pins_as_they_are(self):
+        """A branch travels with its URL; a pin, the build's own
+        expansion of ``$ODOO_VERSION`` aside, carries none."""
+        spec = self._in_image(_make_deploy_executor())._repo_heads_spec(
+            self._repos_yaml(), {"pinned"},
+        )
+        auth = f"https://x-access-token:{self._TOKEN}@github.com/acme"
+        self.assertEqual(
+            spec.splitlines(),
+            [
+                "odoo\tref\t19.0\thttps://github.com/odoo/odoo.git",
+                f"addons\tref\tmain\t{auth}/addons.git",
+                f"pinned\tpin\t{self._PINNED}\t",
+            ],
+        )
+
+    def test_a_pinned_odoo_is_its_own_head(self):
+        yaml_text = self._repos_yaml().replace(
+            "  - odoo $ODOO_VERSION", f"  - odoo {self._PINNED}",
+        )
+        spec = self._in_image(_make_deploy_executor())._repo_heads_spec(
+            yaml_text, {"odoo", "pinned"},
+        )
+        self.assertEqual(spec.splitlines()[0], f"odoo\tpin\t{self._PINNED}\t")
+
+    def test_a_branch_named_like_a_commit_is_asked(self):
+        """``cafebabe`` or ``20261105`` is a branch unless it was pinned."""
+        for branch in ("cafebabe", "20261105"):
+            yaml_text = self._repos_yaml().replace(
+                "  - addons main", f"  - addons {branch}",
+            )
+            spec = _make_deploy_executor()._repo_heads_spec(yaml_text, set())
+            self.assertIn(
+                f"addons\tref\t{branch}\thttps://x-access-token:",
+                spec.splitlines()[1],
+            )
+
+    def _render(self, ex, repos, odoo_commit_sha=False):
+        """Render *ex*'s repos.yaml for *repos*; return ``(text, pinned)``."""
+        inst = ex._inst()
+        inst.odoo_commit_sha = odoo_commit_sha
+        inst.repo_ids = repos
+        pinned = set()
+        with mock.patch.object(
+            ex, "_get_github_tokens", return_value=("", ""),
+        ), mock.patch.object(
+            ex, "_github_repo_access", return_value=(5, True, "app"),
+        ), mock.patch.object(
+            ex, "_scoped_github_token", return_value=self._TOKEN,
+        ):
+            text = ex._repos_yaml_content(pinned)
+        return text, pinned
+
+    def test_the_render_says_what_was_pinned_by_where_it_came_from(self):
+        """``odoo_commit_sha`` and ``commit_sha`` pin; a hex branch name
+        without either does not."""
+        repos = [
+            SimpleNamespace(
+                url="https://github.com/acme/hexbranch.git",
+                branch="cafebabe", commit_sha=False,
+            ),
+            SimpleNamespace(
+                url="https://github.com/acme/fixed.git",
+                branch="main", commit_sha=self._PINNED,
+            ),
+        ]
+        ex = _make_deploy_executor()
+        text, pinned = self._render(ex, repos)
+        self.assertEqual(pinned, {"fixed"})
+        kinds = [line.split("\t")[:3] for line in
+                 ex._repo_heads_spec(text, pinned).splitlines()]
+        self.assertEqual(kinds, [
+            ["odoo", "ref", "19.0"],
+            ["hexbranch", "ref", "cafebabe"],
+            ["fixed", "pin", self._PINNED],
+        ])
+        _text, pinned = self._render(ex, repos, odoo_commit_sha=self._PINNED)
+        self.assertEqual(pinned, {"odoo", "fixed"})
+
+    def test_a_layers_release_pin_is_a_pin(self):
+        """A subclass answering ``_repo_merge_ref`` with a commit the row
+        does not hold (a layer's release pointer) pins it too."""
+        repo = SimpleNamespace(
+            url="https://github.com/acme/core.git",
+            branch="19.0", commit_sha=False,
+        )
+        ex = self._in_image(_make_deploy_executor())
+        with mock.patch.object(
+            ex, "_repo_merge_ref", return_value=self._PINNED,
+        ):
+            text, pinned = self._render(ex, [repo])
+        self.assertEqual(pinned, {"core"})
+        self.assertIn(
+            f"core\tpin\t{self._PINNED}\t",
+            ex._repo_heads_spec(text, pinned).splitlines(),
+        )
+
+    def test_a_row_of_another_host_takes_no_token_to_the_build(self):
+        """repos.yaml and the heads spec carry the token to github.com only.
+
+        A row stored before its URL was checked, naming ``github.com``
+        only in its path, was rendered with the panel's token, which
+        the build's clone and ``record-heads`` then sent to that host
+        (5-nov-2026). An old spelling of a github.com repository still
+        gets it, on the canonical URL.
+        """
+        repos = [
+            SimpleNamespace(
+                url="https://evil.example/github.com/x.git",
+                branch="main", commit_sha=False,
+            ),
+            SimpleNamespace(
+                url="www.github.com/acme/legacy",
+                branch="main", commit_sha=False,
+            ),
+        ]
+        ex = _make_deploy_executor()
+        inst = ex._inst()
+        inst.odoo_commit_sha = False
+        inst.repo_ids = repos
+        opened = mock.MagicMock(spec=http.client.HTTPResponse)
+        opened.__enter__.return_value = opened
+        with mock.patch.object(
+            ex, "_get_github_tokens", return_value=("app_tok", ""),
+        ), mock.patch.object(
+            ex, "_scoped_github_token", return_value=self._TOKEN,
+        ), mock.patch(
+            "odoo.addons.incubacloud.models.deploy_instance_executor.read_json_limited",
+            autospec=True, return_value={"id": 9, "private": True},
+        ), mock.patch(
+            "odoo.addons.incubacloud.models.deploy_instance_executor.safe_urlopen",
+            autospec=True, return_value=opened,
+        ) as urlopen:
+            text = ex._repos_yaml_content(set())
+        spec = ex._repo_heads_spec(text, set()).splitlines()
+        self.assertEqual(spec[1], "x\tref\tmain\thttps://evil.example/github.com/x.git")
+        self.assertEqual(
+            spec[2],
+            f"legacy\tref\tmain\thttps://x-access-token:{self._TOKEN}@github.com/acme/legacy",
+        )
+        self.assertEqual(text.count(self._TOKEN), 1)
+        # GitHub's API was asked about the github.com repository alone.
+        self.assertEqual(
+            [c.args[0].full_url for c in urlopen.call_args_list],
+            ["https://api.github.com/repos/acme/legacy"],
+        )
+
+    def test_no_command_names_the_token(self):
+        """The URLs stay in the staged spec: the steps name paths."""
+        for ex in (_make_deploy_executor(), _make_rebuild_executor()):
+            ex._repo_heads_spec(self._repos_yaml(), set())
+            for label, command, *_opts in ex.get_commands():
+                self.assertNotIn(self._TOKEN, command, label)
+
+
+# ---------------------------------------------------------------------------
+# Class 10: TestDeleteCommandsWhenInstanceIsGone
+# ---------------------------------------------------------------------------
+
+class TestDeleteCommandsWhenInstanceIsGone(TransactionCase):
+    """A retried teardown must tell 'already unlinked' from 'archived'.
+
+    ``on_success`` commits on its own cursor, so when the job's own
+    transaction dies afterwards (five sibling deletes finishing at once
+    lose a serialization race and queue_job re-queues them) the remote
+    work is already done and the record already unlinked. The second run
+    used to reach ``get_remote_dir()`` on an empty recordset and raise
+    ``Expected singleton``, marking a clean removal as failed and raising
+    an alert. Archiving is a different thing: the record still exists and
+    still has its directory on the host, so it must still be torn down.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.host = self.env['cloud.host'].create({
+            'name': 'Teardown Host',
+            'ip_address': '10.0.0.9',
+            'user': 'ubuntu',
+            'wildcard_domain': 'test.example.com',
+        })
+        self.project = self.env['cloud.project'].create({'name': 'Teardown'})
+        self.instance = self.env['cloud.instance'].create({
+            'name': 'doomed',
+            'project_id': self.project.id,
+            'environment': 'staging',
+            'host_id': self.host.id,
+        })
+        self.job_type = self.env['cloud.job.type'].search(
+            [('code', '=', 'delete_instance')], limit=1,
+        )
+        self.job = self.env['cloud.job'].create({
+            'host_id': self.host.id,
+            'instance_id': self.instance.id,
+            'job_type_id': self.job_type.id,
+            'name': 'Delete Instance',
+        })
+
+    def _executor(self):
+        from odoo.addons.incubacloud.models.delete_instance_executor import (
+            DeleteInstanceExecutor,
+        )
+        return DeleteInstanceExecutor(
+            job_record=self.job, host_record=self.host,
+        )
+
+    def test_live_instance_still_gets_torn_down(self):
+        # compose down · drop the logrotate config · remove the directory
+        # · empty the build cache
+        self.assertEqual(len(self._executor().get_commands()), 4)
+
+    def test_archived_instance_still_gets_torn_down(self):
+        """Archived is not gone: the directory is still on the host."""
+        self.instance.write({'active': False})
+        self.job.invalidate_recordset(['instance_id'])
+        self.assertEqual(len(self._executor().get_commands()), 4)
+
+    def test_unlinked_instance_yields_no_commands(self):
+        self.instance.unlink()
+        self.job.invalidate_recordset(['instance_id'])
+        self.assertEqual(self._executor().get_commands(), [])
